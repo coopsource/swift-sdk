@@ -215,7 +215,7 @@ struct LifecycleHTTPServerRouterTests {
             .objectValue?["code"]?.intValue == ProtocolErrorCode.headerMismatch)
         #expect(headerWithoutMetadata.statusCode == 400)
         #expect(try routerResponseObject(headerWithoutMetadata)["error"]?
-            .objectValue?["code"]?.intValue == ProtocolErrorCode.headerMismatch)
+            .objectValue?["code"]?.intValue == -32602)
         #expect(await recorder.count == 0)
 
         await server.stop()
@@ -271,8 +271,8 @@ struct LifecycleHTTPServerRouterTests {
             mode: .initializationOnly,
             recorder: initializationRecorder
         )
-        let modernRequest = makeRouterRequest(body: try makeRouterBody())
-        let initializationResponse = await initializationRouter.handleRequest(modernRequest)
+        let perRequestRequest = makeRouterRequest(body: try makeRouterBody())
+        let initializationResponse = await initializationRouter.handleRequest(perRequestRequest)
 
         #expect(initializationResponse.statusCode == 200)
         #expect(await initializationRecorder.count == 1)
