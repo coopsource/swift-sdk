@@ -12,7 +12,7 @@ log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 
 # Configuration
-CONFORMANCE_PKG="@modelcontextprotocol/conformance"
+CONFORMANCE_PKG="@modelcontextprotocol/conformance@0.1.15"
 CLIENT_EXEC="mcp-everything-client"
 SERVER_EXEC="mcp-everything-server"
 BASELINE_FILE="${BASELINE_FILE:-conformance-baseline.yml}"

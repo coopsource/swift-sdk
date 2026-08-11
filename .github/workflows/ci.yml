@@ -97,6 +97,17 @@ jobs:
             kill $SERVER_PID 2>/dev/null || true
           fi
 
+      - name: Run 2026-07-28 conformance tests
+        run: scripts/run-conformance-2026-07-28.sh
+
+      - name: Upload 2026-07-28 conformance results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-2026-07-28
+          path: .build/conformance-2026-07-28
+          if-no-files-found: warn
+
   documentation:
     name: Documentation
     runs-on: macos-latest

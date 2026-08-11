@@ -9,9 +9,9 @@ import MCP
     import FoundationNetworking
 #endif
 
-actor HTTPApp {
+package actor HTTPApp {
     /// Configuration for the HTTP application.
-    struct Configuration: Sendable {
+    package struct Configuration: Sendable {
         /// The host address to bind to.
         var host: String
 
@@ -27,7 +27,7 @@ actor HTTPApp {
         /// SSE retry interval in milliseconds for priming events.
         var retryInterval: Int?
 
-        init(
+        package init(
             host: String = "127.0.0.1",
             port: Int = 3000,
             endpoint: String = "/mcp",
@@ -43,13 +43,15 @@ actor HTTPApp {
     }
 
     /// Factory function to create MCP Server instances for each session.
-    typealias ServerFactory = @Sendable (String, StatefulHTTPServerTransport) async throws -> Server
+    package typealias ServerFactory =
+        @Sendable (String, StatefulHTTPServerTransport) async throws -> Server
 
     private let configuration: Configuration
     private let serverFactory: ServerFactory
     private let validationPipeline: (any HTTPRequestValidationPipeline)?
     private var channel: Channel?
     private var sessions: [String: SessionContext] = [:]
+    private var lifecycleRouter: LifecycleHTTPServerRouter?
 
     nonisolated let logger: Logger
 
@@ -70,7 +72,7 @@ actor HTTPApp {
     ///     If `nil`, transports use their sensible defaults.
     ///   - serverFactory: Factory function to create Server instances for each session.
     ///   - logger: Optional logger instance.
-    init(
+    package init(
         configuration: Configuration = Configuration(),
         validationPipeline: (any HTTPRequestValidationPipeline)? = nil,
         serverFactory: @escaping ServerFactory,
@@ -86,7 +88,7 @@ actor HTTPApp {
     }
 
     /// Convenience initializer with individual parameters.
-    init(
+    package init(
         host: String = "127.0.0.1",
         port: Int = 3000,
         endpoint: String = "/mcp",
@@ -106,7 +108,7 @@ actor HTTPApp {
     ///
     /// This starts the NIO HTTP server and begins accepting connections.
     /// The call blocks until the server is shut down via ``stop()``.
-    func start() async throws {
+    package func start() async throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
 
         let bootstrap = ServerBootstrap(group: group)
@@ -114,7 +116,10 @@ actor HTTPApp {
             .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
             .childChannelInitializer { channel in
                 channel.pipeline.configureHTTPServerPipeline().flatMap {
-                    channel.pipeline.addHandler(HTTPHandler(app: self))
+                    channel.pipeline.addHandler(HTTPHandler(
+                        endpoint: self.configuration.endpoint,
+                        responder: { request in await self.handleHTTPRequest(request) }
+                    ))
                 }
             }
             .childChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
@@ -138,7 +143,7 @@ actor HTTPApp {
     }
 
     /// Stops the HTTP application gracefully, closing all sessions.
-    func stop() async {
+    package func stop() async {
         await closeAllSessions()
         try? await channel?.close()
         channel = nil
@@ -149,12 +154,25 @@ actor HTTPApp {
 
     var endpoint: String { configuration.endpoint }
 
+    package func installLifecycleRouter(_ router: LifecycleHTTPServerRouter) {
+        lifecycleRouter = router
+    }
+
     /// Routes an incoming HTTP request to the appropriate session transport.
     ///
     /// - Requests with a valid `Mcp-Session-Id` are forwarded to the matching transport.
     /// - POST requests with an `initialize` body create a new session.
     /// - All other requests without a session return an error.
     func handleHTTPRequest(_ request: HTTPRequest) async -> HTTPResponse {
+        if let lifecycleRouter {
+            return await lifecycleRouter.handleRequest(request)
+        }
+        return await handleInitializationBasedHTTPRequest(request)
+    }
+
+    package func handleInitializationBasedHTTPRequest(
+        _ request: HTTPRequest
+    ) async -> HTTPResponse {
         let sessionID = request.header(HTTPHeaderName.sessionID)
 
         // Route to existing session
@@ -270,21 +288,31 @@ actor HTTPApp {
 
 /// Thin NIO adapter that converts between NIO HTTP types and the framework-agnostic
 /// `HTTPRequest`/`HTTPResponse` types, delegating all logic to the `HTTPApp`.
-private final class HTTPHandler: ChannelInboundHandler, @unchecked Sendable {
+final class HTTPHandler: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = HTTPServerRequestPart
     typealias OutboundOut = HTTPServerResponsePart
 
-    private let app: HTTPApp
+    private let endpoint: String
+    private let responder: @Sendable (HTTPRequest) async -> HTTPResponse
 
     private struct RequestState {
         var head: HTTPRequestHead
         var bodyBuffer: ByteBuffer
     }
 
-    private var requestState: RequestState?
+    private struct EventLoopContext: @unchecked Sendable {
+        let value: ChannelHandlerContext
+    }
 
-    init(app: HTTPApp) {
-        self.app = app
+    private var requestState: RequestState?
+    private var activeRequestTasks: [UUID: Task<Void, Never>] = [:]
+
+    init(
+        endpoint: String,
+        responder: @escaping @Sendable (HTTPRequest) async -> HTTPResponse
+    ) {
+        self.endpoint = endpoint
+        self.responder = responder
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -301,23 +329,67 @@ private final class HTTPHandler: ChannelInboundHandler, @unchecked Sendable {
         case .end:
             guard let state = requestState else { return }
             requestState = nil
-
-            nonisolated(unsafe) let ctx = context
-            Task { @MainActor in
-                await self.handleRequest(state: state, context: ctx)
-            }
+            startRequest(state: state, context: context)
         }
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        requestState = nil
+        cancelActiveRequests()
+        context.fireChannelInactive()
+    }
+
+    func errorCaught(context: ChannelHandlerContext, error: Swift.Error) {
+        requestState = nil
+        cancelActiveRequests()
+        context.fireErrorCaught(error)
+        context.close(promise: nil)
+    }
+
+    func handlerRemoved(context: ChannelHandlerContext) {
+        requestState = nil
+        cancelActiveRequests()
     }
 
     // MARK: - Request Processing
 
-    private func handleRequest(state: RequestState, context: ChannelHandlerContext) async {
+    var activeRequestCount: Int { activeRequestTasks.count }
+
+    private func startRequest(state: RequestState, context: ChannelHandlerContext) {
+        let requestID = UUID()
+        let eventLoopContext = EventLoopContext(value: context)
+        let task = Task {
+            defer {
+                eventLoopContext.value.eventLoop.execute {
+                    self.activeRequestTasks.removeValue(forKey: requestID)
+                }
+            }
+            do {
+                try await self.handleRequest(state: state, context: eventLoopContext.value)
+            } catch {
+                try? await self.closeChannel(context: eventLoopContext.value)
+            }
+        }
+        activeRequestTasks[requestID] = task
+    }
+
+    private func cancelActiveRequests() {
+        let tasks = Array(activeRequestTasks.values)
+        activeRequestTasks.removeAll()
+        for task in tasks {
+            task.cancel()
+        }
+    }
+
+    private func handleRequest(
+        state: RequestState,
+        context: ChannelHandlerContext
+    ) async throws {
         let head = state.head
         let path = head.uri.split(separator: "?").first.map(String.init) ?? head.uri
-        let endpoint = await app.endpoint
 
         guard path == endpoint else {
-            await writeResponse(
+            try await writeResponse(
                 .error(statusCode: 404, .invalidRequest("Not Found")),
                 version: head.version,
                 context: context
@@ -326,8 +398,9 @@ private final class HTTPHandler: ChannelInboundHandler, @unchecked Sendable {
         }
 
         let httpRequest = makeHTTPRequest(from: state)
-        let response = await app.handleHTTPRequest(httpRequest)
-        await writeResponse(response, version: head.version, context: context)
+        let response = await responder(httpRequest)
+        try Task.checkCancellation()
+        try await writeResponse(response, version: head.version, context: context)
     }
 
     // MARK: - NIO ↔ HTTPRequest/HTTPResponse Conversion
@@ -366,67 +439,77 @@ private final class HTTPHandler: ChannelInboundHandler, @unchecked Sendable {
         _ response: HTTPResponse,
         version: HTTPVersion,
         context: ChannelHandlerContext
-    ) async {
-        nonisolated(unsafe) let ctx = context
-        let eventLoop = ctx.eventLoop
-
-        // Write response head
+    ) async throws {
         let statusCode = response.statusCode
         let headers = response.headers
+        var head = HTTPResponseHead(
+            version: version,
+            status: HTTPResponseStatus(statusCode: statusCode)
+        )
+        for (name, value) in headers {
+            head.headers.add(name: name, value: value)
+        }
 
         switch response {
         case .stream(let stream, _):
-            eventLoop.execute {
-                var head = HTTPResponseHead(
-                    version: version,
-                    status: HTTPResponseStatus(statusCode: statusCode)
-                )
-                for (name, value) in headers {
-                    head.headers.add(name: name, value: value)
+            try await writeAndFlush(.head(head), context: context)
+            var iterator = stream.makeAsyncIterator()
+            while let chunk = try await iterator.next() {
+                try Task.checkCancellation()
+                do {
+                    try await writeBody(chunk, context: context)
+                } catch {
+                    let writeError = error
+                    withUnsafeCurrentTask { $0?.cancel() }
+                    // Let the response stream observe cancellation before closing the channel.
+                    _ = try? await iterator.next()
+                    throw writeError
                 }
-                ctx.write(self.wrapOutboundOut(.head(head)), promise: nil)
-                ctx.flush()
             }
-
-            // Await the SSE stream directly — no Task needed since we're already in one
-            do {
-                for try await chunk in stream {
-                    eventLoop.execute {
-                        var buffer = ctx.channel.allocator.buffer(capacity: chunk.count)
-                        buffer.writeBytes(chunk)
-                        ctx.writeAndFlush(
-                            self.wrapOutboundOut(.body(.byteBuffer(buffer))), promise: nil)
-                    }
-                }
-            } catch {
-                // Stream ended with error — close connection
-            }
-
-            eventLoop.execute {
-                ctx.writeAndFlush(self.wrapOutboundOut(.end(nil)), promise: nil)
-            }
+            try Task.checkCancellation()
+            try await writeAndFlush(.end(nil), context: context)
 
         default:
             let bodyData = response.bodyData
-            eventLoop.execute {
-                var head = HTTPResponseHead(
-                    version: version,
-                    status: HTTPResponseStatus(statusCode: statusCode)
-                )
-                for (name, value) in headers {
-                    head.headers.add(name: name, value: value)
-                }
-
-                ctx.write(self.wrapOutboundOut(.head(head)), promise: nil)
-
-                if let body = bodyData {
-                    var buffer = ctx.channel.allocator.buffer(capacity: body.count)
-                    buffer.writeBytes(body)
-                    ctx.write(self.wrapOutboundOut(.body(.byteBuffer(buffer))), promise: nil)
-                }
-
-                ctx.writeAndFlush(self.wrapOutboundOut(.end(nil)), promise: nil)
+            try await writeAndFlush(.head(head), context: context)
+            if let bodyData {
+                try await writeBody(bodyData, context: context)
             }
+            try Task.checkCancellation()
+            try await writeAndFlush(.end(nil), context: context)
         }
+    }
+
+    private func writeBody(
+        _ data: Data,
+        context: ChannelHandlerContext
+    ) async throws {
+        try Task.checkCancellation()
+        nonisolated(unsafe) let ctx = context
+        try await ctx.eventLoop.submit {
+            var buffer = ctx.channel.allocator.buffer(capacity: data.count)
+            buffer.writeBytes(data)
+            return ctx.writeAndFlush(self.wrapOutboundOut(.body(.byteBuffer(buffer))))
+        }.flatMap { $0 }.get()
+        try Task.checkCancellation()
+    }
+
+    private func closeChannel(context: ChannelHandlerContext) async throws {
+        nonisolated(unsafe) let ctx = context
+        try await ctx.eventLoop.submit {
+            ctx.close()
+        }.flatMap { $0 }.get()
+    }
+
+    private func writeAndFlush(
+        _ part: HTTPServerResponsePart,
+        context: ChannelHandlerContext
+    ) async throws {
+        try Task.checkCancellation()
+        nonisolated(unsafe) let ctx = context
+        try await ctx.eventLoop.submit {
+            ctx.writeAndFlush(self.wrapOutboundOut(part))
+        }.flatMap { $0 }.get()
+        try Task.checkCancellation()
     }
 }

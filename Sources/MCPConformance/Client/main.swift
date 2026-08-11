@@ -22,6 +22,16 @@ import MCP
 
 typealias ScenarioHandler = ([String]) async throws -> Void
 
+private func conformanceClientConfiguration() -> Client.Configuration {
+    guard
+        ProcessInfo.processInfo.environment["MCP_CONFORMANCE_PROTOCOL_VERSION"]
+            == Version.perRequestMetadataVersion
+    else {
+        return .init(protocolMode: .initializationOnly)
+    }
+    return .init(protocolMode: .perRequestMetadataOnly)
+}
+
 // MARK: - Authorization Scenarios
 
 private func loadConformanceContext() -> [String: String] {
@@ -330,7 +340,11 @@ func runAuthorizationScenario(scenario: String, args: [String]) async throws {
         logger: logger
     )
 
-    let client = Client(name: "test-client", version: "1.0.0")
+    let client = Client(
+        name: "test-client",
+        version: "1.0.0",
+        configuration: conformanceClientConfiguration()
+    )
 
     // Scenarios that expect the connection to fail with a specific error.
     if scenario == "auth/resource-mismatch" {
@@ -392,7 +406,11 @@ func runInitializeScenario(_ args: [String]) async throws {
     )
 
     // Create client
-    let client = Client(name: "test-client", version: "1.0.0")
+    let client = Client(
+        name: "test-client",
+        version: "1.0.0",
+        configuration: conformanceClientConfiguration()
+    )
 
     // Connect
     let initResult = try await client.connect(transport: transport)
@@ -436,7 +454,11 @@ func runToolsCallScenario(_ args: [String]) async throws {
     )
 
     // Create client
-    let client = Client(name: "test-client", version: "1.0.0")
+    let client = Client(
+        name: "test-client",
+        version: "1.0.0",
+        configuration: conformanceClientConfiguration()
+    )
 
     // Connect
     try await client.connect(transport: transport)
@@ -468,6 +490,154 @@ func runToolsCallScenario(_ args: [String]) async throws {
     logger.debug("Tools call scenario completed successfully")
 }
 
+/// Exercises request metadata, tool schema handling, and the stateless client path.
+func runPerRequestMetadataScenario(_ args: [String]) async throws {
+    guard let serverURLString = args.last,
+        let serverURL = URL(string: serverURLString)
+    else {
+        throw ConformanceError.invalidArguments("Valid server URL is required")
+    }
+
+    let transport = HTTPClientTransport(endpoint: serverURL)
+    let client = Client(
+        name: "test-client",
+        version: "1.0.0",
+        capabilities: .init(
+            sampling: .init(),
+            elicitation: .init(),
+            roots: .init()
+        ),
+        configuration: conformanceClientConfiguration()
+    )
+    _ = try await client.connectWithInfo(transport: transport)
+    _ = try await client.listTools()
+    await client.disconnect()
+}
+
+/// Runs the client side of the 2026-07-28 multi-round-trip conformance fixture.
+func runMultiRoundTripScenario(_ args: [String]) async throws {
+    guard let serverURLString = args.last,
+        let serverURL = URL(string: serverURLString)
+    else {
+        throw ConformanceError.invalidArguments("Valid server URL is required")
+    }
+
+    let transport = HTTPClientTransport(endpoint: serverURL)
+    let client = Client(
+        name: "test-client",
+        version: "1.0.0",
+        capabilities: .init(elicitation: .init()),
+        configuration: conformanceClientConfiguration()
+    )
+    await client.withElicitationHandler { _ in
+        .init(action: .accept, content: ["confirmed": true])
+    }
+    _ = try await client.connectWithInfo(transport: transport)
+    _ = try await client.listTools()
+
+    async let stateful = client.callTool(name: "test_mrtr_echo_state", arguments: [:])
+    async let unrelated = client.callTool(name: "test_mrtr_unrelated", arguments: [:])
+    _ = try await (stateful, unrelated)
+    _ = try await client.callTool(name: "test_mrtr_no_state", arguments: [:])
+    _ = try await client.callTool(name: "test_mrtr_no_result_type", arguments: [:])
+
+    await client.disconnect()
+}
+
+/// Calls the annotated tools supplied by the HTTP custom-header fixture.
+func runCustomHeaderScenario(_ args: [String]) async throws {
+    guard let serverURLString = args.last,
+        let serverURL = URL(string: serverURLString)
+    else {
+        throw ConformanceError.invalidArguments("Valid server URL is required")
+    }
+
+    let transport = HTTPClientTransport(endpoint: serverURL)
+    let client = Client(
+        name: "test-client",
+        version: "1.0.0",
+        configuration: conformanceClientConfiguration()
+    )
+    _ = try await client.connectWithInfo(transport: transport)
+    _ = try await client.listTools()
+    _ = try await client.callTool(
+        name: "test_custom_headers",
+        arguments: [
+            "region": "us-west1",
+            "priority": 42,
+            "verbose": false,
+            "debug": true,
+            "empty_val": "",
+            "method_val": "test-method",
+            "float_val": 3.14159,
+            "non_ascii_val": "Hello, 世界",
+            "whitespace_val": " padded ",
+            "leading_space_val": " us-west1",
+            "trailing_space_val": "us-west1 ",
+            "internal_space_val": "us west 1",
+            "control_char_val": "line1\nline2",
+            "crlf_val": "line1\r\nline2",
+            "tab_val": "\tindented",
+            "query": "SELECT * FROM users",
+        ]
+    )
+    _ = try await client.callTool(
+        name: "test_custom_headers_null",
+        arguments: [
+            "region": "us-east1",
+            "priority": 1,
+            "verbose": .null,
+            "query": "SELECT 1",
+        ]
+    )
+    await client.disconnect()
+}
+
+/// Lists header-annotated tools and calls the valid definition left after filtering.
+func runInvalidToolHeaderScenario(_ args: [String]) async throws {
+    guard let serverURLString = args.last,
+        let serverURL = URL(string: serverURLString)
+    else {
+        throw ConformanceError.invalidArguments("Valid server URL is required")
+    }
+
+    let transport = HTTPClientTransport(endpoint: serverURL)
+    let client = Client(
+        name: "test-client",
+        version: "1.0.0",
+        configuration: conformanceClientConfiguration()
+    )
+    _ = try await client.connectWithInfo(transport: transport)
+    let (tools, _) = try await client.listTools()
+    guard tools.contains(where: { $0.name == "valid_tool" }) else {
+        throw ConformanceError.invalidArguments("Valid header tool was filtered out")
+    }
+    _ = try await client.callTool(
+        name: "valid_tool",
+        arguments: ["region": "us-west1"]
+    )
+    await client.disconnect()
+}
+
+/// Lists tools without resolving network references in their JSON Schemas.
+func runListToolsOnlyScenario(_ args: [String]) async throws {
+    guard let serverURLString = args.last,
+        let serverURL = URL(string: serverURLString)
+    else {
+        throw ConformanceError.invalidArguments("Valid server URL is required")
+    }
+
+    let transport = HTTPClientTransport(endpoint: serverURL)
+    let client = Client(
+        name: "test-client",
+        version: "1.0.0",
+        configuration: conformanceClientConfiguration()
+    )
+    _ = try await client.connectWithInfo(transport: transport)
+    _ = try await client.listTools()
+    await client.disconnect()
+}
+
 // MARK: - SSE Scenarios
 
 /// Handler for SSE-related scenarios (retry, reconnection, etc.)
@@ -494,7 +664,11 @@ func runSSEScenario(_ args: [String]) async throws {
     )
 
     // Create client
-    let client = Client(name: "test-client", version: "1.0.0")
+    let client = Client(
+        name: "test-client",
+        version: "1.0.0",
+        configuration: conformanceClientConfiguration()
+    )
 
     // Connect - this will start the SSE stream in the background
     let initResult = try await client.connect(transport: transport)
@@ -555,7 +729,8 @@ func runElicitationSEP1034ClientDefaults(_ args: [String]) async throws {
         version: "1.0.0",
         capabilities: Client.Capabilities(
             elicitation: Client.Capabilities.Elicitation(form: .init(), url: .init())
-        )
+        ),
+        configuration: conformanceClientConfiguration()
     )
 
     // Set up elicitation handler that accepts defaults BEFORE connecting
@@ -642,7 +817,11 @@ func runDefaultScenario(_ args: [String]) async throws {
     )
 
     // Create client
-    let client = Client(name: "test-client", version: "1.0.0")
+    let client = Client(
+        name: "test-client",
+        version: "1.0.0",
+        configuration: conformanceClientConfiguration()
+    )
 
     // Connect
     let initResult = try await client.connect(transport: transport)
@@ -662,6 +841,12 @@ func runDefaultScenario(_ args: [String]) async throws {
 nonisolated(unsafe) let scenarioHandlers: [String: ScenarioHandler] = [
     "initialize": runInitializeScenario,
     "tools_call": runToolsCallScenario,
+    "request-metadata": runPerRequestMetadataScenario,
+    "sep-2322-client-request-state": runMultiRoundTripScenario,
+    "http-standard-headers": runListToolsOnlyScenario,
+    "http-custom-headers": runCustomHeaderScenario,
+    "http-invalid-tool-headers": runInvalidToolHeaderScenario,
+    "json-schema-ref-no-deref": runListToolsOnlyScenario,
     "sse-retry": runSSEScenario,
     "elicitation-sep1034-client-defaults": runElicitationSEP1034ClientDefaults,
 ]
