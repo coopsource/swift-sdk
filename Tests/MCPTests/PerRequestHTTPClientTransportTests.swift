@@ -1861,6 +1861,8 @@ import Testing
                     result = .object([
                         "resultType": "complete",
                         "tools": .array([try Value(tool)]),
+                        "ttlMs": 0,
+                        "cacheScope": "public",
                     ])
                     statusCode = 200
 
@@ -2039,6 +2041,8 @@ import Testing
                     result = .object([
                         "resultType": "complete",
                         "tools": .array([try Value(valid), try Value(invalid)]),
+                        "ttlMs": 0,
+                        "cacheScope": "public",
                     ])
                 }
                 return (
@@ -2124,6 +2128,8 @@ import Testing
                     result = .object([
                         "resultType": "complete",
                         "tools": .array([try Value(tool)]),
+                        "ttlMs": 0,
+                        "cacheScope": "public",
                     ])
                 }
                 return (

@@ -61,6 +61,17 @@ package protocol OriginalRequestIDProviding: Transport {
     func originalRequestID(for requestID: ID) async -> ID?
 }
 
+/// The authorization boundary used for private protocol response caching.
+package enum ResponseCacheAuthorizationContext: Hashable, Sendable {
+    case known(String)
+    case unavailable
+}
+
+/// Optional transport hook for isolating private cached responses.
+package protocol ResponseCacheAuthorizationContextProviding: Transport {
+    func responseCacheAuthorizationContext() async -> ResponseCacheAuthorizationContext
+}
+
 /// Optional HTTP-client hook for schemas that define tool parameter headers.
 package protocol ToolHeaderSchemaManaging: Transport {
     func updateToolHeaderSchemas(_ tools: [Tool], replacing: Bool) async -> [Tool]

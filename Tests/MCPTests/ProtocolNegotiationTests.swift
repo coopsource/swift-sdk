@@ -1013,6 +1013,7 @@ struct ProtocolNegotiationTests {
         #expect(client.protocolMode == .initializationOnly)
         #expect(client.discoveryProbeTimeout == 2)
         #expect(client.multiRoundTripMode == .disabled)
+        #expect(client.responseCacheMode == .disabled)
         #expect(server.protocolMode == .initializationOnly)
 
         let noTimeout = Client.Configuration(discoveryProbeTimeout: 0)
