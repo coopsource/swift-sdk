@@ -78,6 +78,71 @@ struct ProtocolNegotiationTests {
         await server.stop()
     }
 
+    @Test("Automatic client selects a per-request-metadata-only server")
+    func automaticClientUsesPerRequestServer() async throws {
+        let transports = await InMemoryTransport.createConnectedPair()
+        let server = Server(
+            name: "PerRequestServer",
+            version: "1.0",
+            configuration: .init(protocolMode: .perRequestMetadataOnly)
+        )
+        try await server.start(transport: transports.server)
+        let client = Client(
+            name: "AutomaticClient",
+            version: "1.0",
+            configuration: .init(protocolMode: .automatic)
+        )
+
+        let connection = try await client.connectWithInfo(transport: transports.client)
+        #expect(connection.protocolLifecycle == .perRequestMetadata)
+        #expect(connection.protocolVersion == Version.perRequestMetadataVersion)
+
+        await client.disconnect()
+        await server.stop()
+    }
+
+    @Test("Lifecycle-only clients fail against servers from the other lifecycle")
+    func incompatibleLifecycleOnlyModesFail() async throws {
+        let perRequestTransports = await InMemoryTransport.createConnectedPair()
+        let initializationServer = Server(
+            name: "InitializationServer",
+            version: "1.0",
+            configuration: .init(protocolMode: .initializationOnly)
+        )
+        try await initializationServer.start(transport: perRequestTransports.server)
+        let perRequestClient = Client(
+            name: "PerRequestClient",
+            version: "1.0",
+            configuration: .init(protocolMode: .perRequestMetadataOnly)
+        )
+
+        await #expect(throws: MCPError.self) {
+            _ = try await perRequestClient.connectWithInfo(transport: perRequestTransports.client)
+        }
+        await perRequestClient.disconnect()
+        await initializationServer.stop()
+
+        let initializationTransports = await InMemoryTransport.createConnectedPair()
+        let perRequestServer = Server(
+            name: "PerRequestServer",
+            version: "1.0",
+            configuration: .init(protocolMode: .perRequestMetadataOnly)
+        )
+        try await perRequestServer.start(transport: initializationTransports.server)
+        let initializationClient = Client(
+            name: "InitializationClient",
+            version: "1.0",
+            configuration: .init(protocolMode: .initializationOnly)
+        )
+
+        await #expect(throws: MCPError.self) {
+            _ = try await initializationClient.connectWithInfo(
+                transport: initializationTransports.client)
+        }
+        await initializationClient.disconnect()
+        await perRequestServer.stop()
+    }
+
     @Test("Automatic client falls back after an initialization-only discovery error")
     func automaticFallback() async throws {
         let transports = await InMemoryTransport.createConnectedPair()
@@ -167,8 +232,15 @@ struct ProtocolNegotiationTests {
         await client.disconnect()
     }
 
-    @Test("Recognized per-request errors do not trigger initialization fallback")
-    func recognizedErrorDoesNotFallback() async throws {
+    @Test(
+        "Recognized per-request errors do not trigger initialization fallback",
+        arguments: [
+            ProtocolErrorCode.headerMismatch,
+            ProtocolErrorCode.missingRequiredClientCapability,
+            ProtocolErrorCode.unsupportedProtocolVersion,
+        ]
+    )
+    func recognizedErrorDoesNotFallback(expectedCode: Int) async throws {
         let transport = MockTransport()
         let client = Client(
             name: "AutomaticClient",
@@ -184,12 +256,9 @@ struct ProtocolNegotiationTests {
         }
         let request: AnyRequest? = await transport.decodeLastSentMessage()
         let error = MCPError.remote(
-            code: ProtocolErrorCode.unsupportedProtocolVersion,
-            message: "Unsupported protocol version",
-            data: try Value(UnsupportedProtocolVersionData(
-                supported: ["2099-01-01"],
-                requested: Version.perRequestMetadataVersion
-            ))
+            code: expectedCode,
+            message: "Recognized per-request error",
+            data: nil
         )
         try await transport.queue(
             response: AnyMethod.response(id: request!.id, error: error))
@@ -198,14 +267,79 @@ struct ProtocolNegotiationTests {
             _ = try await connectionTask.value
             Issue.record("Expected the recognized protocol error")
         } catch let error as MCPError {
-            guard case .remote(let code, _, _) = error else {
+            guard case .remote(let actualCode, _, _) = error else {
                 Issue.record("Expected a remote protocol error")
                 await client.disconnect()
                 return
             }
-            #expect(code == ProtocolErrorCode.unsupportedProtocolVersion)
+            #expect(actualCode == expectedCode)
         }
         #expect(await transport.sentData.count == 1)
+        await client.disconnect()
+    }
+
+    @Test("Discovery without a mutually supported per-request version does not fall back")
+    func discoveryWithoutMutualVersionDoesNotFallback() async throws {
+        let transport = MockTransport()
+        let client = Client(
+            name: "AutomaticClient",
+            version: "1.0",
+            configuration: .init(protocolMode: .automatic)
+        )
+        let connectionTask = Task {
+            try await client.connectWithInfo(transport: transport)
+        }
+
+        try await waitUntil { await !transport.sentData.isEmpty }
+        let request: AnyRequest = try #require(await transport.decodeLastSentMessage())
+        try await transport.queue(response: Discover.response(
+            id: request.id,
+            result: .init(
+                supportedVersions: [Version.latestInitializationVersion],
+                capabilities: .init(),
+                ttlMs: 0,
+                cacheScope: .public
+            )
+        ))
+
+        do {
+            _ = try await connectionTask.value
+            Issue.record("Expected unsupported protocol version")
+        } catch let error as MCPError {
+            #expect(error.code == ProtocolErrorCode.unsupportedProtocolVersion)
+        }
+        #expect(await transport.sentData.count == 1)
+        await client.disconnect()
+    }
+
+    @Test("Cancelling automatic discovery does not start initialization")
+    func cancelledAutomaticDiscoveryDoesNotFallback() async throws {
+        let transport = MockTransport()
+        let client = Client(
+            name: "AutomaticClient",
+            version: "1.0",
+            configuration: .init(
+                protocolMode: .automatic,
+                discoveryProbeTimeout: 0
+            )
+        )
+        let connectionTask = Task {
+            try await client.connectWithInfo(transport: transport)
+        }
+
+        try await waitUntil { await !transport.sentData.isEmpty }
+        connectionTask.cancel()
+        await #expect(throws: CancellationError.self) {
+            _ = try await connectionTask.value
+        }
+        try await waitUntil { await transport.sentData.count == 2 }
+
+        let sent = await transport.sentData
+        #expect(try JSONDecoder().decode(AnyRequest.self, from: sent[0]).method == Discover.name)
+        #expect(
+            try JSONDecoder().decode(AnyMessage.self, from: sent[1]).method
+                == CancelledNotification.name
+        )
         await client.disconnect()
     }
 
@@ -451,7 +585,7 @@ struct ProtocolNegotiationTests {
             from: JSONEncoder().encode(data)
         )
         #expect(decoded.requested == "1900-01-01")
-        #expect(decoded.supported.first == Version.perRequestMetadataVersion)
+        #expect(decoded.supported == Version.preferenceOrder)
         await server.stop()
     }
 

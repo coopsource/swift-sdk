@@ -481,6 +481,8 @@ public actor Client {
         case .automatic:
             do {
                 return try await discoverConnection()
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 guard !isRecognizedPerRequestMetadataError(error) else { throw error }
                 guard shouldFallbackToInitialization(after: error) else { throw error }
@@ -944,11 +946,22 @@ public actor Client {
     private func awaitDiscovery(_ context: RequestContext<Discover.Result>) async throws
         -> Discover.Result
     {
-        guard !(connection is any HTTPProtocolNegotiationTransport),
-            configuration.discoveryProbeTimeout.isFinite,
+        guard !(connection is any HTTPProtocolNegotiationTransport) else {
+            return try await context.value
+        }
+        guard configuration.discoveryProbeTimeout.isFinite,
             configuration.discoveryProbeTimeout > 0
         else {
-            return try await context.value
+            return try await withTaskCancellationHandler {
+                try await context.value
+            } onCancel: {
+                Task {
+                    try? await self.cancelRequest(
+                        context.requestID,
+                        reason: "Server discovery cancelled"
+                    )
+                }
+            }
         }
         let timeout = configuration.discoveryProbeTimeout
 

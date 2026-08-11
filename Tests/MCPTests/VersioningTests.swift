@@ -60,4 +60,20 @@ struct VersioningTests {
         let negotiatedVersion = Version.negotiate(clientRequestedVersion: clientVersion)
         #expect(negotiatedVersion == "2025-11-25")
     }
+
+    @Test(
+        "Initialization negotiation preserves every initialization-based revision",
+        arguments: ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]
+    )
+    func testEveryInitializationVersion(version: String) {
+        #expect(Version.negotiate(clientRequestedVersion: version) == version)
+    }
+
+    @Test("Initialization negotiation never selects a per-request-metadata revision")
+    func testPerRequestVersionIsNotAnInitializationVersion() {
+        #expect(
+            Version.negotiate(clientRequestedVersion: Version.perRequestMetadataVersion)
+                == Version.latestInitializationVersion
+        )
+    }
 }
