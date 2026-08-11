@@ -413,7 +413,14 @@ package enum MCPHTTPHeaders {
             $0.key.caseInsensitiveCompare(name) == .orderedSame
         }
         guard matches.count == 1 else { return nil }
-        return matches.first?.value
+        guard var value = matches.first?.value[...] else { return nil }
+        while value.first == " " || value.first == "\t" {
+            value.removeFirst()
+        }
+        while value.last == " " || value.last == "\t" {
+            value.removeLast()
+        }
+        return String(value)
     }
 
     private static func isBoolean(_ number: NSNumber) -> Bool {

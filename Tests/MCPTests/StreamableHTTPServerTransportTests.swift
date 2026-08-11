@@ -68,6 +68,28 @@ private func makePerRequestBody(
     return try JSONEncoder().encode(Value.object(object))
 }
 
+private func makeProtocolRequestBody(
+    id: String,
+    method: String,
+    parameters: [String: Value]
+) throws -> Data {
+    var parameters = parameters
+    parameters["_meta"] = .object([
+        ProtocolMetadataKey.protocolVersion: .string(Version.perRequestMetadataVersion),
+        ProtocolMetadataKey.clientCapabilities: .object([:]),
+        ProtocolMetadataKey.clientInfo: .object([
+            "name": "HTTP test client",
+            "version": "1.0",
+        ]),
+    ])
+    return try JSONEncoder().encode(Value.object([
+        "jsonrpc": "2.0",
+        "id": .string(id),
+        "method": .string(method),
+        "params": .object(parameters),
+    ]))
+}
+
 private func makePerRequestHTTPPost(
     body: Data,
     protocolVersion: String? = Version.perRequestMetadataVersion,
@@ -480,7 +502,7 @@ struct StreamableHTTPServerTransportTests {
         await server.stop()
     }
 
-    @Test("Tool-list responses activate schema-derived header validation")
+    @Test("Configured tool definitions activate schema-derived header validation")
     func schemaDerivedHeaderValidation() async throws {
         let tool = Tool(
             name: "weather",
@@ -503,13 +525,11 @@ struct StreamableHTTPServerTransportTests {
             version: "1.0",
             configuration: .init(protocolMode: .perRequestMetadataOnly)
         )
-        await server.withMethodHandler(ListTools.self) { _ in
-            .init(tools: [tool])
-        }
         await server.withMethodHandler(CallTool.self) { _ in
             .init(content: [])
         }
         try await server.start(transport: transport)
+        try await transport.updateTools([tool])
 
         func body(id: String, method: String, parameters: [String: Value]) throws -> Data {
             var parameters = parameters
@@ -529,10 +549,6 @@ struct StreamableHTTPServerTransportTests {
                 "params": .object(parameters),
             ]))
         }
-
-        let listBody = try body(id: "list", method: ListTools.name, parameters: [:])
-        let listResponse = await transport.handleRequest(makePerRequestHTTPPost(body: listBody))
-        #expect(listResponse.statusCode == 200)
 
         let callBody = try body(
             id: "call-missing",
@@ -565,6 +581,157 @@ struct StreamableHTTPServerTransportTests {
             extraHeaders: customHeaders
         ))
         #expect(valid.statusCode == 200)
+
+        await server.stop()
+    }
+
+    @Test("Tool-list responses do not change server-wide header validation")
+    func toolListDoesNotChangeValidation() async throws {
+        let tool = Tool(
+            name: "weather",
+            description: nil,
+            inputSchema: .object([
+                "type": "object",
+                "properties": .object([
+                    "region": .object([
+                        "type": "string",
+                        "x-mcp-header": "Region",
+                    ])
+                ]),
+            ])
+        )
+        let transport = StreamableHTTPServerTransport(
+            validationPipeline: StandardValidationPipeline(validators: [])
+        )
+        let server = Server(
+            name: "HTTP server",
+            version: "1.0",
+            configuration: .init(protocolMode: .perRequestMetadataOnly)
+        )
+        await server.withMethodHandler(ListTools.self) { _ in .init(tools: [tool]) }
+        await server.withMethodHandler(CallTool.self) { _ in .init(content: []) }
+        try await server.start(transport: transport)
+
+        let list = await transport.handleRequest(makePerRequestHTTPPost(
+            body: try makeProtocolRequestBody(
+                id: "list-tools",
+                method: ListTools.name,
+                parameters: [:]
+            )
+        ))
+        #expect(list.statusCode == 200)
+
+        let call = await transport.handleRequest(makePerRequestHTTPPost(
+            body: try makeProtocolRequestBody(
+                id: "call-tool",
+                method: CallTool.name,
+                parameters: [
+                    "name": "weather",
+                    "arguments": .object(["region": "us-west1"]),
+                ]
+            )
+        ))
+        #expect(call.statusCode == 200)
+
+        await server.stop()
+    }
+
+    @Test("Request-local tool schemas remain isolated across concurrent callers")
+    func requestLocalToolSchemas() async throws {
+        let regionTool = Tool(
+            name: "weather",
+            description: nil,
+            inputSchema: .object([
+                "type": "object",
+                "properties": .object([
+                    "region": .object([
+                        "type": "string",
+                        "x-mcp-header": "Region",
+                    ])
+                ]),
+            ])
+        )
+        let tenantTool = Tool(
+            name: "weather",
+            description: nil,
+            inputSchema: .object([
+                "type": "object",
+                "properties": .object([
+                    "tenant": .object([
+                        "type": "string",
+                        "x-mcp-header": "Tenant",
+                    ])
+                ]),
+            ])
+        )
+        let transport = StreamableHTTPServerTransport(
+            validationPipeline: StandardValidationPipeline(validators: []),
+            toolHeaderSchemaProvider: { _, request in
+                request.header(HTTPHeaderName.authorization) == "Bearer region"
+                    ? regionTool : tenantTool
+            }
+        )
+        let server = Server(
+            name: "HTTP server",
+            version: "1.0",
+            configuration: .init(protocolMode: .perRequestMetadataOnly)
+        )
+        await server.withMethodHandler(CallTool.self) { _ in .init(content: []) }
+        try await server.start(transport: transport)
+
+        func request(
+            id: String,
+            authorization: String,
+            arguments: [String: Value],
+            tool: Tool
+        ) throws -> HTTPRequest {
+            let body = try makeProtocolRequestBody(
+                id: id,
+                method: CallTool.name,
+                parameters: [
+                    "name": "weather",
+                    "arguments": .object(arguments),
+                ]
+            )
+            let headers = try MCPHTTPHeaders.requestHeaders(
+                for: body,
+                toolPlans: [tool.name: try ToolHeaderPlan(tool: tool)]
+            )
+            return makePerRequestHTTPPost(
+                body: body,
+                authorization: authorization,
+                extraHeaders: headers
+            )
+        }
+
+        let regionRequest = try request(
+            id: "region",
+            authorization: "Bearer region",
+            arguments: ["region": "us-west1"],
+            tool: regionTool
+        )
+        let tenantRequest = try request(
+            id: "tenant",
+            authorization: "Bearer tenant",
+            arguments: ["tenant": "example"],
+            tool: tenantTool
+        )
+        async let regionResponse = transport.handleRequest(regionRequest)
+        async let tenantResponse = transport.handleRequest(tenantRequest)
+
+        #expect(await regionResponse.statusCode == 200)
+        #expect(await tenantResponse.statusCode == 200)
+
+        let wrongSchema = await transport.handleRequest(try request(
+            id: "wrong",
+            authorization: "Bearer region",
+            arguments: [
+                "region": "us-west1",
+                "tenant": "example",
+            ],
+            tool: tenantTool
+        ))
+        #expect(wrongSchema.statusCode == 400)
 
         await server.stop()
     }

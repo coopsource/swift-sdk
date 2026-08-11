@@ -294,6 +294,18 @@ struct HTTPHeaderMetadataTests {
         )?.contains("Mcp-Method") == true)
     }
 
+    @Test("Server comparison ignores HTTP optional whitespace around values")
+    func headerOptionalWhitespace() throws {
+        let body = try makeHeaderCall(arguments: [:])
+        let generated = try MCPHTTPHeaders.requestHeaders(for: body, toolPlans: [:])
+        let headers = generated.mapValues { " \t\($0)\t " }
+
+        #expect(MCPHTTPHeaders.validationFailure(
+            for: makeHeaderHTTPRequest(body: body, generatedHeaders: headers),
+            toolPlans: [:]
+        ) == nil)
+    }
+
     @Test("Required standard headers fail with HeaderMismatch and preserve the request id")
     func standardHeaderError() async throws {
         let transport = StreamableHTTPServerTransport(
