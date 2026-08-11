@@ -651,8 +651,13 @@ public actor Server {
         let responseData: Data
         if protocolLifecycle == .perRequestMetadata {
             let response = validatedCacheFields(in: response, requestMethod: requestMethod)
-            responseData = try PerRequestMetadataWire.encodeResponse(
+            let encoded = try PerRequestMetadataWire.encodeResponse(
                 response, serverInfo: serverInfo, using: encoder)
+            responseData = try addingConservativeCacheFields(
+                to: encoded,
+                requestMethod: requestMethod,
+                using: encoder
+            )
         } else {
             responseData = try encoder.encode(response)
         }
@@ -1300,7 +1305,11 @@ public actor Server {
         }
 
         guard resultType == "complete",
-            let ttlMs = object["ttlMs"]?.intValue,
+            object["ttlMs"] != nil || object["cacheScope"] != nil
+        else {
+            return response
+        }
+        guard let ttlMs = object["ttlMs"]?.intValue,
             ttlMs >= 0,
             let rawScope = object["cacheScope"]?.stringValue,
             CacheScope(rawValue: rawScope) != nil
@@ -1312,6 +1321,26 @@ public actor Server {
             )
         }
         return response
+    }
+
+    private func addingConservativeCacheFields(
+        to data: Data,
+        requestMethod: String?,
+        using encoder: JSONEncoder
+    ) throws -> Data {
+        guard let requestMethod, Self.cacheableResultMethods.contains(requestMethod),
+            case .object(var envelope) = try JSONDecoder().decode(Value.self, from: data),
+            case .object(var result) = envelope["result"],
+            (result["resultType"]?.stringValue ?? "complete") == "complete",
+            result["ttlMs"] == nil,
+            result["cacheScope"] == nil
+        else {
+            return data
+        }
+        result["ttlMs"] = 0
+        result["cacheScope"] = .string(CacheScope.private.rawValue)
+        envelope["result"] = .object(result)
+        return try encoder.encode(Value.object(envelope))
     }
 
     private static let cacheableResultMethods: Set<String> = [

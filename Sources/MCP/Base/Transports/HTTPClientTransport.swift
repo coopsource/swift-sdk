@@ -238,7 +238,8 @@ private struct RequestScopedSSEParser {
 /// ```
 public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestStreamCancelling,
     ProtocolLifecycleCacheKeyProviding, ToolHeaderSchemaManaging,
-    ResponseCacheAuthorizationContextProviding
+    ResponseCacheAuthorizationContextProviding,
+    ResponseCacheRequestAuthorizationContextProviding
 {
     /// The server endpoint URL to connect to
     public let endpoint: URL
@@ -294,6 +295,7 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
     /// Active request-scoped HTTP tasks, keyed by JSON-RPC request ID.
     private var activeRequestTasks: [ID: URLSessionDataTask] = [:]
     private var usesUntrackedAuthorization = false
+    private var responseCacheAuthorizationContexts: [ID: ResponseCacheAuthorizationContext] = [:]
 
     /// Cancellations received before the corresponding HTTP task is registered.
     private var pendingRequestCancellations: Set<ID> = []
@@ -451,6 +453,7 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
         }
         activeRequestTasks = [:]
         pendingRequestCancellations = []
+        responseCacheAuthorizationContexts = [:]
         toolHeaderPlans.removeAll()
 
         session.invalidateAndCancel()
@@ -552,6 +555,12 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
     package func responseCacheAuthorizationContext() -> ResponseCacheAuthorizationContext {
         guard !usesUntrackedAuthorization else { return .unavailable }
         return .known(authorizer?.authorizationHeader(for: endpoint) ?? "")
+    }
+
+    package func takeResponseCacheAuthorizationContext(
+        for requestID: ID
+    ) -> ResponseCacheAuthorizationContext {
+        responseCacheAuthorizationContexts.removeValue(forKey: requestID) ?? .unavailable
     }
 
     /// Sends data through an HTTP POST request
@@ -664,6 +673,12 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
             throw MCPError.invalidRequest(
                 "Per-request metadata HTTP requires one JSON-RPC request or notification per POST")
         }
+        var completedRequest = false
+        defer {
+            if !completedRequest, let requestID {
+                responseCacheAuthorizationContexts.removeValue(forKey: requestID)
+            }
+        }
 
         let operationKey = jsonRPCOperationKey(from: data)
         let isDiscovery = operationKey == Discover.name
@@ -728,10 +743,16 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
                 request.setValue(authValue, forHTTPHeaderField: HTTPHeaderName.authorization)
             }
             request = requestModifier(request)
-            if request.value(forHTTPHeaderField: HTTPHeaderName.authorization)
-                != authorizationHeader
-            {
+            let appliedAuthorization = request.value(
+                forHTTPHeaderField: HTTPHeaderName.authorization)
+            if appliedAuthorization != authorizationHeader {
                 usesUntrackedAuthorization = true
+            }
+            if let requestID {
+                responseCacheAuthorizationContexts[requestID] =
+                    appliedAuthorization == authorizationHeader
+                    ? .known(appliedAuthorization ?? "")
+                    : .unavailable
             }
 
             do {
@@ -743,6 +764,7 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
                     isNotification: isNotification,
                     isDiscovery: isDiscovery
                 )
+                completedRequest = true
                 return
             } catch let authError as HTTPAuthenticationChallengeError {
                 guard let authorizer else {

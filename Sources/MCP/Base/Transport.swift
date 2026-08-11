@@ -72,6 +72,13 @@ package protocol ResponseCacheAuthorizationContextProviding: Transport {
     func responseCacheAuthorizationContext() async -> ResponseCacheAuthorizationContext
 }
 
+/// Optional transport hook for the authorization context used by one completed request attempt.
+package protocol ResponseCacheRequestAuthorizationContextProviding: Transport {
+    func takeResponseCacheAuthorizationContext(
+        for requestID: ID
+    ) async -> ResponseCacheAuthorizationContext
+}
+
 /// Optional HTTP-client hook for schemas that define tool parameter headers.
 package protocol ToolHeaderSchemaManaging: Transport {
     func updateToolHeaderSchemas(_ tools: [Tool], replacing: Bool) async -> [Tool]
