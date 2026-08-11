@@ -379,7 +379,7 @@ struct MultiRoundTripTests {
         try await connectPerRequestClient(client, transport: transport)
         await transport.clearMessages()
 
-        let request = Ping.request()
+        let request = ListTools.request(.init())
         let context = try await client.send(request)
         try await waitUntil { await !transport.sentData.isEmpty }
         await transport.queue(data: try JSONEncoder().encode(Value.object([
@@ -392,8 +392,8 @@ struct MultiRoundTripTests {
         }
 
         await transport.clearMessages()
-        let batchRequest = Ping.request()
-        nonisolated(unsafe) var batchTask: Task<Ping.Result, Error>?
+        let batchRequest = ListTools.request(.init())
+        nonisolated(unsafe) var batchTask: Task<ListTools.Result, Error>?
         try await client.withBatch { batch in
             batchTask = try await batch.addRequest(batchRequest)
         }
