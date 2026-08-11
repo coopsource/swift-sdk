@@ -123,6 +123,7 @@ private final class HTTPResponseStreamDelegate: NSObject, URLSessionDataDelegate
 private struct RequestScopedSSEParser {
     private var buffer = Data()
     private var dataLines: [String] = []
+    private var isFirstLine = true
 
     mutating func append(_ data: Data) throws -> [Data] {
         buffer.append(data)
@@ -159,8 +160,12 @@ private struct RequestScopedSSEParser {
     }
 
     private mutating func process(line: Data, messages: inout [Data]) throws {
-        guard let line = String(data: line, encoding: .utf8) else {
+        guard var line = String(data: line, encoding: .utf8) else {
             throw MCPError.invalidRequest("SSE response is not valid UTF-8")
+        }
+        if isFirstLine {
+            isFirstLine = false
+            if line.first == "\u{FEFF}" { line.removeFirst() }
         }
         if line.isEmpty {
             dispatch(messages: &messages)
@@ -282,6 +287,9 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
     /// Active request-scoped HTTP tasks, keyed by JSON-RPC request ID.
     private var activeRequestTasks: [ID: URLSessionDataTask] = [:]
 
+    /// Cancellations received before the corresponding HTTP task is registered.
+    private var pendingRequestCancellations: Set<ID> = []
+
     /// Serializes access to authorizers whose mutable state is transport-confined.
     private var authorizationTail: Task<Void, Never>?
 
@@ -302,7 +310,7 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
         configuration: URLSessionConfiguration = .default,
         streaming: Bool = true,
         sseInitializationTimeout: TimeInterval = 10,
-        protocolVersion: String = Version.latest,
+        protocolVersion: String = Version.latestInitializationVersion,
         authorizer: (any HTTPClientAuthorizer)? = nil,
         requestModifier: @escaping (URLRequest) -> URLRequest = { $0 },
         logger: Logger? = nil
@@ -325,7 +333,7 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
         session: URLSession,
         streaming: Bool = false,
         sseInitializationTimeout: TimeInterval = 10,
-        protocolVersion: String = Version.latest,
+        protocolVersion: String = Version.latestInitializationVersion,
         authorizer: (any HTTPClientAuthorizer)? = nil,
         requestModifier: @escaping (URLRequest) -> URLRequest = { $0 },
         logger: Logger? = nil
@@ -403,6 +411,7 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
             task.cancel()
         }
         activeRequestTasks = [:]
+        pendingRequestCancellations = []
 
         session.invalidateAndCancel()
         requestSession.invalidateAndCancel()
@@ -444,7 +453,11 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
     }
 
     package func cancelRequestStream(id: ID) {
-        activeRequestTasks[id]?.cancel()
+        if let task = activeRequestTasks[id] {
+            task.cancel()
+        } else {
+            pendingRequestCancellations.insert(id)
+        }
     }
 
     /// Sends data through an HTTP POST request
@@ -512,6 +525,9 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
                 guard let authorizer else {
                     throw mapAuthenticationChallengeError(authError)
                 }
+                guard attempts < authorizer.maxAuthorizationAttempts else {
+                    throw mapAuthenticationChallengeError(authError)
+                }
 
                 let handled: Bool
                 do {
@@ -529,9 +545,7 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
 
                 attempts += 1
 
-                if handled, attempts < authorizer.maxAuthorizationAttempts {
-                    continue
-                }
+                if handled { continue }
 
                 throw mapAuthenticationChallengeError(authError)
             }
@@ -630,6 +644,12 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
                         isDiscovery: isDiscovery
                     )
                 }
+                guard attempts < maximumAuthorizationAttempts else {
+                    throw probeErrorIfNeeded(
+                        mapAuthenticationChallengeError(authError),
+                        isDiscovery: isDiscovery
+                    )
+                }
 
                 let challengeResult: (handled: Bool, authorizationHeader: String?)
                 do {
@@ -662,9 +682,7 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
                 }
 
                 attempts += 1
-                if challengeResult.handled,
-                    attempts < maximumAuthorizationAttempts
-                {
+                if challengeResult.handled {
                     authorizationHeader = challengeResult.authorizationHeader
                     continue
                 }
@@ -674,6 +692,10 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
                 )
             } catch let error as ProtocolLifecycleProbeError {
                 throw error
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as URLError where error.code == .cancelled && Task.isCancelled {
+                throw CancellationError()
             } catch let error as MCPError {
                 throw probeErrorIfNeeded(error, isDiscovery: isDiscovery)
             } catch {
@@ -690,6 +712,9 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
         isNotification: Bool,
         isDiscovery: Bool
     ) async throws {
+        if let requestID, pendingRequestCancellations.remove(requestID) != nil {
+            throw CancellationError()
+        }
         let task = requestSession.dataTask(with: request)
         let responseStream = requestStreamDelegate.register(task: task)
         if let requestID {
