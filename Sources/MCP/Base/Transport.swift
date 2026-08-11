@@ -18,3 +18,11 @@ public protocol Transport: Actor {
     /// Receives data in an async sequence
     func receive() -> AsyncThrowingStream<Data, Swift.Error>
 }
+
+/// Optional transport hook for lifecycle-specific request routing.
+///
+/// The raw `Transport` interface remains unchanged. Transports whose wire behavior differs
+/// between lifecycle mechanisms can adopt this package-only protocol.
+package protocol ProtocolLifecycleUpdating: Transport {
+    func updateProtocolLifecycle(_ lifecycle: ProtocolLifecycle, protocolVersion: String) async
+}

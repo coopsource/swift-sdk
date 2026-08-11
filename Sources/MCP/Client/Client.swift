@@ -7,6 +7,18 @@ import class Foundation.JSONEncoder
 
 /// Model Context Protocol client
 public actor Client {
+    /// Selects the protocol lifecycle used when connecting to a server.
+    public enum ProtocolMode: String, Hashable, Codable, Sendable {
+        /// Use `initialize` and `notifications/initialized` only.
+        case initializationOnly
+
+        /// Probe for per-request metadata support and fall back to initialization when required.
+        case automatic
+
+        /// Require per-request metadata and do not fall back to initialization.
+        case perRequestMetadataOnly
+    }
+
     /// The client configuration
     public struct Configuration: Hashable, Codable, Sendable {
         /// The default configuration.
@@ -25,8 +37,27 @@ public actor Client {
         /// servers, though this may lead to undefined behavior.
         public var strict: Bool
 
-        public init(strict: Bool = false) {
+        /// The protocol lifecycle selection policy.
+        public var protocolMode: ProtocolMode
+
+        public init(
+            strict: Bool = false,
+            protocolMode: ProtocolMode = .initializationOnly
+        ) {
             self.strict = strict
+            self.protocolMode = protocolMode
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case strict, protocolMode
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            strict = try container.decodeIfPresent(Bool.self, forKey: .strict) ?? false
+            protocolMode =
+                try container.decodeIfPresent(ProtocolMode.self, forKey: .protocolMode)
+                ?? .initializationOnly
         }
     }
 
@@ -59,6 +90,47 @@ public actor Client {
             self.description = description
             self.websiteUrl = websiteUrl
             self.icons = icons
+        }
+    }
+
+    /// Information selected while establishing an MCP connection.
+    public struct ConnectionInfo: Hashable, Codable, Sendable {
+        /// The protocol version used for requests on this connection.
+        public let protocolVersion: String
+
+        /// The lifecycle mechanism used by the connection.
+        public let protocolLifecycle: ProtocolLifecycle
+
+        /// Capabilities reported by the server.
+        public let capabilities: Server.Capabilities
+
+        /// Self-reported server information, when supplied by the server.
+        public let serverInfo: Server.Info?
+
+        /// Optional instructions reported by the server.
+        public let instructions: String?
+
+        public init(
+            protocolVersion: String,
+            protocolLifecycle: ProtocolLifecycle,
+            capabilities: Server.Capabilities,
+            serverInfo: Server.Info? = nil,
+            instructions: String? = nil
+        ) {
+            self.protocolVersion = protocolVersion
+            self.protocolLifecycle = protocolLifecycle
+            self.capabilities = capabilities
+            self.serverInfo = serverInfo
+            self.instructions = instructions
+        }
+
+        fileprivate var initializeResult: Initialize.Result {
+            Initialize.Result(
+                protocolVersion: protocolVersion,
+                capabilities: capabilities,
+                serverInfo: serverInfo ?? .init(name: "unknown", version: "0.0.0"),
+                instructions: instructions
+            )
         }
     }
 
@@ -271,6 +343,10 @@ public actor Client {
     private var serverVersion: String?
     /// The server instructions
     private var instructions: String?
+    /// The lifecycle selected for the active connection.
+    private var selectedProtocolLifecycle: ProtocolLifecycle?
+    /// The protocol version selected for the active connection.
+    private var selectedProtocolVersion: String?
 
     /// A dictionary of type-erased notification handlers, keyed by method name
     private var notificationHandlers: [String: [NotificationHandlerBox]] = [:]
@@ -305,7 +381,15 @@ public actor Client {
     /// Connect to the server using the given transport
     @discardableResult
     public func connect(transport: any Transport) async throws -> Initialize.Result {
+        try await connectWithInfo(transport: transport).initializeResult
+    }
+
+    /// Connects to a server and reports the selected protocol lifecycle.
+    @discardableResult
+    public func connectWithInfo(transport: any Transport) async throws -> ConnectionInfo {
         self.connection = transport
+        selectedProtocolLifecycle = nil
+        selectedProtocolVersion = nil
         try await self.connection?.connect()
 
         await logger?.debug(
@@ -379,8 +463,19 @@ public actor Client {
             }
         }
 
-        // Automatically initialize after connecting
-        return try await _initialize()
+        switch configuration.protocolMode {
+        case .initializationOnly:
+            return try await initializeConnection()
+        case .automatic:
+            do {
+                return try await discoverConnection()
+            } catch {
+                guard !isRecognizedPerRequestMetadataError(error) else { throw error }
+                return try await initializeConnection()
+            }
+        case .perRequestMetadataOnly:
+            return try await discoverConnection()
+        }
     }
 
     /// Disconnect the client and cancel all pending requests
@@ -395,6 +490,8 @@ public actor Client {
         self.task = nil
         self.connection = nil
         self.pendingRequests = [:]  // Use empty dictionary literal
+        self.selectedProtocolLifecycle = nil
+        self.selectedProtocolVersion = nil
 
         // Part 2: Outside actor - Resume continuations, disconnect transport, await task
 
@@ -494,7 +591,7 @@ public actor Client {
             throw MCPError.internalError("Client connection not initialized")
         }
 
-        let requestData = try encoder.encode(request)
+        let requestData = try encodeRequest(request)
 
         let requestTask = Task<M.Result, Error> {
             try await withCheckedThrowingContinuation { continuation in
@@ -716,7 +813,21 @@ public actor Client {
             "Sending batch request", metadata: ["count": "\(requests.count)"])
 
         // Encode the array of AnyMethod requests into a single JSON payload
-        let data = try encoder.encode(requests)
+        let encoded = try encoder.encode(requests)
+        let data: Data
+        if selectedProtocolLifecycle == .perRequestMetadata,
+            let selectedProtocolVersion
+        {
+            data = try PerRequestMetadataWire.addingRequestMetadata(
+                to: encoded,
+                protocolVersion: selectedProtocolVersion,
+                clientInfo: clientInfo,
+                clientCapabilities: capabilities,
+                using: encoder
+            )
+        } else {
+            data = encoded
+        }
         try await connection.send(data)
 
         // Responses will be handled asynchronously by the message loop and handleBatchResponse/handleResponse.
@@ -737,6 +848,124 @@ public actor Client {
     )
     public func initialize() async throws -> Initialize.Result {
         return try await _initialize()
+    }
+
+    private func initializeConnection() async throws -> ConnectionInfo {
+        selectedProtocolLifecycle = .initializationBased
+        selectedProtocolVersion = Version.latestInitializationVersion
+        let result = try await _initialize()
+        await updateTransportLifecycle(
+            .initializationBased, protocolVersion: result.protocolVersion)
+        return ConnectionInfo(
+            protocolVersion: result.protocolVersion,
+            protocolLifecycle: .initializationBased,
+            capabilities: result.capabilities,
+            serverInfo: result.serverInfo,
+            instructions: result.instructions
+        )
+    }
+
+    private func discoverConnection() async throws -> ConnectionInfo {
+        selectedProtocolLifecycle = .perRequestMetadata
+        selectedProtocolVersion = Version.perRequestMetadataVersion
+
+        let request = Discover.request(.init())
+        let context = try send(request)
+        let result: Discover.Result
+        do {
+            result = try await withThrowingTaskGroup(of: Discover.Result.self) { group in
+                group.addTask { try await context.value }
+                group.addTask {
+                    try await Task.sleep(for: .seconds(2))
+                    throw MCPError.internalError("Server discovery timed out")
+                }
+
+                do {
+                    guard let first = try await group.next() else {
+                        throw MCPError.internalError("Server discovery did not complete")
+                    }
+                    group.cancelAll()
+                    return first
+                } catch {
+                    if let pending = self.removePendingRequest(id: context.requestID) {
+                        pending.resume(throwing: error)
+                    }
+                    group.cancelAll()
+                    throw error
+                }
+            }
+        } catch {
+            selectedProtocolLifecycle = nil
+            selectedProtocolVersion = nil
+            throw error
+        }
+
+        guard
+            let selectedVersion = Version.preferenceOrder.first(where: {
+                Version.perRequestMetadataSupported.contains($0)
+                    && result.supportedVersions.contains($0)
+            })
+        else {
+            selectedProtocolLifecycle = nil
+            selectedProtocolVersion = nil
+            throw MCPError.remote(
+                code: ProtocolErrorCode.unsupportedProtocolVersion,
+                message: "Server does not advertise a mutually supported per-request metadata version",
+                data: try? Value(UnsupportedProtocolVersionData(
+                    supported: result.supportedVersions,
+                    requested: Version.perRequestMetadataVersion
+                ))
+            )
+        }
+
+        selectedProtocolVersion = selectedVersion
+        serverCapabilities = result.capabilities
+        serverVersion = result.serverInfo?.version
+        instructions = result.instructions
+        await updateTransportLifecycle(.perRequestMetadata, protocolVersion: selectedVersion)
+
+        return ConnectionInfo(
+            protocolVersion: selectedVersion,
+            protocolLifecycle: .perRequestMetadata,
+            capabilities: result.capabilities,
+            serverInfo: result.serverInfo,
+            instructions: result.instructions
+        )
+    }
+
+    private func updateTransportLifecycle(
+        _ lifecycle: ProtocolLifecycle,
+        protocolVersion: String
+    ) async {
+        if let transport = connection as? any ProtocolLifecycleUpdating {
+            await transport.updateProtocolLifecycle(lifecycle, protocolVersion: protocolVersion)
+        }
+    }
+
+    private func isRecognizedPerRequestMetadataError(_ error: Swift.Error) -> Bool {
+        guard let mcpError = error as? MCPError,
+            case .remote(let code, _, _) = mcpError
+        else {
+            return false
+        }
+        return code == ProtocolErrorCode.headerMismatch
+            || code == ProtocolErrorCode.missingRequiredClientCapability
+            || code == ProtocolErrorCode.unsupportedProtocolVersion
+    }
+
+    private func encodeRequest<M: Method>(_ request: Request<M>) throws -> Data {
+        guard selectedProtocolLifecycle == .perRequestMetadata,
+            let selectedProtocolVersion
+        else {
+            return try encoder.encode(request)
+        }
+        return try PerRequestMetadataWire.encodeRequest(
+            request,
+            protocolVersion: selectedProtocolVersion,
+            clientInfo: clientInfo,
+            clientCapabilities: capabilities,
+            using: encoder
+        )
     }
 
     /// Internal initialization implementation
@@ -1070,7 +1299,11 @@ public actor Client {
             // If we successfully removed it, resume its continuation.
             switch response.result {
             case .success(let value):
-                removedRequest.resume(returning: value)
+                if let error = resultTypeValidationError(for: value) {
+                    removedRequest.resume(throwing: error)
+                } else {
+                    removedRequest.resume(returning: value)
+                }
             case .failure(let error):
                 removedRequest.resume(throwing: error)
             }
@@ -1164,6 +1397,17 @@ public actor Client {
         }
     }
 
+    private func resultTypeValidationError(for value: Value) -> MCPError? {
+        guard selectedProtocolLifecycle == .perRequestMetadata else { return nil }
+        guard let result = value.objectValue,
+            result["resultType"]?.stringValue != nil
+        else {
+            return MCPError.internalError(
+                "Per-request metadata response is missing a string-valued resultType")
+        }
+        return nil
+    }
+
     // Add handler for batch responses
     private func handleBatchResponse(_ responses: [AnyResponse]) async {
         await logger?.trace("Processing batch response", metadata: ["count": "\(responses.count)"])
@@ -1174,7 +1418,11 @@ public actor Client {
                 // If we successfully removed it, handle the response using the pending request.
                 switch response.result {
                 case .success(let value):
-                    pendingRequest.resume(returning: value)
+                    if let error = resultTypeValidationError(for: value) {
+                        pendingRequest.resume(throwing: error)
+                    } else {
+                        pendingRequest.resume(returning: value)
+                    }
                 case .failure(let error):
                     pendingRequest.resume(throwing: error)
                 }

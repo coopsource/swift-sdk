@@ -5,10 +5,10 @@ import Testing
 
 @Suite("MCP 2026-07-28 wire models")
 struct Protocol20260728Tests {
-    @Test("Version is known without changing supported lifecycle behavior")
+    @Test("Version is supported without changing the default lifecycle")
     func versionSupport() {
         #expect(Version.perRequestMetadataVersion == "2026-07-28")
-        #expect(!Version.supported.contains("2026-07-28"))
+        #expect(Version.supported.contains("2026-07-28"))
         #expect(Version.latest == "2025-11-25")
         #expect(Version.latestInitializationVersion == "2025-11-25")
         #expect(Version.preferenceOrder.first == "2026-07-28")
@@ -31,6 +31,24 @@ struct Protocol20260728Tests {
             result._meta?[ProtocolMetadataKey.serverInfo]?.objectValue?["name"]
                 == .string("ExampleServer")
         )
+    }
+
+    @Test("Per-request metadata encoding matches the official discovery request")
+    func discoveryRequestFixture() throws {
+        let encoder = JSONEncoder()
+        let encoded = try PerRequestMetadataWire.encodeRequest(
+            Discover.request(id: .string("discover-1"), .init()),
+            protocolVersion: Version.perRequestMetadataVersion,
+            clientInfo: .init(name: "ExampleClient", version: "1.0.0"),
+            clientCapabilities: .init(),
+            using: encoder
+        )
+
+        let decoder = JSONDecoder()
+        let actual = try decoder.decode(Value.self, from: encoded)
+        let expected = try decoder.decode(
+            Value.self, from: try fixture(named: "discover-request"))
+        #expect(actual == expected)
     }
 
     @Test("Structured protocol error data is preserved")

@@ -1,3 +1,7 @@
+import struct Foundation.Data
+import class Foundation.JSONDecoder
+import class Foundation.JSONEncoder
+
 /// Metadata keys reserved by MCP protocol version 2026-07-28.
 public enum ProtocolMetadataKey {
     public static let protocolVersion = "io.modelcontextprotocol/protocolVersion"
@@ -97,6 +101,154 @@ struct ProtocolCapabilityCodingKey: CodingKey {
     }
 }
 
+struct PerRequestProtocolMetadata: Sendable {
+    let protocolVersion: String
+    let clientInfo: Client.Info?
+    let clientCapabilities: Client.Capabilities
+}
+
+enum PerRequestMetadataWire {
+    static func encodeRequest<M: Method>(
+        _ request: Request<M>,
+        protocolVersion: String,
+        clientInfo: Client.Info,
+        clientCapabilities: Client.Capabilities,
+        using encoder: JSONEncoder
+    ) throws -> Data {
+        let data = try encoder.encode(request)
+        return try addingRequestMetadata(
+            to: data,
+            protocolVersion: protocolVersion,
+            clientInfo: clientInfo,
+            clientCapabilities: clientCapabilities,
+            using: encoder
+        )
+    }
+
+    static func addingRequestMetadata(
+        to data: Data,
+        protocolVersion: String,
+        clientInfo: Client.Info,
+        clientCapabilities: Client.Capabilities,
+        using encoder: JSONEncoder
+    ) throws -> Data {
+        var value = try JSONDecoder().decode(Value.self, from: data)
+        value = try addingRequestMetadata(
+            to: value,
+            protocolVersion: protocolVersion,
+            clientInfo: clientInfo,
+            clientCapabilities: clientCapabilities
+        )
+        return try encoder.encode(value)
+    }
+
+    private static func addingRequestMetadata(
+        to value: Value,
+        protocolVersion: String,
+        clientInfo: Client.Info,
+        clientCapabilities: Client.Capabilities
+    ) throws -> Value {
+        if case .array(let items) = value {
+            return .array(try items.map {
+                try addingRequestMetadata(
+                    to: $0,
+                    protocolVersion: protocolVersion,
+                    clientInfo: clientInfo,
+                    clientCapabilities: clientCapabilities
+                )
+            })
+        }
+
+        guard case .object(var request) = value else {
+            throw MCPError.invalidRequest("Request must be a JSON object")
+        }
+
+        var parameters = request["params"]?.objectValue ?? [:]
+        var metadata = parameters["_meta"]?.objectValue ?? [:]
+        metadata[ProtocolMetadataKey.protocolVersion] = .string(protocolVersion)
+        metadata[ProtocolMetadataKey.clientInfo] = try Value(clientInfo)
+        metadata[ProtocolMetadataKey.clientCapabilities] = try Value(clientCapabilities)
+        parameters["_meta"] = .object(metadata)
+        request["params"] = .object(parameters)
+        return .object(request)
+    }
+
+    static func decodeRequestMetadata(from request: AnyRequest) throws
+        -> PerRequestProtocolMetadata
+    {
+        guard let parameters = request.params.objectValue,
+            let metadata = parameters["_meta"]?.objectValue
+        else {
+            throw MCPError.invalidRequest(
+                "Per-request metadata requires an object-valued params._meta field")
+        }
+        guard let protocolVersion = metadata[ProtocolMetadataKey.protocolVersion]?.stringValue
+        else {
+            throw MCPError.invalidRequest(
+                "Per-request metadata is missing io.modelcontextprotocol/protocolVersion")
+        }
+        guard let capabilitiesValue = metadata[ProtocolMetadataKey.clientCapabilities] else {
+            throw MCPError.invalidRequest(
+                "Per-request metadata is missing io.modelcontextprotocol/clientCapabilities")
+        }
+
+        let decoder = JSONDecoder()
+        let capabilities: Client.Capabilities
+        let clientInfo: Client.Info?
+        do {
+            capabilities = try decoder.decode(
+                Client.Capabilities.self, from: JSONEncoder().encode(capabilitiesValue))
+            if let clientInfoValue = metadata[ProtocolMetadataKey.clientInfo] {
+                clientInfo = try decoder.decode(
+                    Client.Info.self, from: JSONEncoder().encode(clientInfoValue))
+            } else {
+                clientInfo = nil
+            }
+        } catch {
+            throw MCPError.invalidRequest("Per-request client metadata is malformed")
+        }
+
+        return PerRequestProtocolMetadata(
+            protocolVersion: protocolVersion,
+            clientInfo: clientInfo,
+            clientCapabilities: capabilities
+        )
+    }
+
+    static func containsLifecycleMetadata(_ request: AnyRequest) -> Bool {
+        guard let parameters = request.params.objectValue,
+            let metadata = parameters["_meta"]?.objectValue
+        else {
+            return false
+        }
+        return metadata[ProtocolMetadataKey.protocolVersion] != nil
+            || metadata[ProtocolMetadataKey.clientCapabilities] != nil
+            || metadata[ProtocolMetadataKey.clientInfo] != nil
+    }
+
+    static func encodeResponse<M: Method>(
+        _ response: Response<M>,
+        serverInfo: Server.Info,
+        using encoder: JSONEncoder
+    ) throws -> Data {
+        let data = try encoder.encode(response)
+        guard case .object(var envelope) = try JSONDecoder().decode(Value.self, from: data),
+            case .object(var result) = envelope["result"]
+        else {
+            return data
+        }
+
+        if result["resultType"] == nil {
+            result["resultType"] = .string("complete")
+        }
+        var metadata = result["_meta"]?.objectValue ?? [:]
+        metadata[ProtocolMetadataKey.serverInfo] = try Value(serverInfo)
+        result["_meta"] = .object(metadata)
+        envelope["result"] = .object(result)
+        return try encoder.encode(Value.object(envelope))
+    }
+}
+
 /// The disposition of a successful MCP result.
 public enum ResultType: Hashable, Codable, Sendable {
     case complete
@@ -175,7 +327,7 @@ public enum Discover: Method {
     public struct Parameters: Hashable, Codable, Sendable {
         public var _meta: Metadata
 
-        public init(_meta: Metadata) {
+        public init(_meta: Metadata = .init()) {
             self._meta = _meta
         }
     }
@@ -227,6 +379,14 @@ public enum Discover: Method {
                 ?? .complete
             _meta = try container.decodeIfPresent(Metadata.self, forKey: ._meta)
         }
+    }
+}
+
+extension Discover.Result {
+    /// Self-reported server information carried in the result metadata.
+    public var serverInfo: Server.Info? {
+        guard let value = _meta?[ProtocolMetadataKey.serverInfo] else { return nil }
+        return try? JSONDecoder().decode(Server.Info.self, from: JSONEncoder().encode(value))
     }
 }
 

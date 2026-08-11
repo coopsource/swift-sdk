@@ -7,6 +7,18 @@ import class Foundation.JSONEncoder
 
 /// Model Context Protocol server
 public actor Server {
+    /// Selects which protocol lifecycle mechanisms a server accepts.
+    public enum ProtocolMode: String, Hashable, Codable, Sendable {
+        /// Accept initialization-based clients only.
+        case initializationOnly
+
+        /// Accept both initialization and per-request metadata clients.
+        case initializationAndPerRequestMetadata
+
+        /// Accept per-request metadata clients only.
+        case perRequestMetadataOnly
+    }
+
     /// The server configuration
     public struct Configuration: Hashable, Codable, Sendable {
         /// The default configuration.
@@ -24,6 +36,29 @@ public actor Server {
         /// Disabling strict mode allows the server to be more lenient with non-compliant
         /// clients, though this may lead to undefined behavior.
         public var strict: Bool
+
+        /// The protocol lifecycle mechanisms accepted by the server.
+        public var protocolMode: ProtocolMode
+
+        public init(
+            strict: Bool = false,
+            protocolMode: ProtocolMode = .initializationOnly
+        ) {
+            self.strict = strict
+            self.protocolMode = protocolMode
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case strict, protocolMode
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            strict = try container.decodeIfPresent(Bool.self, forKey: .strict) ?? false
+            protocolMode =
+                try container.decodeIfPresent(ProtocolMode.self, forKey: .protocolMode)
+                ?? .initializationOnly
+        }
     }
 
     /// Implementation information
@@ -410,9 +445,32 @@ public actor Server {
         /// path.
         public let httpContext: HTTPRequest?
 
-        package init(id: ID, httpContext: HTTPRequest?) {
+        /// The lifecycle mechanism used for this request.
+        public let protocolLifecycle: ProtocolLifecycle
+
+        /// The protocol version selected for this request or initialized connection.
+        public let protocolVersion: String?
+
+        /// Self-reported client information supplied for this request, when present.
+        public let clientInfo: Client.Info?
+
+        /// Client capabilities supplied for this request or initialized connection.
+        public let clientCapabilities: Client.Capabilities?
+
+        package init(
+            id: ID,
+            httpContext: HTTPRequest?,
+            protocolLifecycle: ProtocolLifecycle = .initializationBased,
+            protocolVersion: String? = nil,
+            clientInfo: Client.Info? = nil,
+            clientCapabilities: Client.Capabilities? = nil
+        ) {
             self.id = id
             self.httpContext = httpContext
+            self.protocolLifecycle = protocolLifecycle
+            self.protocolVersion = protocolVersion
+            self.clientInfo = clientInfo
+            self.clientCapabilities = clientCapabilities
         }
     }
 
@@ -460,6 +518,13 @@ public actor Server {
 
     /// Send a response to a request
     public func send<M: Method>(_ response: Response<M>) async throws {
+        try await send(response, protocolLifecycle: Server.currentHandlerContext?.protocolLifecycle)
+    }
+
+    private func send<M: Method>(
+        _ response: Response<M>,
+        protocolLifecycle: ProtocolLifecycle?
+    ) async throws {
         guard let connection = connection else {
             throw MCPError.internalError("Server connection not initialized")
         }
@@ -467,7 +532,13 @@ public actor Server {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
 
-        let responseData = try encoder.encode(response)
+        let responseData: Data
+        if protocolLifecycle == .perRequestMetadata {
+            responseData = try PerRequestMetadataWire.encodeResponse(
+                response, serverInfo: serverInfo, using: encoder)
+        } else {
+            responseData = try encoder.encode(response)
+        }
         try await connection.send(responseData)
     }
 
@@ -850,7 +921,20 @@ public actor Server {
                 "id": "\(request.id)",
             ])
 
-        if configuration.strict {
+        let handlerContext: HandlerContext
+        do {
+            handlerContext = try await makeHandlerContext(for: request)
+        } catch {
+            let mcpError = error as? MCPError ?? MCPError.internalError(error.localizedDescription)
+            let response = AnyMethod.response(id: request.id, error: mcpError)
+            if sendResponse {
+                try await send(response, protocolLifecycle: nil)
+                return nil
+            }
+            return response
+        }
+
+        if configuration.strict && handlerContext.protocolLifecycle == .initializationBased {
             // The client SHOULD NOT send requests other than pings
             // before the server has responded to the initialize request.
             switch request.method {
@@ -867,19 +951,13 @@ public actor Server {
             let response = AnyMethod.response(id: request.id, error: error)
 
             if sendResponse {
-                try await send(response)
+                try await send(
+                    response, protocolLifecycle: handlerContext.protocolLifecycle)
                 return nil
             }
 
             return response
         }
-
-        // Ask the transport for the originating HTTP request so handlers can observe
-        // headers/auth via `Server.currentHandlerContext?.httpContext`. Transports
-        // that don't carry HTTP context (stdio, in-memory) don't conform.
-        let httpContext = await (connection as? any HTTPContextProviding)?
-            .httpRequestContext(for: request.id)
-        let handlerContext = HandlerContext(id: request.id, httpContext: httpContext)
 
         // Create a task to handle the request with cancellation support.
         // Set currentHandlerContext as a task local so handlers see it.
@@ -920,7 +998,8 @@ public actor Server {
             let response = try await handlerTask.value
 
             if sendResponse {
-                try await send(response)
+                try await send(
+                    response, protocolLifecycle: handlerContext.protocolLifecycle)
                 return nil
             }
 
@@ -934,11 +1013,97 @@ public actor Server {
             let response = AnyMethod.response(id: request.id, error: mcpError)
 
             if sendResponse {
-                try await send(response)
+                try await send(
+                    response, protocolLifecycle: handlerContext.protocolLifecycle)
                 return nil
             }
 
             return response
+        }
+    }
+
+    private func makeHandlerContext(for request: AnyRequest) async throws -> HandlerContext {
+        let httpContext = await (connection as? any HTTPContextProviding)?
+            .httpRequestContext(for: request.id)
+        let carriesPerRequestMetadata =
+            PerRequestMetadataWire.containsLifecycleMetadata(request)
+
+        switch configuration.protocolMode {
+        case .initializationOnly:
+            if request.method == Discover.name {
+                throw MCPError.methodNotFound("Unknown method: \(request.method)")
+            }
+            return HandlerContext(
+                id: request.id,
+                httpContext: httpContext,
+                protocolLifecycle: .initializationBased,
+                protocolVersion: protocolVersion,
+                clientInfo: clientInfo,
+                clientCapabilities: clientCapabilities
+            )
+
+        case .initializationAndPerRequestMetadata:
+            if !carriesPerRequestMetadata {
+                return HandlerContext(
+                    id: request.id,
+                    httpContext: httpContext,
+                    protocolLifecycle: .initializationBased,
+                    protocolVersion: protocolVersion,
+                    clientInfo: clientInfo,
+                    clientCapabilities: clientCapabilities
+                )
+            }
+
+        case .perRequestMetadataOnly:
+            if !carriesPerRequestMetadata {
+                if request.method == Initialize.name {
+                    throw MCPError.methodNotFound(
+                        "initialize is not supported; supported protocol versions: "
+                            + supportedProtocolVersions.joined(separator: ", "))
+                }
+                throw MCPError.invalidRequest(
+                    "Request is missing required per-request protocol metadata")
+            }
+        }
+
+        let metadata = try PerRequestMetadataWire.decodeRequestMetadata(from: request)
+        guard Version.perRequestMetadataSupported.contains(metadata.protocolVersion) else {
+            throw MCPError.remote(
+                code: ProtocolErrorCode.unsupportedProtocolVersion,
+                message: "Unsupported protocol version",
+                data: try? Value(UnsupportedProtocolVersionData(
+                    supported: supportedProtocolVersions,
+                    requested: metadata.protocolVersion
+                ))
+            )
+        }
+
+        // `initialize` opens the initialization-based lifecycle. A request that carries
+        // per-request metadata has already selected the other lifecycle, so it must not
+        // reach the initialization state machine.
+        if request.method == Initialize.name {
+            throw MCPError.methodNotFound(
+                "initialize is not part of the per-request-metadata lifecycle")
+        }
+
+        return HandlerContext(
+            id: request.id,
+            httpContext: httpContext,
+            protocolLifecycle: .perRequestMetadata,
+            protocolVersion: metadata.protocolVersion,
+            clientInfo: metadata.clientInfo,
+            clientCapabilities: metadata.clientCapabilities
+        )
+    }
+
+    private var supportedProtocolVersions: [String] {
+        switch configuration.protocolMode {
+        case .initializationOnly:
+            return Version.preferenceOrder.filter { $0 != Version.perRequestMetadataVersion }
+        case .initializationAndPerRequestMetadata:
+            return Version.preferenceOrder
+        case .perRequestMetadataOnly:
+            return Version.preferenceOrder.filter(Version.perRequestMetadataSupported.contains)
         }
     }
 
@@ -947,7 +1112,7 @@ public actor Server {
             "Processing notification",
             metadata: ["method": "\(message.method)"])
 
-        if configuration.strict {
+        if configuration.strict && configuration.protocolMode == .initializationOnly {
             // Check initialization state unless this is an initialized notification
             if message.method != InitializedNotification.name {
                 try checkInitialized()
@@ -1047,6 +1212,27 @@ public actor Server {
                 capabilities: await self.capabilities,
                 serverInfo: self.serverInfo,
                 instructions: self.instructions
+            )
+        }
+
+        // Discovery
+        withMethodHandler(Discover.self) { [weak self] _ in
+            guard let self = self else {
+                throw MCPError.internalError("Server was deallocated")
+            }
+            guard await self.configuration.protocolMode != .initializationOnly else {
+                throw MCPError.methodNotFound("Unknown method: \(Discover.name)")
+            }
+
+            return Discover.Result(
+                supportedVersions: await self.supportedProtocolVersions,
+                capabilities: await self.capabilities,
+                instructions: self.instructions,
+                ttlMs: 0,
+                cacheScope: .public,
+                _meta: Metadata(additionalFields: [
+                    ProtocolMetadataKey.serverInfo: try Value(self.serverInfo)
+                ])
             )
         }
 
