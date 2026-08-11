@@ -5,6 +5,17 @@ import struct Foundation.Date
 import class Foundation.JSONDecoder
 import class Foundation.JSONEncoder
 
+private struct EmbeddedInputWorkItem: Sendable {
+    let key: String
+    let handler: RequestHandlerBox
+    let request: AnyRequest
+}
+
+private struct FulfilledEmbeddedInput: Sendable {
+    let key: String
+    let value: Value
+}
+
 /// Model Context Protocol client
 public actor Client {
     /// Selects the protocol lifecycle used when connecting to a server.
@@ -18,6 +29,69 @@ public actor Client {
         /// Require per-request metadata and do not fall back to initialization.
         case perRequestMetadataOnly
     }
+
+    /// Controls how the client handles `input_required` results.
+    public enum MultiRoundTripMode: Hashable, Codable, Sendable {
+        /// Fulfill embedded requests with registered method handlers and retry automatically.
+        case automatic(maxRounds: Int)
+
+        /// Delegate each aggregate input request map to one registered handler.
+        case manual
+
+        /// Reject `input_required` results.
+        case disabled
+
+        private enum CodingKeys: String, CodingKey {
+            case mode, maxRounds
+        }
+
+        private enum Mode: String, Codable {
+            case automatic, manual, disabled
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            switch try container.decode(Mode.self, forKey: .mode) {
+            case .automatic:
+                self = .automatic(
+                    maxRounds: try container.decodeIfPresent(Int.self, forKey: .maxRounds) ?? 8)
+            case .manual:
+                self = .manual
+            case .disabled:
+                self = .disabled
+            }
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            switch self {
+            case .automatic(let maxRounds):
+                try container.encode(Mode.automatic, forKey: .mode)
+                try container.encode(maxRounds, forKey: .maxRounds)
+            case .manual:
+                try container.encode(Mode.manual, forKey: .mode)
+            case .disabled:
+                try container.encode(Mode.disabled, forKey: .mode)
+            }
+        }
+    }
+
+    /// An aggregate request passed to a manual multi-round-trip handler.
+    public struct MultiRoundTripContext: Hashable, Codable, Sendable {
+        public let method: String
+        public let round: Int
+        public let inputRequired: InputRequiredResult
+
+        public init(method: String, round: Int, inputRequired: InputRequiredResult) {
+            self.method = method
+            self.round = round
+            self.inputRequired = inputRequired
+        }
+    }
+
+    /// Handles all embedded input requests in one multi-round-trip response.
+    public typealias MultiRoundTripHandler = @Sendable (MultiRoundTripContext) async throws
+        -> [String: Value]
 
     /// The client configuration
     public struct Configuration: Hashable, Codable, Sendable {
@@ -44,18 +118,23 @@ public actor Client {
         /// Set to `0` to wait without an SDK-imposed limit.
         public var discoveryProbeTimeout: Double
 
+        /// Multi-round-trip behavior for per-request metadata responses.
+        public var multiRoundTripMode: MultiRoundTripMode
+
         public init(
             strict: Bool = false,
             protocolMode: ProtocolMode = .initializationOnly,
-            discoveryProbeTimeout: Double = 2
+            discoveryProbeTimeout: Double = 2,
+            multiRoundTripMode: MultiRoundTripMode = .automatic(maxRounds: 8)
         ) {
             self.strict = strict
             self.protocolMode = protocolMode
             self.discoveryProbeTimeout = discoveryProbeTimeout
+            self.multiRoundTripMode = multiRoundTripMode
         }
 
         private enum CodingKeys: String, CodingKey {
-            case strict, protocolMode, discoveryProbeTimeout
+            case strict, protocolMode, discoveryProbeTimeout, multiRoundTripMode
         }
 
         public init(from decoder: Decoder) throws {
@@ -67,6 +146,10 @@ public actor Client {
             discoveryProbeTimeout =
                 try container.decodeIfPresent(Double.self, forKey: .discoveryProbeTimeout)
                 ?? 2
+            multiRoundTripMode =
+                try container.decodeIfPresent(
+                    MultiRoundTripMode.self, forKey: .multiRoundTripMode)
+                ?? .disabled
         }
     }
 
@@ -358,6 +441,14 @@ public actor Client {
     private var selectedProtocolVersion: String?
     /// Whether the initialization-based ready notification has been sent.
     private var initializationNotificationSent = false
+    /// Aggregate handler used when multi-round-trip mode is manual.
+    private var multiRoundTripHandler: MultiRoundTripHandler?
+    /// Current wire request ID for each logical request.
+    private var logicalRequestAttempts: [ID: ID] = [:]
+    /// Logical requests cancelled while embedded input was being fulfilled.
+    private var cancelledLogicalRequests: Set<ID> = []
+    /// Cancellation actions for active logical request tasks.
+    private var logicalRequestCancellations: [ID: @Sendable () -> Void] = [:]
 
     /// A dictionary of type-erased notification handlers, keyed by method name
     private var notificationHandlers: [String: [NotificationHandlerBox]] = [:]
@@ -501,18 +592,25 @@ public actor Client {
         let taskToCancel = self.task
         let connectionToDisconnect = self.connection
         let pendingRequestsToCancel = self.pendingRequests
+        let logicalRequestsToCancel = self.logicalRequestCancellations.values
 
         self.task = nil
         self.connection = nil
         self.pendingRequests = [:]  // Use empty dictionary literal
         self.selectedProtocolLifecycle = nil
         self.selectedProtocolVersion = nil
+        self.logicalRequestAttempts = [:]
+        self.cancelledLogicalRequests = []
+        self.logicalRequestCancellations = [:]
 
         // Part 2: Outside actor - Resume continuations, disconnect transport, await task
 
         // Resume continuations first
         for (_, request) in pendingRequestsToCancel {
             request.resume(throwing: MCPError.internalError("Client disconnected"))
+        }
+        for cancel in logicalRequestsToCancel {
+            cancel()
         }
         await logger?.debug("Pending requests cancelled.")
 
@@ -562,6 +660,15 @@ public actor Client {
         return self
     }
 
+    /// Registers the aggregate handler used by manual multi-round-trip mode.
+    @discardableResult
+    public func withMultiRoundTripHandler(
+        _ handler: @escaping MultiRoundTripHandler
+    ) -> Self {
+        multiRoundTripHandler = handler
+        return self
+    }
+
     /// Send a notification to the server
     public func notify<N: Notification>(_ notification: Message<N>) async throws {
         guard let connection = connection else {
@@ -604,6 +711,16 @@ public actor Client {
     public func send<M: Method>(_ request: Request<M>) throws -> RequestContext<M.Result> {
         guard let connection = connection else {
             throw MCPError.internalError("Client connection not initialized")
+        }
+
+        if selectedProtocolLifecycle == .perRequestMetadata,
+            configuration.multiRoundTripMode != .disabled
+        {
+            let requestTask = Task<M.Result, Error> {
+                try await self.performLogicalRequest(request, connection: connection)
+            }
+            logicalRequestCancellations[request.id] = { requestTask.cancel() }
+            return RequestContext(requestID: request.id, requestTask: requestTask)
         }
 
         let requestData = try encodeRequest(request)
@@ -651,15 +768,25 @@ public actor Client {
     /// - Throws: MCPError if the notification cannot be sent
     /// - SeeAlso: https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/cancellation
     public func cancelRequest(_ requestID: ID, reason: String? = nil) async throws {
+        let activeRequestID = logicalRequestAttempts[requestID] ?? requestID
+        // `send` registers the cancellation action synchronously, before the request task runs
+        // its first attempt. Gating on that registration — rather than on the attempt map, which
+        // `performLogicalRequest` only populates once the task starts — cancels a logical request
+        // that has not reached the wire yet.
+        if let cancelLogicalRequest = logicalRequestCancellations[requestID] {
+            cancelledLogicalRequests.insert(requestID)
+            cancelLogicalRequest()
+        }
+
         // Remove the pending request and resume with cancellation error
         // This ensures any response that arrives after cancellation is ignored
-        if let pendingRequest = removePendingRequest(id: requestID) {
+        if let pendingRequest = removePendingRequest(id: activeRequestID) {
             pendingRequest.resume(throwing: CancellationError())
         }
 
         // Send cancellation notification to server
         let notification = CancelledNotification.message(
-            .init(requestId: requestID, reason: reason)
+            .init(requestId: activeRequestID, reason: reason)
         )
         try await notify(notification)
     }
@@ -688,6 +815,207 @@ public actor Client {
 
     private func removePendingRequest(id: ID) -> AnyPendingRequest? {
         return pendingRequests.removeValue(forKey: id)
+    }
+
+    private func performLogicalRequest<M: Method>(
+        _ request: Request<M>,
+        connection: any Transport
+    ) async throws -> M.Result {
+        let logicalRequestID = request.id
+        var attemptID = request.id
+        var attemptData = try encodeRequest(request)
+        var usedRequestIDs: Set<ID> = [attemptID]
+        var round = 0
+
+        defer {
+            logicalRequestAttempts.removeValue(forKey: logicalRequestID)
+            cancelledLogicalRequests.remove(logicalRequestID)
+            logicalRequestCancellations.removeValue(forKey: logicalRequestID)
+        }
+
+        while true {
+            try Task.checkCancellation()
+            if cancelledLogicalRequests.contains(logicalRequestID) {
+                throw CancellationError()
+            }
+
+            logicalRequestAttempts[logicalRequestID] = attemptID
+            let value = try await sendRawRequest(
+                data: attemptData, id: attemptID, connection: connection)
+            guard let resultTypeValue = value.objectValue?["resultType"]?.stringValue else {
+                throw MCPError.internalError(
+                    "Per-request metadata response is missing a string-valued resultType")
+            }
+            let resultType = try decoder.decode(
+                ResultType.self, from: encoder.encode(Value.string(resultTypeValue)))
+            if resultType != .inputRequired {
+                return try decoder.decode(M.Result.self, from: encoder.encode(value))
+            }
+
+            guard M.self is any MultiRoundTripMethod.Type else {
+                throw MCPError.invalidRequest(
+                    "Method \(M.name) does not support input_required results")
+            }
+
+            let inputRequired = try decoder.decode(
+                InputRequiredResult.self, from: encoder.encode(value))
+            try inputRequired.validate(clientCapabilities: capabilities)
+            round += 1
+
+            let inputResponses: [String: Value]
+            switch configuration.multiRoundTripMode {
+            case .automatic(let configuredMaximum):
+                guard configuredMaximum > 0 else {
+                    throw MCPError.invalidParams(
+                        "Multi-round-trip maxRounds must be greater than zero")
+                }
+                guard round <= configuredMaximum else {
+                    throw MCPError.internalError(
+                        "Multi-round-trip request exceeded \(configuredMaximum) rounds")
+                }
+                inputResponses = try await fulfillEmbeddedInputRequests(
+                    inputRequired.inputRequests ?? [:])
+            case .manual:
+                guard let multiRoundTripHandler else {
+                    throw MCPError.internalError(
+                        "Manual multi-round-trip mode requires a registered aggregate handler")
+                }
+                inputResponses = try await multiRoundTripHandler(.init(
+                    method: M.name,
+                    round: round,
+                    inputRequired: inputRequired
+                ))
+            case .disabled:
+                throw MCPError.internalError("Multi-round-trip handling is disabled")
+            }
+
+            if let requiredKeys = inputRequired.inputRequests?.keys {
+                let missingKeys = requiredKeys.filter { inputResponses[$0] == nil }
+                guard missingKeys.isEmpty else {
+                    throw MCPError.invalidParams(
+                        "Missing embedded input responses: "
+                            + missingKeys.sorted().joined(separator: ", "))
+                }
+            }
+
+            try Task.checkCancellation()
+            if cancelledLogicalRequests.contains(logicalRequestID) {
+                throw CancellationError()
+            }
+
+            repeat {
+                attemptID = .random
+            } while usedRequestIDs.contains(attemptID)
+            usedRequestIDs.insert(attemptID)
+            attemptData = try encodeRetry(
+                request,
+                id: attemptID,
+                inputResponses: inputRequired.inputRequests == nil ? nil : inputResponses,
+                requestState: inputRequired.requestState
+            )
+        }
+    }
+
+    private func sendRawRequest(
+        data: Data,
+        id: ID,
+        connection: any Transport
+    ) async throws -> Value {
+        try await withCheckedThrowingContinuation { continuation in
+            addPendingRequest(id: id, continuation: continuation, type: Value.self)
+            Task {
+                do {
+                    try await connection.send(data)
+                } catch {
+                    if self.removePendingRequest(id: id) != nil {
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        }
+    }
+
+    private func fulfillEmbeddedInputRequests(
+        _ inputRequests: [String: Value]
+    ) async throws -> [String: Value] {
+        var workItems: [EmbeddedInputWorkItem] = []
+        for (key, value) in inputRequests {
+            guard let object = value.objectValue,
+                object["id"] == nil,
+                object["jsonrpc"] == nil,
+                let method = object["method"]?.stringValue,
+                let handler = methodHandlers[method]
+            else {
+                throw MCPError.invalidParams(
+                    "Embedded input request \(key) is malformed or has no registered handler")
+            }
+            let parameters = object["params"] ?? .object([:])
+            guard parameters.objectValue != nil else {
+                throw MCPError.invalidParams(
+                    "Embedded input request \(key) has non-object parameters")
+            }
+            workItems.append(EmbeddedInputWorkItem(
+                key: key,
+                handler: handler,
+                request: Request(id: .random, method: method, params: parameters)
+            ))
+        }
+
+        return try await withThrowingTaskGroup(of: FulfilledEmbeddedInput.self) { group in
+            for workItem in workItems {
+                group.addTask {
+                    let response = try await workItem.handler(workItem.request)
+                    switch response.result {
+                    case .success(let value):
+                        return FulfilledEmbeddedInput(key: workItem.key, value: value)
+                    case .failure(let error):
+                        throw error
+                    }
+                }
+            }
+
+            var responses: [String: Value] = [:]
+            for try await fulfilled in group {
+                responses[fulfilled.key] = fulfilled.value
+            }
+            return responses
+        }
+    }
+
+    private func encodeRetry<M: Method>(
+        _ request: Request<M>,
+        id: ID,
+        inputResponses: [String: Value]?,
+        requestState: String?
+    ) throws -> Data {
+        guard case .object(var envelope) = try decoder.decode(
+            Value.self, from: encoder.encode(request))
+        else {
+            throw MCPError.invalidRequest("Request must encode as a JSON object")
+        }
+        envelope["id"] = try Value(id)
+        var parameters = envelope["params"]?.objectValue ?? [:]
+        parameters.removeValue(forKey: "inputResponses")
+        parameters.removeValue(forKey: "requestState")
+        if let inputResponses {
+            parameters["inputResponses"] = .object(inputResponses)
+        }
+        if let requestState {
+            parameters["requestState"] = .string(requestState)
+        }
+        envelope["params"] = .object(parameters)
+
+        let data = try encoder.encode(Value.object(envelope))
+        guard let selectedProtocolVersion else {
+            throw MCPError.internalError("Per-request protocol version is not selected")
+        }
+        return try PerRequestMetadataWire.addingRequestMetadata(
+            to: data,
+            protocolVersion: selectedProtocolVersion,
+            clientInfo: clientInfo,
+            clientCapabilities: capabilities,
+            using: encoder
+        )
     }
 
     // MARK: - Batching
@@ -1509,7 +1837,11 @@ public actor Client {
                 "Per-request metadata response has a non-string resultType")
         }
         switch resultType {
-        case "complete", "input_required":
+        case "complete":
+            return nil
+        case "input_required" where configuration.multiRoundTripMode == .disabled:
+            return MCPError.internalError("Multi-round-trip handling is disabled")
+        case "input_required":
             return nil
         default:
             return MCPError.invalidRequest("Unsupported resultType: \(resultType)")

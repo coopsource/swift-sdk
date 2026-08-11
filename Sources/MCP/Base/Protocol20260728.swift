@@ -408,3 +408,66 @@ public struct InputRequiredResult: Hashable, Codable, Sendable {
         self._meta = _meta
     }
 }
+
+/// A server handler result for a method that may require additional client input.
+public enum MultiRoundTripResult<Success: Hashable & Codable & Sendable>: Hashable, Sendable {
+    /// The request completed with its normal method result.
+    case complete(Success)
+
+    /// The client must fulfill embedded input requests and retry the original method.
+    case inputRequired(InputRequiredResult)
+}
+
+extension InputRequiredResult {
+    func validate(clientCapabilities: Client.Capabilities?) throws {
+        guard resultType == .inputRequired else {
+            throw MCPError.invalidParams(
+                "InputRequiredResult must use the input_required result type")
+        }
+        guard inputRequests != nil || requestState != nil else {
+            throw MCPError.invalidParams(
+                "InputRequiredResult requires inputRequests or requestState")
+        }
+
+        for request in inputRequests?.values.map({ $0 }) ?? [] {
+            guard let object = request.objectValue,
+                object["id"] == nil,
+                object["jsonrpc"] == nil,
+                let method = object["method"]?.stringValue
+            else {
+                throw MCPError.invalidParams("Embedded input request is malformed")
+            }
+            if let parameters = object["params"], parameters.objectValue == nil {
+                throw MCPError.invalidParams(
+                    "Embedded input request has non-object parameters")
+            }
+
+            switch method {
+            case CreateElicitation.name:
+                guard clientCapabilities?.elicitation != nil else {
+                    throw missingCapability(.init(elicitation: .init()))
+                }
+            case CreateSamplingMessage.name:
+                guard clientCapabilities?.sampling != nil else {
+                    throw missingCapability(.init(sampling: .init()))
+                }
+            case ListRoots.name:
+                guard clientCapabilities?.roots != nil else {
+                    throw missingCapability(.init(roots: .init()))
+                }
+            default:
+                throw MCPError.invalidParams(
+                    "Unsupported embedded input request method: \(method)")
+            }
+        }
+    }
+
+    private func missingCapability(_ capabilities: Client.Capabilities) -> MCPError {
+        .remote(
+            code: ProtocolErrorCode.missingRequiredClientCapability,
+            message: "Server requires a client capability for embedded input",
+            data: try? Value(MissingRequiredClientCapabilityData(
+                requiredCapabilities: capabilities))
+        )
+    }
+}

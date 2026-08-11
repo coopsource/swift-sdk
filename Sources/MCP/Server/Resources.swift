@@ -301,14 +301,22 @@ public enum ListResources: Method {
 
 /// To retrieve resource contents, clients send a `resources/read` request:
 /// - SeeAlso: https://modelcontextprotocol.io/specification/2025-11-25/server/resources/#reading-resources
-public enum ReadResource: Method {
+public enum ReadResource: MultiRoundTripMethod {
     public static let name: String = "resources/read"
 
     public struct Parameters: Hashable, Codable, Sendable {
         public let uri: String
+        public let inputResponses: [String: Value]?
+        public let requestState: String?
 
-        public init(uri: String) {
+        public init(
+            uri: String,
+            inputResponses: [String: Value]? = nil,
+            requestState: String? = nil
+        ) {
             self.uri = uri
+            self.inputResponses = inputResponses
+            self.requestState = requestState
         }
     }
 
