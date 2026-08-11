@@ -56,6 +56,11 @@ package protocol RequestCancellationRegistering: Transport {
     ) async
 }
 
+/// Optional transport hook for private request IDs used during internal routing.
+package protocol OriginalRequestIDProviding: Transport {
+    func originalRequestID(for requestID: ID) async -> ID?
+}
+
 /// Optional HTTP-client hook for schemas that define tool parameter headers.
 package protocol ToolHeaderSchemaManaging: Transport {
     func updateToolHeaderSchemas(_ tools: [Tool], replacing: Bool) async -> [Tool]

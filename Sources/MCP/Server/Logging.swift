@@ -23,6 +23,15 @@ public enum LogLevel: String, Hashable, Codable, Sendable, CaseIterable {
     case alert
     /// System is unusable
     case emergency
+
+    package func isAtLeast(_ requested: LogLevel) -> Bool {
+        guard let levelIndex = Self.allCases.firstIndex(of: self),
+            let requestedIndex = Self.allCases.firstIndex(of: requested)
+        else {
+            return false
+        }
+        return levelIndex >= requestedIndex
+    }
 }
 
 // MARK: - Set Log Level

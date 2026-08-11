@@ -105,6 +105,7 @@ struct PerRequestProtocolMetadata: Sendable {
     let protocolVersion: String
     let clientInfo: Client.Info?
     let clientCapabilities: Client.Capabilities
+    let logLevel: LogLevel?
 }
 
 enum PerRequestMetadataWire {
@@ -113,6 +114,7 @@ enum PerRequestMetadataWire {
         protocolVersion: String,
         clientInfo: Client.Info,
         clientCapabilities: Client.Capabilities,
+        logLevel: LogLevel? = nil,
         using encoder: JSONEncoder
     ) throws -> Data {
         let data = try encoder.encode(request)
@@ -121,6 +123,7 @@ enum PerRequestMetadataWire {
             protocolVersion: protocolVersion,
             clientInfo: clientInfo,
             clientCapabilities: clientCapabilities,
+            logLevel: logLevel,
             using: encoder
         )
     }
@@ -130,6 +133,7 @@ enum PerRequestMetadataWire {
         protocolVersion: String,
         clientInfo: Client.Info,
         clientCapabilities: Client.Capabilities,
+        logLevel: LogLevel? = nil,
         using encoder: JSONEncoder
     ) throws -> Data {
         var value = try JSONDecoder().decode(Value.self, from: data)
@@ -137,7 +141,8 @@ enum PerRequestMetadataWire {
             to: value,
             protocolVersion: protocolVersion,
             clientInfo: clientInfo,
-            clientCapabilities: clientCapabilities
+            clientCapabilities: clientCapabilities,
+            logLevel: logLevel
         )
         return try encoder.encode(value)
     }
@@ -146,7 +151,8 @@ enum PerRequestMetadataWire {
         to value: Value,
         protocolVersion: String,
         clientInfo: Client.Info,
-        clientCapabilities: Client.Capabilities
+        clientCapabilities: Client.Capabilities,
+        logLevel: LogLevel?
     ) throws -> Value {
         if case .array(let items) = value {
             return .array(try items.map {
@@ -154,7 +160,8 @@ enum PerRequestMetadataWire {
                     to: $0,
                     protocolVersion: protocolVersion,
                     clientInfo: clientInfo,
-                    clientCapabilities: clientCapabilities
+                    clientCapabilities: clientCapabilities,
+                    logLevel: logLevel
                 )
             })
         }
@@ -168,6 +175,9 @@ enum PerRequestMetadataWire {
         metadata[ProtocolMetadataKey.protocolVersion] = .string(protocolVersion)
         metadata[ProtocolMetadataKey.clientInfo] = try Value(clientInfo)
         metadata[ProtocolMetadataKey.clientCapabilities] = try Value(clientCapabilities)
+        if let logLevel {
+            metadata[ProtocolMetadataKey.logLevel] = .string(logLevel.rawValue)
+        }
         parameters["_meta"] = .object(metadata)
         request["params"] = .object(parameters)
         return .object(request)
@@ -208,10 +218,24 @@ enum PerRequestMetadataWire {
             throw MCPError.invalidParams("Per-request client metadata is malformed")
         }
 
+        let logLevel: LogLevel?
+        if let value = metadata[ProtocolMetadataKey.logLevel] {
+            guard let rawValue = value.stringValue,
+                let decodedLevel = LogLevel(rawValue: rawValue)
+            else {
+                throw MCPError.invalidParams(
+                    "io.modelcontextprotocol/logLevel is not a recognized log level")
+            }
+            logLevel = decodedLevel
+        } else {
+            logLevel = nil
+        }
+
         return PerRequestProtocolMetadata(
             protocolVersion: protocolVersion,
             clientInfo: clientInfo,
-            clientCapabilities: capabilities
+            clientCapabilities: capabilities,
+            logLevel: logLevel
         )
     }
 

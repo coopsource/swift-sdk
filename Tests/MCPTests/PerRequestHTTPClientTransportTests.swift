@@ -495,7 +495,10 @@ import Testing
                     events: [
                         .data(Data([0xEF]), delayMilliseconds: 0),
                         .data(Data([0xBB]), delayMilliseconds: 0),
-                        .data(Data([0xBF]) + Data("data: \(response)\n\n".utf8), delayMilliseconds: 0),
+                        .data(
+                            Data([0xBF]) + Data("data: \(response)\n\n".utf8),
+                            delayMilliseconds: 0
+                        ),
                         .finish(delayMilliseconds: 0),
                     ]
                 )
@@ -512,6 +515,122 @@ import Testing
 
             try await transport.send(requestData)
             #expect(try await iterator.next() == Data(response.utf8))
+            await transport.disconnect()
+        }
+
+        @Test("Subscription SSE requires acknowledgment before correlated notifications")
+        func subscriptionSSEOrdering() async throws {
+            await PerRequestHTTPURLProtocol.storage.reset()
+            let requestData = try makePerRequestData(
+                id: 12,
+                method: SubscriptionsListen.name
+            )
+            let acknowledgment = #"{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":12},"notifications":{"toolsListChanged":true}}}"#
+            let notification = #"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":12}}}"#
+            let response = #"{"jsonrpc":"2.0","id":12,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":12}}}"#
+            await PerRequestHTTPURLProtocol.storage.setHandler { [endpoint] _ in
+                StreamingHTTPScript(
+                    response: HTTPURLResponse(
+                        url: endpoint,
+                        statusCode: 200,
+                        httpVersion: "HTTP/1.1",
+                        headerFields: ["Content-Type": ContentType.sse]
+                    )!,
+                    events: [
+                        .data(Data(": keepalive\n\ndata: \(acknowledgment)\n\n".utf8), delayMilliseconds: 0),
+                        .data(Data("data: \(notification)\n\n".utf8), delayMilliseconds: 5),
+                        .data(Data("data: \(response)\n\n".utf8), delayMilliseconds: 5),
+                        .finish(delayMilliseconds: 0),
+                    ]
+                )
+            }
+
+            let transport = makeStreamingTransport()
+            await transport.updateProtocolLifecycle(
+                .perRequestMetadata,
+                protocolVersion: Version.perRequestMetadataVersion
+            )
+            try await transport.connect()
+            let stream = await transport.receive()
+            var iterator = stream.makeAsyncIterator()
+            let sendTask = Task { try await transport.send(requestData) }
+
+            #expect(try await iterator.next() == Data(acknowledgment.utf8))
+            #expect(try await iterator.next() == Data(notification.utf8))
+            #expect(try await iterator.next() == Data(response.utf8))
+            try await sendTask.value
+            await transport.disconnect()
+        }
+
+        @Test("Subscription SSE rejects a notification before acknowledgment")
+        func subscriptionNotificationBeforeAcknowledgment() async throws {
+            await PerRequestHTTPURLProtocol.storage.reset()
+            let requestData = try makePerRequestData(
+                id: 13,
+                method: SubscriptionsListen.name
+            )
+            let notification = #"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":13}}}"#
+            await PerRequestHTTPURLProtocol.storage.setHandler { [endpoint] _ in
+                StreamingHTTPScript(
+                    response: HTTPURLResponse(
+                        url: endpoint,
+                        statusCode: 200,
+                        httpVersion: "HTTP/1.1",
+                        headerFields: ["Content-Type": ContentType.sse]
+                    )!,
+                    events: [
+                        .data(Data("data: \(notification)\n\n".utf8), delayMilliseconds: 0),
+                        .finish(delayMilliseconds: 0),
+                    ]
+                )
+            }
+
+            let transport = makeStreamingTransport()
+            await transport.updateProtocolLifecycle(
+                .perRequestMetadata,
+                protocolVersion: Version.perRequestMetadataVersion
+            )
+            try await transport.connect()
+            await #expect(throws: MCPError.self) {
+                try await transport.send(requestData)
+            }
+            await transport.disconnect()
+        }
+
+        @Test("Subscription response rejects mismatched correlation metadata")
+        func subscriptionCorrelationMismatch() async throws {
+            await PerRequestHTTPURLProtocol.storage.reset()
+            let requestData = try makePerRequestData(
+                id: 14,
+                method: SubscriptionsListen.name
+            )
+            let acknowledgment = #"{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":14},"notifications":{}}}"#
+            let response = #"{"jsonrpc":"2.0","id":14,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":99}}}"#
+            await PerRequestHTTPURLProtocol.storage.setHandler { [endpoint] _ in
+                StreamingHTTPScript(
+                    response: HTTPURLResponse(
+                        url: endpoint,
+                        statusCode: 200,
+                        httpVersion: "HTTP/1.1",
+                        headerFields: ["Content-Type": ContentType.sse]
+                    )!,
+                    events: [
+                        .data(Data("data: \(acknowledgment)\n\n".utf8), delayMilliseconds: 0),
+                        .data(Data("data: \(response)\n\n".utf8), delayMilliseconds: 0),
+                        .finish(delayMilliseconds: 0),
+                    ]
+                )
+            }
+
+            let transport = makeStreamingTransport()
+            await transport.updateProtocolLifecycle(
+                .perRequestMetadata,
+                protocolVersion: Version.perRequestMetadataVersion
+            )
+            try await transport.connect()
+            await #expect(throws: MCPError.self) {
+                try await transport.send(requestData)
+            }
             await transport.disconnect()
         }
 
@@ -591,6 +710,10 @@ import Testing
                 try await sendTask.value
             }
             #expect(await PerRequestHTTPURLProtocol.storage.emittedChunkCount == 0)
+            for _ in 0..<100 {
+                if await PerRequestHTTPURLProtocol.storage.stoppedRequestCount > 0 { break }
+                try await Task.sleep(for: .milliseconds(1))
+            }
             #expect(await PerRequestHTTPURLProtocol.storage.stoppedRequestCount >= 1)
             await transport.disconnect()
         }

@@ -547,7 +547,9 @@ struct ProtocolNegotiationTests {
         )
         try await server.start(transport: transport)
 
-        await transport.queue(data: try JSONEncoder().encode(validRequest(id: 3, method: Ping.name)))
+        await transport.queue(data: try JSONEncoder().encode(
+            validRequest(id: 3, method: Discover.name)
+        ))
         try await Task.sleep(for: .milliseconds(20))
 
         let response: Value? = await transport.decodeLastSentMessage()
@@ -665,6 +667,149 @@ struct ProtocolNegotiationTests {
         }
         #expect(message?.contains(ProtocolMetadataKey.clientCapabilities) == true)
         await server.stop()
+    }
+
+    @Test("Server rejects an unrecognized request-scoped log level")
+    func malformedLogLevel() async throws {
+        let transport = MockTransport()
+        let server = Server(
+            name: "Server",
+            version: "1.0",
+            configuration: .init(protocolMode: .perRequestMetadataOnly)
+        )
+        try await server.start(transport: transport)
+
+        guard case .object(var request) = validRequest(id: 4, method: ContextProbe.name)
+        else {
+            Issue.record("Expected an object-valued request")
+            await server.stop()
+            return
+        }
+        var parameters = request["params"]?.objectValue ?? [:]
+        var metadata = parameters["_meta"]?.objectValue ?? [:]
+        metadata[ProtocolMetadataKey.logLevel] = .string("verbose")
+        parameters["_meta"] = .object(metadata)
+        request["params"] = .object(parameters)
+        await transport.queue(data: try JSONEncoder().encode(Value.object(request)))
+        try await Task.sleep(for: .milliseconds(20))
+
+        let response: AnyResponse? = await transport.decodeLastSentMessage()
+        guard case .failure(.invalidParams(let message)) = response?.result else {
+            Issue.record("Expected an invalid-params response")
+            await server.stop()
+            return
+        }
+        #expect(message?.contains(ProtocolMetadataKey.logLevel) == true)
+        await server.stop()
+    }
+
+    @Test(
+        "Removed initialization methods are unavailable in 2026-07-28",
+        arguments: [
+            Ping.name,
+            SetLoggingLevel.name,
+            ResourceSubscribe.name,
+            ResourceUnsubscribe.name,
+        ]
+    )
+    func removedMethod(method: String) async throws {
+        let transport = MockTransport()
+        let server = Server(
+            name: "Server",
+            version: "1.0",
+            configuration: .init(protocolMode: .perRequestMetadataOnly)
+        )
+        try await server.start(transport: transport)
+
+        await transport.queue(data: try JSONEncoder().encode(
+            validRequest(id: 5, method: method)
+        ))
+        try await Task.sleep(for: .milliseconds(20))
+
+        let response: AnyResponse? = await transport.decodeLastSentMessage()
+        guard case .failure(.methodNotFound(let message)) = response?.result else {
+            Issue.record("Expected a method-not-found response for \(method)")
+            await server.stop()
+            return
+        }
+        #expect(message?.contains(method) == true)
+        await server.stop()
+    }
+
+    @Test("Client compatibility helpers reject removed 2026-07-28 operations")
+    func clientRemovedOperationHelpers() async throws {
+        let pair = await InMemoryTransport.createConnectedPair()
+        let server = Server(
+            name: "Server",
+            version: "1.0",
+            capabilities: .init(
+                logging: .init(),
+                resources: .init(subscribe: true)
+            ),
+            configuration: .init(protocolMode: .perRequestMetadataOnly)
+        )
+        try await server.start(transport: pair.server)
+        let client = Client(
+            name: "Client",
+            version: "1.0",
+            configuration: .init(protocolMode: .perRequestMetadataOnly)
+        )
+        _ = try await client.connectWithInfo(transport: pair.client)
+
+        await #expect(throws: MCPError.self) { try await client.ping() }
+        await #expect(throws: MCPError.self) { try await client.setLoggingLevel(.info) }
+        await #expect(throws: MCPError.self) {
+            try await client.subscribeToResource(uri: "file:///resource")
+        }
+        await #expect(throws: MCPError.self) { try await client.notifyRootsChanged() }
+        await #expect(throws: MCPError.self) {
+            _ = try await client.send(Ping.request())
+        }
+        await #expect(throws: MCPError.self) {
+            try await client.notify(InitializedNotification.message())
+        }
+
+        await client.disconnect()
+        await server.stop()
+    }
+
+    @Test("Per-request roots capability omits the removed list-change flag")
+    func perRequestRootsCapability() async throws {
+        let transport = MockTransport()
+        let client = Client(
+            name: "Client",
+            version: "1.0",
+            capabilities: .init(roots: .init(listChanged: true)),
+            configuration: .init(protocolMode: .perRequestMetadataOnly)
+        )
+        let connectionTask = Task {
+            try await client.connectWithInfo(transport: transport)
+        }
+        while await transport.sentData.isEmpty {
+            await Task.yield()
+        }
+
+        let request: AnyRequest = try #require(await transport.decodeLastSentMessage())
+        let roots = request.params.objectValue?["_meta"]?
+            .objectValue?[ProtocolMetadataKey.clientCapabilities]?
+            .objectValue?["roots"]?.objectValue
+        #expect(roots != nil)
+        #expect(roots?["listChanged"] == nil)
+
+        let result = Discover.Result(
+            supportedVersions: [Version.perRequestMetadataVersion],
+            capabilities: .init(),
+            ttlMs: 0,
+            cacheScope: .public,
+            _meta: Metadata(additionalFields: [
+                ProtocolMetadataKey.serverInfo: try Value(
+                    Server.Info(name: "Server", version: "1.0")
+                )
+            ])
+        )
+        try await transport.queue(response: Discover.response(id: request.id, result: result))
+        _ = try await connectionTask.value
+        await client.disconnect()
     }
 
     @Test("Server returns supported versions for an unsupported request version")

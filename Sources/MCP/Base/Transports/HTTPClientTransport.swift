@@ -794,8 +794,13 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
             } catch let error as MCPError {
                 throw probeErrorIfNeeded(error, isDiscovery: isDiscovery)
             } catch {
-                let mapped = MCPError.internalError(
-                    "HTTP request failed: \(error.localizedDescription)")
+                let mapped: MCPError
+                if operationKey == SubscriptionsListen.name {
+                    mapped = .transportError(error)
+                } else {
+                    mapped = .internalError(
+                        "HTTP request failed: \(error.localizedDescription)")
+                }
                 throw probeErrorIfNeeded(mapped, isDiscovery: isDiscovery)
             }
         }
@@ -890,6 +895,10 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
         }
 
         if hasContentType(contentType, ContentType.json) {
+            guard requestMethod != SubscriptionsListen.name else {
+                throw MCPError.invalidRequest(
+                    "subscriptions/listen requires an acknowledged SSE response stream")
+            }
             let receivedData = try await collect(body)
             if isDiscovery,
                 let remoteError = decodedResponseError(
@@ -931,13 +940,15 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
         listToolsCursor: String?
     ) async throws {
         var parser = RequestScopedSSEParser()
+        var subscriptionAcknowledged = requestMethod != SubscriptionsListen.name
         for try await chunk in body {
             for message in try parser.append(chunk) {
                 if try processRequestScopedMessage(
                     message,
                     requestID: requestID,
                     requestMethod: requestMethod,
-                    listToolsCursor: listToolsCursor
+                    listToolsCursor: listToolsCursor,
+                    subscriptionAcknowledged: &subscriptionAcknowledged
                 ) {
                     return
                 }
@@ -948,10 +959,14 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
                 message,
                 requestID: requestID,
                 requestMethod: requestMethod,
-                listToolsCursor: listToolsCursor
+                listToolsCursor: listToolsCursor,
+                subscriptionAcknowledged: &subscriptionAcknowledged
             ) {
                 return
             }
+        }
+        if requestMethod == SubscriptionsListen.name {
+            throw MCPError.connectionClosed
         }
         throw MCPError.internalError(
             "Request-scoped SSE stream ended before its JSON-RPC response")
@@ -961,12 +976,22 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
         _ receivedData: Data,
         requestID: ID?,
         requestMethod: String?,
-        listToolsCursor: String?
+        listToolsCursor: String?,
+        subscriptionAcknowledged: inout Bool
     ) throws -> Bool {
         if let response = try? JSONDecoder().decode(AnyResponse.self, from: receivedData) {
             guard let requestID, response.id == requestID else {
                 throw MCPError.invalidRequest(
                     "Request-scoped SSE response ID does not match its HTTP request")
+            }
+            if requestMethod == SubscriptionsListen.name {
+                guard subscriptionAcknowledged,
+                    case .success(let result) = response.result,
+                    Self.subscriptionID(in: result.objectValue?["_meta"]) == requestID
+                else {
+                    throw MCPError.invalidRequest(
+                        "Subscription response is missing its acknowledgment or correlation ID")
+                }
             }
             let data = prepareIncomingResponse(
                 receivedData,
@@ -980,12 +1005,43 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
             throw MCPError.invalidRequest(
                 "Request-scoped SSE streams must not contain server requests")
         }
-        guard (try? JSONDecoder().decode(AnyMessage.self, from: receivedData)) != nil else {
+        guard let notification = try? JSONDecoder().decode(AnyMessage.self, from: receivedData)
+        else {
             throw MCPError.invalidRequest(
                 "Request-scoped SSE stream contains an invalid JSON-RPC message")
         }
+        if requestMethod == SubscriptionsListen.name {
+            guard let requestID,
+                Self.subscriptionID(in: notification.params.objectValue?["_meta"])
+                    == requestID
+            else {
+                throw MCPError.invalidRequest(
+                    "Subscription notification has a missing or mismatched correlation ID")
+            }
+            if subscriptionAcknowledged {
+                guard notification.method != SubscriptionsAcknowledgedNotification.name else {
+                    throw MCPError.invalidRequest(
+                        "Subscription stream contains a duplicate acknowledgment")
+                }
+            } else {
+                guard notification.method == SubscriptionsAcknowledgedNotification.name else {
+                    throw MCPError.invalidRequest(
+                        "Subscription acknowledgment must be the first stream message")
+                }
+                subscriptionAcknowledged = true
+            }
+        }
         messageContinuation.yield(receivedData)
         return false
+    }
+
+    private static func subscriptionID(in metadata: Value?) -> ID? {
+        guard let value = metadata?.objectValue?[ProtocolMetadataKey.subscriptionID] else {
+            return nil
+        }
+        if let string = value.stringValue { return .string(string) }
+        if let number = value.intValue { return .number(number) }
+        return nil
     }
 
     private func prepareIncomingResponse(

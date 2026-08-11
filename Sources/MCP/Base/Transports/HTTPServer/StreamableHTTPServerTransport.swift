@@ -18,7 +18,8 @@ private func makeStreamableHTTPValidationPipeline(
 /// first, in which case the response becomes a request-scoped SSE stream. This
 /// transport does not create sessions, a standalone GET stream, or replay state.
 public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
-    RequestScopedSending, RequestCancellationRegistering, TransportProtocolVersionProviding
+    RequestScopedSending, RequestCancellationRegistering, OriginalRequestIDProviding,
+    TransportProtocolVersionProviding
 {
     /// Resolves the definition used to validate one tool call in its HTTP request context.
     public typealias ToolHeaderSchemaProvider =
@@ -598,6 +599,10 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
             return nil
         }
         return httpRequestContexts[routingID]
+    }
+
+    package func originalRequestID(for requestID: ID) -> ID? {
+        activeRequests[requestID]?.originalID
     }
 
     package func setRequestCancellationHandler(
