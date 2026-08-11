@@ -40,16 +40,21 @@ public actor Server {
         /// The protocol lifecycle mechanisms accepted by the server.
         public var protocolMode: ProtocolMode
 
+        /// Maximum queued messages and waiting publishers for each subscription.
+        public var subscriptionBufferCapacity: Int
+
         public init(
             strict: Bool = false,
-            protocolMode: ProtocolMode = .initializationOnly
+            protocolMode: ProtocolMode = .initializationOnly,
+            subscriptionBufferCapacity: Int = 32
         ) {
             self.strict = strict
             self.protocolMode = protocolMode
+            self.subscriptionBufferCapacity = subscriptionBufferCapacity
         }
 
         private enum CodingKeys: String, CodingKey {
-            case strict, protocolMode
+            case strict, protocolMode, subscriptionBufferCapacity
         }
 
         public init(from decoder: Decoder) throws {
@@ -58,6 +63,16 @@ public actor Server {
             protocolMode =
                 try container.decodeIfPresent(ProtocolMode.self, forKey: .protocolMode)
                 ?? .initializationOnly
+            subscriptionBufferCapacity =
+                try container.decodeIfPresent(Int.self, forKey: .subscriptionBufferCapacity)
+                ?? 32
+            guard subscriptionBufferCapacity > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .subscriptionBufferCapacity,
+                    in: container,
+                    debugDescription: "Subscription buffer capacity must be positive"
+                )
+            }
         }
     }
 
@@ -336,16 +351,24 @@ public actor Server {
     /// The protocol version
     private var protocolVersion: String?
     /// One active long-lived notification stream, keyed by its transport routing ID.
+    private struct PendingSubscriptionMessage {
+        let id: Int
+        let data: Data
+        let continuation: CheckedContinuation<Void, Swift.Error>
+    }
+
     private struct ActiveSubscription {
         let requestID: ID
         let notifications: SubscriptionFilter
-        var queuedMessages: [Data]
+        var queuedMessages: SubscriptionQueue<Data>
+        var pendingMessages: SubscriptionQueue<PendingSubscriptionMessage>
         var isDraining: Bool
         var isClosing: Bool
         let closureContinuation: AsyncThrowingStream<Void, Swift.Error>.Continuation
     }
 
     private var subscriptions: [ID: ActiveSubscription] = [:]
+    private var nextSubscriptionMessageID = 0
     private var subscriptionClosureWaiters: [CheckedContinuation<Void, Never>] = []
     /// The task for the message handling loop
     private var task: Task<Void, Never>?
@@ -1542,6 +1565,9 @@ public actor Server {
             throw MCPError.methodNotFound(
                 "subscriptions/listen requires the per-request-metadata lifecycle")
         }
+        guard configuration.subscriptionBufferCapacity > 0 else {
+            throw MCPError.invalidParams("Subscription buffer capacity must be positive")
+        }
 
         let accepted = acceptedSubscriptionFilter(parameters.notifications)
         let acknowledgment = SubscriptionsAcknowledgedNotification.message(.init(
@@ -1557,7 +1583,8 @@ public actor Server {
         subscriptions[context.id] = ActiveSubscription(
             requestID: context.requestID,
             notifications: accepted,
-            queuedMessages: [acknowledgmentData],
+            queuedMessages: SubscriptionQueue([acknowledgmentData]),
+            pendingMessages: SubscriptionQueue(),
             isDraining: false,
             isClosing: false,
             closureContinuation: closureContinuation
@@ -1624,8 +1651,9 @@ public actor Server {
             throw MCPError.internalError("Server connection not initialized")
         }
 
+        var selectedMessages: [(ID, Data)] = []
         for routingID in Array(subscriptions.keys) {
-            guard var subscription = subscriptions[routingID],
+            guard let subscription = subscriptions[routingID],
                 !subscription.isClosing,
                 subscription.notifications.permits(
                     method: message.method,
@@ -1634,13 +1662,84 @@ public actor Server {
             else {
                 continue
             }
-            subscription.queuedMessages.append(try Self.addingSubscriptionID(
-                subscription.requestID,
-                to: data
+            selectedMessages.append((
+                routingID,
+                try Self.addingSubscriptionID(subscription.requestID, to: data)
             ))
+        }
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for (routingID, message) in selectedMessages {
+                group.addTask {
+                    try await self.enqueueSubscriptionMessage(
+                        message,
+                        routingID: routingID,
+                        connection: connection
+                    )
+                }
+            }
+            try await group.waitForAll()
+        }
+    }
+
+    private func enqueueSubscriptionMessage(
+        _ data: Data,
+        routingID: ID,
+        connection: any Transport
+    ) async throws {
+        guard var subscription = subscriptions[routingID], !subscription.isClosing else {
+            return
+        }
+        if subscription.pendingMessages.isEmpty,
+            subscription.queuedMessages.count < configuration.subscriptionBufferCapacity
+        {
+            subscription.queuedMessages.append(data)
             subscriptions[routingID] = subscription
             beginDrainingSubscription(routingID, connection: connection)
+            return
         }
+
+        let messageID = nextSubscriptionMessageID
+        nextSubscriptionMessageID += 1
+        try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Void, Swift.Error>) in
+                guard var current = subscriptions[routingID], !current.isClosing else {
+                    continuation.resume(throwing: MCPError.connectionClosed)
+                    return
+                }
+                if current.pendingMessages.isEmpty,
+                    current.queuedMessages.count < configuration.subscriptionBufferCapacity
+                {
+                    current.queuedMessages.append(data)
+                    subscriptions[routingID] = current
+                    continuation.resume()
+                    beginDrainingSubscription(routingID, connection: connection)
+                    return
+                }
+                guard current.pendingMessages.count < configuration.subscriptionBufferCapacity
+                else {
+                    continuation.resume(throwing: MCPError.internalError(
+                        "Subscription publisher buffer is full"
+                    ))
+                    return
+                }
+                current.pendingMessages.append(PendingSubscriptionMessage(
+                    id: messageID,
+                    data: data,
+                    continuation: continuation
+                ))
+                subscriptions[routingID] = current
+            }
+        }, onCancel: {
+            Task {
+                await self.cancelPendingSubscriptionMessage(
+                    messageID,
+                    routingID: routingID
+                )
+            }
+        })
+        try Task.checkCancellation()
     }
 
     private func beginDrainingSubscription(
@@ -1669,7 +1768,13 @@ public actor Server {
                 return
             }
 
-            let data = subscription.queuedMessages.removeFirst()
+            guard let data = subscription.queuedMessages.popFirst() else { return }
+            if !subscription.isClosing,
+                let pending = subscription.pendingMessages.popFirst()
+            {
+                subscription.queuedMessages.append(pending.data)
+                pending.continuation.resume()
+            }
             subscriptions[routingID] = subscription
             do {
                 if let connection = connection as? any RequestScopedSending {
@@ -1678,10 +1783,12 @@ public actor Server {
                     try await connection.send(data)
                 }
             } catch {
-                guard let subscription = subscriptions[routingID] else {
+                guard let subscription = removeSubscription(
+                    routingID,
+                    pendingError: error
+                ) else {
                     return
                 }
-                removeSubscription(routingID)
                 subscription.closureContinuation.finish(throwing: error)
                 return
             }
@@ -1696,6 +1803,10 @@ public actor Server {
             for routingID in Array(subscriptions.keys) {
                 guard var subscription = subscriptions[routingID] else { continue }
                 subscription.isClosing = true
+                failPendingSubscriptionMessages(
+                    &subscription,
+                    error: MCPError.connectionClosed
+                )
                 subscriptions[routingID] = subscription
                 beginDrainingSubscription(routingID, connection: connection)
             }
@@ -1703,18 +1814,50 @@ public actor Server {
     }
 
     private func cancelSubscription(_ routingID: ID) {
-        guard let subscription = subscriptions[routingID] else { return }
-        removeSubscription(routingID)
+        guard let subscription = removeSubscription(
+            routingID,
+            pendingError: CancellationError()
+        ) else { return }
         subscription.closureContinuation.finish()
     }
 
-    private func removeSubscription(_ routingID: ID) {
-        subscriptions.removeValue(forKey: routingID)
-        guard subscriptions.isEmpty, !subscriptionClosureWaiters.isEmpty else { return }
-        let waiters = subscriptionClosureWaiters
-        subscriptionClosureWaiters.removeAll()
-        for waiter in waiters {
-            waiter.resume()
+    @discardableResult
+    private func removeSubscription(
+        _ routingID: ID,
+        pendingError: Swift.Error = MCPError.connectionClosed
+    ) -> ActiveSubscription? {
+        guard var subscription = subscriptions.removeValue(forKey: routingID) else {
+            return nil
+        }
+        failPendingSubscriptionMessages(&subscription, error: pendingError)
+        if subscriptions.isEmpty, !subscriptionClosureWaiters.isEmpty {
+            let waiters = subscriptionClosureWaiters
+            subscriptionClosureWaiters.removeAll()
+            for waiter in waiters {
+                waiter.resume()
+            }
+        }
+        return subscription
+    }
+
+    private func cancelPendingSubscriptionMessage(
+        _ messageID: Int,
+        routingID: ID
+    ) {
+        guard var subscription = subscriptions[routingID] else { return }
+        let removed = subscription.pendingMessages.removeAll { $0.id == messageID }
+        subscriptions[routingID] = subscription
+        for pending in removed {
+            pending.continuation.resume(throwing: CancellationError())
+        }
+    }
+
+    private func failPendingSubscriptionMessages(
+        _ subscription: inout ActiveSubscription,
+        error: Swift.Error
+    ) {
+        while let pending = subscription.pendingMessages.popFirst() {
+            pending.continuation.resume(throwing: error)
         }
     }
 

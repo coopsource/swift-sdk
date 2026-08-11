@@ -111,3 +111,43 @@ public struct SubscriptionNotification: Hashable, Sendable {
         self.parameters = parameters
     }
 }
+
+package struct SubscriptionQueue<Element> {
+    private var front: [Element] = []
+    private var back: [Element] = []
+
+    package var count: Int { front.count + back.count }
+    package var isEmpty: Bool { front.isEmpty && back.isEmpty }
+
+    package init(_ elements: [Element] = []) {
+        back = elements
+    }
+
+    package mutating func append(_ element: Element) {
+        back.append(element)
+    }
+
+    package mutating func popFirst() -> Element? {
+        if front.isEmpty {
+            front = back.reversed()
+            back.removeAll(keepingCapacity: true)
+        }
+        return front.popLast()
+    }
+
+    package mutating func removeAll(
+        where shouldRemove: (Element) throws -> Bool
+    ) rethrows -> [Element] {
+        var kept = SubscriptionQueue<Element>()
+        var removed: [Element] = []
+        while let element = popFirst() {
+            if try shouldRemove(element) {
+                removed.append(element)
+            } else {
+                kept.append(element)
+            }
+        }
+        self = kept
+        return removed
+    }
+}

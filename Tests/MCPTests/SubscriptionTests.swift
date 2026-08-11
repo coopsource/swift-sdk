@@ -246,6 +246,34 @@ struct SubscriptionTests {
         #expect(result._meta.subscriptionID == .string("listen-1"))
     }
 
+    @Test("Subscription buffer configuration is positive and backward compatible")
+    func bufferConfiguration() throws {
+        let decoder = JSONDecoder()
+        let oldClient = try decoder.decode(
+            Client.Configuration.self,
+            from: Data(#"{"strict":false}"#.utf8)
+        )
+        let oldServer = try decoder.decode(
+            Server.Configuration.self,
+            from: Data(#"{"strict":false}"#.utf8)
+        )
+        #expect(oldClient.subscriptionBufferCapacity == 32)
+        #expect(oldServer.subscriptionBufferCapacity == 32)
+
+        #expect(throws: DecodingError.self) {
+            _ = try decoder.decode(
+                Client.Configuration.self,
+                from: Data(#"{"subscriptionBufferCapacity":0}"#.utf8)
+            )
+        }
+        #expect(throws: DecodingError.self) {
+            _ = try decoder.decode(
+                Server.Configuration.self,
+                from: Data(#"{"subscriptionBufferCapacity":-1}"#.utf8)
+            )
+        }
+    }
+
     @Test("Acknowledgment precedes selected notifications")
     func acknowledgmentAndFiltering() async throws {
         let (client, server) = try await connectedPair(
@@ -326,6 +354,168 @@ struct SubscriptionTests {
         try await client.cancelSubscription(resourceSubscription.id)
         await client.disconnect()
         await server.stop()
+    }
+
+    @Test("A slow client fails explicitly and cancels its remote subscription once")
+    func clientBufferOverflow() async throws {
+        let transport = MockTransport()
+        let client = makeClient(subscriptionBufferCapacity: 2)
+        let connectTask = Task {
+            try await client.connectWithInfo(transport: transport)
+        }
+        while await transport.sentData.isEmpty {
+            await Task.yield()
+        }
+        let discover: AnyRequest = try #require(await transport.decodeLastSentMessage())
+        try await transport.queue(response: Discover.response(
+            id: discover.id,
+            result: .init(
+                supportedVersions: [Version.perRequestMetadataVersion],
+                capabilities: .init(tools: .init(listChanged: true)),
+                ttlMs: 0,
+                cacheScope: .public,
+                _meta: Metadata(additionalFields: [
+                    ProtocolMetadataKey.serverInfo: try Value(
+                        Server.Info(name: "Server", version: "1.0")
+                    )
+                ])
+            )
+        ))
+        _ = try await connectTask.value
+
+        let listenTask = Task {
+            try await client.listen(notifications: .init(toolsListChanged: true))
+        }
+        while await transport.sentData.count < 2 {
+            await Task.yield()
+        }
+        let request = try JSONDecoder().decode(
+            Request<SubscriptionsListen>.self,
+            from: await transport.sentData[1]
+        )
+        try await transport.queue(notification: SubscriptionsAcknowledgedNotification.message(
+            .init(
+                subscriptionID: request.id,
+                notifications: .init(toolsListChanged: true)
+            )
+        ))
+        let subscription = try await listenTask.value
+
+        await transport.queue(data: try correlatedToolNotification(subscriptionID: request.id))
+        await transport.queue(data: try correlatedToolNotification(subscriptionID: request.id))
+        try await Task.sleep(for: .milliseconds(20))
+
+        var events = subscription.events.makeAsyncIterator()
+        #expect(try await events.next() == .acknowledged(.init(toolsListChanged: true)))
+        guard case .notification = try await events.next() else {
+            Issue.record("Expected the buffered tool notification")
+            await client.disconnect()
+            return
+        }
+        await #expect(throws: MCPError.self) {
+            _ = try await events.next()
+        }
+
+        for _ in 0..<1_000 where await cancellationCount(in: transport) < 1 {
+            await Task.yield()
+        }
+        #expect(await cancellationCount(in: transport) == 1)
+        await transport.queue(data: try correlatedToolNotification(subscriptionID: request.id))
+        try await Task.sleep(for: .milliseconds(10))
+        #expect(await cancellationCount(in: transport) == 1)
+        await client.disconnect()
+    }
+
+    @Test("Server subscription publishing applies bounded FIFO backpressure")
+    func serverBackpressure() async throws {
+        let gate = SubscriptionSendGate()
+        let completion = SubscriptionCompletionFlag()
+        let transport = MockTransport()
+        await transport.setSendObserver { _ in await gate.wait() }
+        let server = makeServer(
+            capabilities: .init(resources: .init(subscribe: true)),
+            subscriptionBufferCapacity: 1
+        )
+        try await server.start(transport: transport)
+        let requestID = ID.string("bounded-server-test")
+        await transport.queue(data: try subscriptionRequest(
+            id: requestID,
+            resources: ["file:///one", "file:///two", "file:///three"]
+        ))
+        await gate.waitForArrivals(1)
+
+        try await server.notify(ResourceUpdatedNotification.message(.init(uri: "file:///one")))
+        let second = Task {
+            try await server.notify(
+                ResourceUpdatedNotification.message(.init(uri: "file:///two"))
+            )
+            await completion.finish()
+        }
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(await completion.isFinished == false)
+        await #expect(throws: MCPError.self) {
+            try await server.notify(
+                ResourceUpdatedNotification.message(.init(uri: "file:///three"))
+            )
+        }
+
+        await gate.open()
+        try await second.value
+        await gate.waitForArrivals(3)
+        let messages = await transport.sentData.compactMap {
+            try? JSONDecoder().decode(AnyMessage.self, from: $0)
+        }
+        #expect(messages.count >= 3)
+        #expect(messages[0].method == SubscriptionsAcknowledgedNotification.name)
+        #expect(messages[1].params.objectValue?["uri"]?.stringValue == "file:///one")
+        #expect(messages[2].params.objectValue?["uri"]?.stringValue == "file:///two")
+
+        try await transport.queue(notification: CancelledNotification.message(
+            .init(requestId: requestID, reason: "Test complete")
+        ))
+        await server.stop()
+    }
+
+    @Test("Cancellation and shutdown release blocked subscription publishers")
+    func serverBackpressureTermination() async throws {
+        let gate = SubscriptionSendGate()
+        let transport = MockTransport()
+        await transport.setSendObserver { _ in await gate.wait() }
+        let server = makeServer(
+            capabilities: .init(resources: .init(subscribe: true)),
+            subscriptionBufferCapacity: 1
+        )
+        try await server.start(transport: transport)
+        await transport.queue(data: try subscriptionRequest(
+            id: .string("blocked-server-test"),
+            resources: ["file:///one", "file:///two", "file:///three"]
+        ))
+        await gate.waitForArrivals(1)
+
+        try await server.notify(ResourceUpdatedNotification.message(.init(uri: "file:///one")))
+        let cancelledPublisher = Task {
+            try await server.notify(
+                ResourceUpdatedNotification.message(.init(uri: "file:///two"))
+            )
+        }
+        try await Task.sleep(for: .milliseconds(20))
+        cancelledPublisher.cancel()
+        await #expect(throws: CancellationError.self) {
+            try await cancelledPublisher.value
+        }
+
+        let closingPublisher = Task {
+            try await server.notify(
+                ResourceUpdatedNotification.message(.init(uri: "file:///three"))
+            )
+        }
+        try await Task.sleep(for: .milliseconds(20))
+        let stop = Task { await server.stop() }
+        await #expect(throws: MCPError.self) {
+            try await closingPublisher.value
+        }
+        await gate.open()
+        await stop.value
     }
 
     @Test("Explicit reconnect re-sends the same subscription")
@@ -409,20 +599,62 @@ struct SubscriptionTests {
         return (client, server)
     }
 
-    private func makeClient() -> Client {
+    private func makeClient(subscriptionBufferCapacity: Int = 32) -> Client {
         Client(
             name: "SubscriptionClient",
             version: "1.0",
-            configuration: .init(protocolMode: .perRequestMetadataOnly)
+            configuration: .init(
+                protocolMode: .perRequestMetadataOnly,
+                subscriptionBufferCapacity: subscriptionBufferCapacity
+            )
         )
     }
 
-    private func makeServer(capabilities: Server.Capabilities) -> Server {
+    private func makeServer(
+        capabilities: Server.Capabilities,
+        subscriptionBufferCapacity: Int = 32
+    ) -> Server {
         Server(
             name: "SubscriptionServer",
             version: "1.0",
             capabilities: capabilities,
-            configuration: .init(protocolMode: .perRequestMetadataOnly)
+            configuration: .init(
+                protocolMode: .perRequestMetadataOnly,
+                subscriptionBufferCapacity: subscriptionBufferCapacity
+            )
+        )
+    }
+
+    private func correlatedToolNotification(subscriptionID: ID) throws -> Data {
+        let metadata = Metadata(additionalFields: [
+            ProtocolMetadataKey.subscriptionID: try Value(subscriptionID)
+        ])
+        return try JSONEncoder().encode(Value.object([
+            "jsonrpc": "2.0",
+            "method": .string(ToolListChangedNotification.name),
+            "params": .object(["_meta": try Value(metadata)]),
+        ]))
+    }
+
+    private func cancellationCount(in transport: MockTransport) async -> Int {
+        await transport.sentData.reduce(into: 0) { count, data in
+            guard let message = try? JSONDecoder().decode(AnyMessage.self, from: data),
+                message.method == CancelledNotification.name
+            else { return }
+            count += 1
+        }
+    }
+
+    private func subscriptionRequest(id: ID, resources: [String]) throws -> Data {
+        try PerRequestMetadataWire.encodeRequest(
+            SubscriptionsListen.request(
+                id: id,
+                .init(notifications: .init(resourceSubscriptions: resources))
+            ),
+            protocolVersion: Version.perRequestMetadataVersion,
+            clientInfo: .init(name: "Client", version: "1.0"),
+            clientCapabilities: .init(),
+            using: JSONEncoder()
         )
     }
 
@@ -432,5 +664,36 @@ struct SubscriptionTests {
             contentsOf: testDirectory
                 .appendingPathComponent("Fixtures/2026-07-28/\(name).json")
         )
+    }
+}
+
+private actor SubscriptionSendGate {
+    private var isOpen = false
+    private var arrivals = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        arrivals += 1
+        guard !isOpen else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func waitForArrivals(_ count: Int) async {
+        while arrivals < count { await Task.yield() }
+    }
+
+    func open() {
+        isOpen = true
+        let continuations = waiters
+        waiters.removeAll()
+        for continuation in continuations { continuation.resume() }
+    }
+}
+
+private actor SubscriptionCompletionFlag {
+    private(set) var isFinished = false
+
+    func finish() {
+        isFinished = true
     }
 }
