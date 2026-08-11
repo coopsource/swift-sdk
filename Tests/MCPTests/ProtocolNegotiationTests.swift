@@ -308,7 +308,7 @@ struct ProtocolNegotiationTests {
         await server.stop()
     }
 
-    @Test("Per-request client rejects a success response without result type")
+    @Test("Per-request client treats an absent result type as complete")
     func missingResultType() async throws {
         let transport = MockTransport()
         let client = Client(
@@ -334,16 +334,49 @@ struct ProtocolNegotiationTests {
         ]
         await transport.queue(data: try JSONEncoder().encode(response))
 
+        let connection = try await connectionTask.value
+        #expect(connection.protocolLifecycle == .perRequestMetadata)
+        #expect(connection.protocolVersion == Version.perRequestMetadataVersion)
+        await client.disconnect()
+    }
+
+    @Test("Per-request client rejects an unrecognized result type")
+    func unrecognizedResultType() async throws {
+        let transport = MockTransport()
+        let client = Client(
+            name: "PerRequestClient",
+            version: "1.0",
+            configuration: .init(protocolMode: .perRequestMetadataOnly)
+        )
+        let connectionTask = Task {
+            try await client.connectWithInfo(transport: transport)
+        }
+        try await waitUntil { await !transport.sentData.isEmpty }
+        let decodedRequest: AnyRequest? = await transport.decodeLastSentMessage()
+        let request = try #require(decodedRequest)
+        let response: Value = [
+            "jsonrpc": "2.0",
+            "id": try Value(request.id),
+            "result": [
+                "supportedVersions": [.string(Version.perRequestMetadataVersion)],
+                "capabilities": .object([:]),
+                "ttlMs": 0,
+                "cacheScope": "public",
+                "resultType": "totally_unknown",
+            ],
+        ]
+        await transport.queue(data: try JSONEncoder().encode(response))
+
         do {
             _ = try await connectionTask.value
-            Issue.record("Expected the response to be rejected")
+            Issue.record("Expected an unrecognized result type to be rejected")
         } catch let error as MCPError {
-            guard case .internalError(let message) = error else {
-                Issue.record("Expected a result-type validation error")
+            guard case .invalidRequest(let message) = error else {
+                Issue.record("Expected an invalid-request error, got \(error)")
                 await client.disconnect()
                 return
             }
-            #expect(message?.contains("resultType") == true)
+            #expect(message?.contains("totally_unknown") == true)
         }
         await client.disconnect()
     }

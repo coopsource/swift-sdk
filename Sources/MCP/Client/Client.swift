@@ -1487,13 +1487,21 @@ public actor Client {
 
     private func resultTypeValidationError(for value: Value) -> MCPError? {
         guard selectedProtocolLifecycle == .perRequestMetadata else { return nil }
-        guard let result = value.objectValue,
-            result["resultType"]?.stringValue != nil
-        else {
+        guard let result = value.objectValue else {
             return MCPError.internalError(
-                "Per-request metadata response is missing a string-valued resultType")
+                "Per-request metadata response result must be a JSON object")
         }
-        return nil
+        guard let resultTypeValue = result["resultType"] else { return nil }
+        guard let resultType = resultTypeValue.stringValue else {
+            return MCPError.internalError(
+                "Per-request metadata response has a non-string resultType")
+        }
+        switch resultType {
+        case "complete", "input_required":
+            return nil
+        default:
+            return MCPError.invalidRequest("Unsupported resultType: \(resultType)")
+        }
     }
 
     // Add handler for batch responses
