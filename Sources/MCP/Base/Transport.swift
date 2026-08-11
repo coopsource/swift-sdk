@@ -56,6 +56,13 @@ package protocol RequestCancellationRegistering: Transport {
     ) async
 }
 
+/// Optional HTTP-client hook for schemas that define tool parameter headers.
+package protocol ToolHeaderSchemaManaging: Transport {
+    func updateToolHeaderSchemas(_ tools: [Tool], replacing: Bool) async -> [Tool]
+    func toolHeaderPlan(named toolName: String) async -> ToolHeaderPlan?
+    func clearToolHeaderSchemas() async
+}
+
 /// Classifies the result of an HTTP per-request metadata compatibility probe.
 package enum ProtocolLifecycleProbeError: Error {
     case initializationBasedResponse

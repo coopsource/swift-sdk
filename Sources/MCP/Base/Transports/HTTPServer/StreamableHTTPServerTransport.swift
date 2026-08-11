@@ -24,6 +24,8 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
 
     private struct ActiveRequest {
         let originalID: ID
+        let method: String
+        let listToolsCursor: String?
         let stream: AsyncThrowingStream<Data, Swift.Error>
         let streamContinuation: AsyncThrowingStream<Data, Swift.Error>.Continuation
         var initialResponse: CheckedContinuation<HTTPResponse, Never>?
@@ -56,6 +58,7 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
     private var activeRequests: [ID: ActiveRequest] = [:]
     private var httpRequestContexts: [ID: HTTPRequest] = [:]
     private var requestCancellationHandler: (@Sendable (ID) async -> Void)?
+    private var toolHeaderPlans: [String: ToolHeaderPlan] = [:]
     private var started = false
     private var terminated = false
 
@@ -122,6 +125,18 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
 
     public func send(_ data: Data) async throws {
         try await send(data, relatedTo: nil)
+    }
+
+    /// Replaces the tool definitions used to validate `Mcp-Param-*` headers.
+    ///
+    /// Responses to `tools/list` also update these definitions automatically. Calling
+    /// this method allows validation before the first list request reaches the server.
+    public func updateTools(_ tools: [Tool]) throws {
+        var plans: [String: ToolHeaderPlan] = [:]
+        for tool in tools {
+            plans[tool.name] = try ToolHeaderPlan(tool: tool)
+        }
+        toolHeaderPlans = plans
     }
 
     package func send(_ data: Data, relatedTo requestID: ID?) async throws {
@@ -211,20 +226,40 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
         if let versionError = validateProtocolVersion(request: request, message: message) {
             return versionError
         }
+        if let headerError = MCPHTTPHeaders.validationFailure(
+            for: request,
+            toolPlans: toolHeaderPlans
+        ) {
+            return makeErrorResponse(
+                statusCode: 400,
+                id: message.id,
+                error: .remote(
+                    code: ProtocolErrorCode.headerMismatch,
+                    message: "Header mismatch: \(headerError)",
+                    data: nil
+                )
+            )
+        }
 
         switch message {
         case .notification:
             incomingContinuation.yield(body)
             return .accepted()
 
-        case .request(let id, _, _):
-            return await handleJSONRPCRequest(body, requestID: id, request: request)
+        case .request(let id, let method, _):
+            return await handleJSONRPCRequest(
+                body,
+                requestID: id,
+                method: method,
+                request: request
+            )
         }
     }
 
     private func handleJSONRPCRequest(
         _ body: Data,
         requestID: ID,
+        method: String,
         request: HTTPRequest
     ) async -> HTTPResponse {
         let routingID = makeRoutingID()
@@ -247,6 +282,8 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
 
                 activeRequests[routingID] = ActiveRequest(
                     originalID: requestID,
+                    method: method,
+                    listToolsCursor: Self.listToolsCursor(in: body, method: method),
                     stream: stream,
                     streamContinuation: streamContinuation,
                     initialResponse: continuation,
@@ -306,6 +343,13 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
                 .internalError("Could not restore the response id")
             ))
             return
+        }
+
+        if activeRequest.method == ListTools.name {
+            updateToolsFromListResponse(
+                clientData,
+                replacing: activeRequest.listToolsCursor == nil
+            )
         }
 
         if activeRequest.isStreaming {
@@ -481,6 +525,45 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
         return id(from: idValue)
     }
 
+    private static func listToolsCursor(in data: Data, method: String) -> String? {
+        guard method == ListTools.name,
+            let value = try? JSONDecoder().decode(Value.self, from: data)
+        else {
+            return nil
+        }
+        return value.objectValue?["params"]?.objectValue?["cursor"]?.stringValue
+    }
+
+    private func updateToolsFromListResponse(_ data: Data, replacing: Bool) {
+        guard let value = try? JSONDecoder().decode(Value.self, from: data),
+            let toolsValue = value.objectValue?["result"]?.objectValue?["tools"],
+            let tools = try? JSONDecoder().decode(
+                [Tool].self,
+                from: JSONEncoder().encode(toolsValue)
+            )
+        else {
+            return
+        }
+
+        if replacing {
+            toolHeaderPlans.removeAll()
+        }
+        for tool in tools {
+            do {
+                toolHeaderPlans[tool.name] = try ToolHeaderPlan(tool: tool)
+            } catch {
+                toolHeaderPlans.removeValue(forKey: tool.name)
+                logger.warning(
+                    "Cannot validate headers for tool with invalid x-mcp-header schema",
+                    metadata: [
+                        "tool": "\(tool.name)",
+                        "error": "\(error.localizedDescription)",
+                    ]
+                )
+            }
+        }
+    }
+
     private static func replacingMessageID(in data: Data, with id: ID) throws -> Data {
         var value = try JSONDecoder().decode(Value.self, from: data)
         guard case .object(var object) = value else {
@@ -579,6 +662,7 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
         }
 
         requestCancellationHandler = nil
+        toolHeaderPlans.removeAll()
         incomingContinuation.finish()
         logger.debug("Per-request-metadata HTTP server transport terminated")
     }

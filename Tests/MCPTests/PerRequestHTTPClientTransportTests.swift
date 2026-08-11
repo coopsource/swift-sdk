@@ -175,6 +175,19 @@ import Testing
         }
     }
 
+    private actor ToolHeaderRetryTracker {
+        private(set) var callIDs: [ID] = []
+        private(set) var listCount = 0
+
+        func recordCall(_ id: ID) {
+            callIDs.append(id)
+        }
+
+        func recordList() {
+            listCount += 1
+        }
+    }
+
     private final class RefreshingAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
         let tracker = AuthorizationCallTracker()
         let maxAuthorizationAttempts = 3
@@ -370,6 +383,7 @@ import Testing
                     request.value(forHTTPHeaderField: HTTPHeaderName.protocolVersion)
                         == Version.perRequestMetadataVersion
                 )
+                #expect(request.value(forHTTPHeaderField: HTTPHeaderName.mcpMethod) == Ping.name)
                 #expect(request.value(forHTTPHeaderField: HTTPHeaderName.sessionID) == nil)
 
                 let response = HTTPURLResponse(
@@ -408,6 +422,10 @@ import Testing
                 #expect(
                     request.value(forHTTPHeaderField: HTTPHeaderName.protocolVersion)
                         == Version.perRequestMetadataVersion
+                )
+                #expect(
+                    request.value(forHTTPHeaderField: HTTPHeaderName.mcpMethod)
+                        == CancelledNotification.name
                 )
                 let response = HTTPURLResponse(
                     url: endpoint,
@@ -1676,6 +1694,349 @@ import Testing
             }
             await PerRequestHTTPURLProtocol.verifyCallCount(0, for: endpoint)
             await transport.disconnect()
+        }
+
+        @Test("HeaderMismatch refreshes a changed tool schema and retries with a fresh id")
+        func toolHeaderRefreshAndRetry() async throws {
+            let tracker = ToolHeaderRetryTracker()
+            let tool = Tool(
+                name: "weather",
+                description: nil,
+                inputSchema: .object([
+                    "type": "object",
+                    "properties": .object([
+                        "region": .object([
+                            "type": "string",
+                            "x-mcp-header": "Region",
+                        ])
+                    ]),
+                ])
+            )
+
+            await PerRequestHTTPURLProtocol.setHandler { [endpoint] request in
+                let body = try #require(requestBody(request))
+                let rpcRequest = try JSONDecoder().decode(AnyRequest.self, from: body)
+                let method = rpcRequest.method
+
+                let result: Value
+                let statusCode: Int
+                switch method {
+                case Discover.name:
+                    result = .object([
+                        "resultType": "complete",
+                        "supportedVersions": .array([
+                            .string(Version.perRequestMetadataVersion)
+                        ]),
+                        "capabilities": .object(["tools": .object([:])]),
+                        "ttlMs": 0,
+                        "cacheScope": "public",
+                    ])
+                    statusCode = 200
+
+                case ListTools.name:
+                    await tracker.recordList()
+                    result = .object([
+                        "resultType": "complete",
+                        "tools": .array([try Value(tool)]),
+                    ])
+                    statusCode = 200
+
+                case CallTool.name:
+                    await tracker.recordCall(rpcRequest.id)
+                    #expect(request.value(forHTTPHeaderField: HTTPHeaderName.mcpName)
+                        == "weather")
+                    if request.value(forHTTPHeaderField: "Mcp-Param-Region") == nil {
+                        let error = MCPError.remote(
+                            code: ProtocolErrorCode.headerMismatch,
+                            message: "Header mismatch: Mcp-Param-Region is missing",
+                            data: nil
+                        )
+                        return (
+                            HTTPURLResponse(
+                                url: endpoint,
+                                statusCode: 400,
+                                httpVersion: "HTTP/1.1",
+                                headerFields: ["Content-Type": ContentType.json]
+                            )!,
+                            try JSONEncoder().encode(
+                                AnyMethod.response(id: rpcRequest.id, error: error)
+                            )
+                        )
+                    }
+                    #expect(request.value(forHTTPHeaderField: "Mcp-Param-Region")
+                        == "us-west1")
+                    result = .object([
+                        "resultType": "complete",
+                        "content": .array([]),
+                    ])
+                    statusCode = 200
+
+                default:
+                    Issue.record("Unexpected method \(method)")
+                    result = .object(["resultType": "complete"])
+                    statusCode = 200
+                }
+
+                return (
+                    HTTPURLResponse(
+                        url: endpoint,
+                        statusCode: statusCode,
+                        httpVersion: "HTTP/1.1",
+                        headerFields: ["Content-Type": ContentType.json]
+                    )!,
+                    try JSONEncoder().encode(
+                        AnyMethod.response(id: rpcRequest.id, result: result)
+                    )
+                )
+            }
+
+            let client = Client(
+                name: "Header client",
+                version: "1.0",
+                configuration: .init(protocolMode: .perRequestMetadataOnly)
+            )
+            try await client.connect(transport: makeTransport())
+            let result = try await client.callTool(
+                name: "weather",
+                arguments: ["region": "us-west1"]
+            )
+
+            #expect(result.content.isEmpty)
+            #expect(await tracker.listCount == 1)
+            let callIDs = await tracker.callIDs
+            #expect(callIDs.count == 2)
+            #expect(callIDs[0] != callIDs[1])
+            await PerRequestHTTPURLProtocol.verifyCallCount(4, for: endpoint)
+            await client.disconnect()
+        }
+
+        @Test("HeaderMismatch for a standard header does not refresh tool schemas")
+        func standardHeaderMismatchDoesNotRetry() async throws {
+            let tracker = ToolHeaderRetryTracker()
+            await PerRequestHTTPURLProtocol.setHandler { [endpoint] request in
+                let body = try #require(requestBody(request))
+                let rpcRequest = try JSONDecoder().decode(AnyRequest.self, from: body)
+                if rpcRequest.method == Discover.name {
+                    return (
+                        HTTPURLResponse(
+                            url: endpoint,
+                            statusCode: 200,
+                            httpVersion: "HTTP/1.1",
+                            headerFields: ["Content-Type": ContentType.json]
+                        )!,
+                        try JSONEncoder().encode(AnyMethod.response(
+                            id: rpcRequest.id,
+                            result: Value.object([
+                                "resultType": "complete",
+                                "supportedVersions": .array([
+                                    .string(Version.perRequestMetadataVersion)
+                                ]),
+                                "capabilities": .object(["tools": .object([:])]),
+                                "ttlMs": 0,
+                                "cacheScope": "public",
+                            ])
+                        ))
+                    )
+                }
+
+                await tracker.recordCall(rpcRequest.id)
+                let error = MCPError.remote(
+                    code: ProtocolErrorCode.headerMismatch,
+                    message: "Header mismatch: Mcp-Name does not match",
+                    data: nil
+                )
+                return (
+                    HTTPURLResponse(
+                        url: endpoint,
+                        statusCode: 400,
+                        httpVersion: "HTTP/1.1",
+                        headerFields: ["Content-Type": ContentType.json]
+                    )!,
+                    try JSONEncoder().encode(
+                        AnyMethod.response(id: rpcRequest.id, error: error)
+                    )
+                )
+            }
+
+            let client = Client(
+                name: "Header client",
+                version: "1.0",
+                configuration: .init(protocolMode: .perRequestMetadataOnly)
+            )
+            try await client.connect(transport: makeTransport())
+            do {
+                _ = try await client.callTool(name: "weather")
+                Issue.record("Expected HeaderMismatch")
+            } catch let error as MCPError {
+                #expect(error.code == ProtocolErrorCode.headerMismatch)
+            }
+
+            #expect(await tracker.callIDs.count == 1)
+            #expect(await tracker.listCount == 0)
+            await PerRequestHTTPURLProtocol.verifyCallCount(2, for: endpoint)
+            await client.disconnect()
+        }
+
+        @Test("Generic tools/list requests exclude invalid header schemas")
+        func genericListToolsFiltersInvalidSchemas() async throws {
+            let valid = Tool(
+                name: "valid",
+                description: nil,
+                inputSchema: .object(["type": "object", "properties": .object([:])])
+            )
+            let invalid = Tool(
+                name: "invalid",
+                description: nil,
+                inputSchema: .object([
+                    "type": "object",
+                    "properties": .object([
+                        "value": .object([
+                            "type": "number",
+                            "x-mcp-header": "Value",
+                        ])
+                    ]),
+                ])
+            )
+            await PerRequestHTTPURLProtocol.setHandler { [endpoint] request in
+                let body = try #require(requestBody(request))
+                let rpcRequest = try JSONDecoder().decode(AnyRequest.self, from: body)
+                let result: Value
+                if rpcRequest.method == Discover.name {
+                    result = .object([
+                        "resultType": "complete",
+                        "supportedVersions": .array([
+                            .string(Version.perRequestMetadataVersion)
+                        ]),
+                        "capabilities": .object(["tools": .object([:])]),
+                        "ttlMs": 0,
+                        "cacheScope": "public",
+                    ])
+                } else {
+                    #expect(rpcRequest.method == ListTools.name)
+                    result = .object([
+                        "resultType": "complete",
+                        "tools": .array([try Value(valid), try Value(invalid)]),
+                    ])
+                }
+                return (
+                    HTTPURLResponse(
+                        url: endpoint,
+                        statusCode: 200,
+                        httpVersion: "HTTP/1.1",
+                        headerFields: ["Content-Type": ContentType.json]
+                    )!,
+                    try JSONEncoder().encode(
+                        AnyMethod.response(id: rpcRequest.id, result: result)
+                    )
+                )
+            }
+
+            let client = Client(
+                name: "Header client",
+                version: "1.0",
+                configuration: .init(protocolMode: .perRequestMetadataOnly)
+            )
+            try await client.connect(transport: makeTransport())
+            let context = try await client.send(ListTools.request(.init()))
+            let result = try await context.value
+
+            #expect(result.tools.map(\.name) == ["valid"])
+            await client.disconnect()
+        }
+
+        @Test("HeaderMismatch does not retry when the tool schema is unchanged")
+        func unchangedToolSchemaDoesNotRetry() async throws {
+            let tracker = ToolHeaderRetryTracker()
+            let tool = Tool(
+                name: "weather",
+                description: nil,
+                inputSchema: .object([
+                    "type": "object",
+                    "properties": .object([
+                        "region": .object([
+                            "type": "string",
+                            "x-mcp-header": "Region",
+                        ])
+                    ]),
+                ])
+            )
+            await PerRequestHTTPURLProtocol.setHandler { [endpoint] request in
+                let body = try #require(requestBody(request))
+                let rpcRequest = try JSONDecoder().decode(AnyRequest.self, from: body)
+
+                if rpcRequest.method == CallTool.name {
+                    await tracker.recordCall(rpcRequest.id)
+                    let error = MCPError.remote(
+                        code: ProtocolErrorCode.headerMismatch,
+                        message: "Header mismatch: Mcp-Param-Region does not match",
+                        data: nil
+                    )
+                    return (
+                        HTTPURLResponse(
+                            url: endpoint,
+                            statusCode: 400,
+                            httpVersion: "HTTP/1.1",
+                            headerFields: ["Content-Type": ContentType.json]
+                        )!,
+                        try JSONEncoder().encode(
+                            AnyMethod.response(id: rpcRequest.id, error: error)
+                        )
+                    )
+                }
+
+                let result: Value
+                if rpcRequest.method == Discover.name {
+                    result = .object([
+                        "resultType": "complete",
+                        "supportedVersions": .array([
+                            .string(Version.perRequestMetadataVersion)
+                        ]),
+                        "capabilities": .object(["tools": .object([:])]),
+                        "ttlMs": 0,
+                        "cacheScope": "public",
+                    ])
+                } else {
+                    #expect(rpcRequest.method == ListTools.name)
+                    await tracker.recordList()
+                    result = .object([
+                        "resultType": "complete",
+                        "tools": .array([try Value(tool)]),
+                    ])
+                }
+                return (
+                    HTTPURLResponse(
+                        url: endpoint,
+                        statusCode: 200,
+                        httpVersion: "HTTP/1.1",
+                        headerFields: ["Content-Type": ContentType.json]
+                    )!,
+                    try JSONEncoder().encode(
+                        AnyMethod.response(id: rpcRequest.id, result: result)
+                    )
+                )
+            }
+
+            let client = Client(
+                name: "Header client",
+                version: "1.0",
+                configuration: .init(protocolMode: .perRequestMetadataOnly)
+            )
+            try await client.connect(transport: makeTransport())
+            _ = try await client.listTools()
+            do {
+                _ = try await client.callTool(
+                    name: "weather",
+                    arguments: ["region": "us-west1"]
+                )
+                Issue.record("Expected HeaderMismatch")
+            } catch let error as MCPError {
+                #expect(error.code == ProtocolErrorCode.headerMismatch)
+            }
+
+            #expect(await tracker.callIDs.count == 1)
+            #expect(await tracker.listCount == 2)
+            await PerRequestHTTPURLProtocol.verifyCallCount(4, for: endpoint)
+            await client.disconnect()
         }
 
         private func makeTransport(

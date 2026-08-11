@@ -237,7 +237,7 @@ private struct RequestScopedSSEParser {
 /// // and deliver them through the client's notification handlers
 /// ```
 public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestStreamCancelling,
-    ProtocolLifecycleCacheKeyProviding
+    ProtocolLifecycleCacheKeyProviding, ToolHeaderSchemaManaging
 {
     /// The server endpoint URL to connect to
     public let endpoint: URL
@@ -253,6 +253,7 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
 
     /// Lifecycle-specific behavior selected by the client.
     private var protocolLifecycle: ProtocolLifecycle = .initializationBased
+    private var toolHeaderPlans: [String: ToolHeaderPlan] = [:]
 
     /// Whether initialization-based connections open a standalone GET event stream.
     ///
@@ -448,6 +449,7 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
         }
         activeRequestTasks = [:]
         pendingRequestCancellations = []
+        toolHeaderPlans.removeAll()
 
         session.invalidateAndCancel()
         requestSession.invalidateAndCancel()
@@ -508,6 +510,41 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
             return "\(scheme)://\(formattedHost):\(port)"
         }
         return "\(scheme)://\(formattedHost)"
+    }
+
+    package func updateToolHeaderSchemas(
+        _ tools: [Tool],
+        replacing: Bool
+    ) -> [Tool] {
+        if replacing {
+            toolHeaderPlans.removeAll()
+        }
+
+        var accepted: [Tool] = []
+        for tool in tools {
+            do {
+                toolHeaderPlans[tool.name] = try ToolHeaderPlan(tool: tool)
+                accepted.append(tool)
+            } catch {
+                toolHeaderPlans.removeValue(forKey: tool.name)
+                logger.warning(
+                    "Ignoring tool with invalid x-mcp-header schema",
+                    metadata: [
+                        "tool": "\(tool.name)",
+                        "error": "\(error.localizedDescription)",
+                    ]
+                )
+            }
+        }
+        return accepted
+    }
+
+    package func toolHeaderPlan(named toolName: String) -> ToolHeaderPlan? {
+        toolHeaderPlans[toolName]
+    }
+
+    package func clearToolHeaderSchemas() {
+        toolHeaderPlans.removeAll()
     }
 
     /// Sends data through an HTTP POST request
@@ -674,6 +711,12 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
                 requestProtocolVersion,
                 forHTTPHeaderField: HTTPHeaderName.protocolVersion
             )
+            for (name, value) in try MCPHTTPHeaders.requestHeaders(
+                for: data,
+                toolPlans: toolHeaderPlans
+            ) {
+                request.setValue(value, forHTTPHeaderField: name)
+            }
             if let authValue = authorizationHeader {
                 request.setValue(authValue, forHTTPHeaderField: HTTPHeaderName.authorization)
             }
@@ -683,6 +726,8 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
                 try await performPerRequestMetadataPOST(
                     request,
                     requestID: requestID,
+                    requestMethod: operationKey,
+                    listToolsCursor: Self.listToolsCursor(in: data, method: operationKey),
                     isNotification: isNotification,
                     isDiscovery: isDiscovery
                 )
@@ -759,6 +804,8 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
     private func performPerRequestMetadataPOST(
         _ request: URLRequest,
         requestID: ID?,
+        requestMethod: String?,
+        listToolsCursor: String?,
         isNotification: Bool,
         isDiscovery: Bool
     ) async throws {
@@ -784,6 +831,8 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
                     response,
                     body: responseStream.body,
                     requestID: requestID,
+                    requestMethod: requestMethod,
+                    listToolsCursor: listToolsCursor,
                     isNotification: isNotification,
                     isDiscovery: isDiscovery
                 )
@@ -801,6 +850,8 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
         _ response: HTTPURLResponse,
         body: AsyncThrowingStream<Data, Swift.Error>,
         requestID: ID?,
+        requestMethod: String?,
+        listToolsCursor: String?,
         isNotification: Bool,
         isDiscovery: Bool
     ) async throws {
@@ -839,10 +890,10 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
         }
 
         if hasContentType(contentType, ContentType.json) {
-            let data = try await collect(body)
+            let receivedData = try await collect(body)
             if isDiscovery,
                 let remoteError = decodedResponseError(
-                    from: data,
+                    from: receivedData,
                     requestID: requestID
                 )
             {
@@ -851,12 +902,22 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
                     error: remoteError
                 )
             }
+            let data = prepareIncomingResponse(
+                receivedData,
+                requestMethod: requestMethod,
+                listToolsCursor: listToolsCursor
+            )
             try validatePerRequestResponse(data, requestID: requestID)
             messageContinuation.yield(data)
             return
         }
         if hasContentType(contentType, ContentType.sse) {
-            try await processRequestScopedSSE(body, requestID: requestID)
+            try await processRequestScopedSSE(
+                body,
+                requestID: requestID,
+                requestMethod: requestMethod,
+                listToolsCursor: listToolsCursor
+            )
             return
         }
         throw MCPError.internalError(
@@ -865,18 +926,30 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
 
     private func processRequestScopedSSE(
         _ body: AsyncThrowingStream<Data, Swift.Error>,
-        requestID: ID?
+        requestID: ID?,
+        requestMethod: String?,
+        listToolsCursor: String?
     ) async throws {
         var parser = RequestScopedSSEParser()
         for try await chunk in body {
             for message in try parser.append(chunk) {
-                if try processRequestScopedMessage(message, requestID: requestID) {
+                if try processRequestScopedMessage(
+                    message,
+                    requestID: requestID,
+                    requestMethod: requestMethod,
+                    listToolsCursor: listToolsCursor
+                ) {
                     return
                 }
             }
         }
         for message in try parser.finish() {
-            if try processRequestScopedMessage(message, requestID: requestID) {
+            if try processRequestScopedMessage(
+                message,
+                requestID: requestID,
+                requestMethod: requestMethod,
+                listToolsCursor: listToolsCursor
+            ) {
                 return
             }
         }
@@ -884,25 +957,68 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
             "Request-scoped SSE stream ended before its JSON-RPC response")
     }
 
-    private func processRequestScopedMessage(_ data: Data, requestID: ID?) throws -> Bool {
-        if let response = try? JSONDecoder().decode(AnyResponse.self, from: data) {
+    private func processRequestScopedMessage(
+        _ receivedData: Data,
+        requestID: ID?,
+        requestMethod: String?,
+        listToolsCursor: String?
+    ) throws -> Bool {
+        if let response = try? JSONDecoder().decode(AnyResponse.self, from: receivedData) {
             guard let requestID, response.id == requestID else {
                 throw MCPError.invalidRequest(
                     "Request-scoped SSE response ID does not match its HTTP request")
             }
+            let data = prepareIncomingResponse(
+                receivedData,
+                requestMethod: requestMethod,
+                listToolsCursor: listToolsCursor
+            )
             messageContinuation.yield(data)
             return true
         }
-        if (try? JSONDecoder().decode(AnyRequest.self, from: data)) != nil {
+        if (try? JSONDecoder().decode(AnyRequest.self, from: receivedData)) != nil {
             throw MCPError.invalidRequest(
                 "Request-scoped SSE streams must not contain server requests")
         }
-        guard (try? JSONDecoder().decode(AnyMessage.self, from: data)) != nil else {
+        guard (try? JSONDecoder().decode(AnyMessage.self, from: receivedData)) != nil else {
             throw MCPError.invalidRequest(
                 "Request-scoped SSE stream contains an invalid JSON-RPC message")
         }
-        messageContinuation.yield(data)
+        messageContinuation.yield(receivedData)
         return false
+    }
+
+    private func prepareIncomingResponse(
+        _ data: Data,
+        requestMethod: String?,
+        listToolsCursor: String?
+    ) -> Data {
+        guard requestMethod == ListTools.name,
+            case .object(var envelope) = try? JSONDecoder().decode(Value.self, from: data),
+            case .object(var result)? = envelope["result"],
+            let toolsValue = result["tools"],
+            let tools = try? JSONDecoder().decode(
+                [Tool].self,
+                from: JSONEncoder().encode(toolsValue)
+            )
+        else {
+            return data
+        }
+
+        let accepted = updateToolHeaderSchemas(tools, replacing: listToolsCursor == nil)
+        guard let filteredTools = try? Value(accepted) else { return data }
+        result["tools"] = filteredTools
+        envelope["result"] = .object(result)
+        return (try? JSONEncoder().encode(Value.object(envelope))) ?? data
+    }
+
+    private static func listToolsCursor(in data: Data, method: String?) -> String? {
+        guard method == ListTools.name,
+            let value = try? JSONDecoder().decode(Value.self, from: data)
+        else {
+            return nil
+        }
+        return value.objectValue?["params"]?.objectValue?["cursor"]?.stringValue
     }
 
     private func validatePerRequestResponse(_ data: Data, requestID: ID?) throws {
