@@ -138,20 +138,26 @@ public actor Client {
         /// Multi-round-trip behavior for per-request metadata responses.
         public var multiRoundTripMode: MultiRoundTripMode
 
+        /// Maximum number of subscription events buffered for a slow consumer.
+        public var subscriptionBufferCapacity: Int
+
         public init(
             strict: Bool = false,
             protocolMode: ProtocolMode = .initializationOnly,
             discoveryProbeTimeout: Double = 15,
-            multiRoundTripMode: MultiRoundTripMode = .automatic(maxRounds: 8)
+            multiRoundTripMode: MultiRoundTripMode = .automatic(maxRounds: 8),
+            subscriptionBufferCapacity: Int = 32
         ) {
             self.strict = strict
             self.protocolMode = protocolMode
             self.discoveryProbeTimeout = discoveryProbeTimeout
             self.multiRoundTripMode = multiRoundTripMode
+            self.subscriptionBufferCapacity = subscriptionBufferCapacity
         }
 
         private enum CodingKeys: String, CodingKey {
             case strict, protocolMode, discoveryProbeTimeout, multiRoundTripMode
+            case subscriptionBufferCapacity
         }
 
         public init(from decoder: Decoder) throws {
@@ -167,6 +173,16 @@ public actor Client {
                 try container.decodeIfPresent(
                     MultiRoundTripMode.self, forKey: .multiRoundTripMode)
                 ?? .disabled
+            subscriptionBufferCapacity =
+                try container.decodeIfPresent(Int.self, forKey: .subscriptionBufferCapacity)
+                ?? 32
+            guard subscriptionBufferCapacity > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .subscriptionBufferCapacity,
+                    in: container,
+                    debugDescription: "Subscription buffer capacity must be positive"
+                )
+            }
         }
     }
 
@@ -671,7 +687,7 @@ public actor Client {
         }
 
         if connectionInfo.protocolLifecycle == .perRequestMetadata {
-            reestablishSubscriptions()
+            await reestablishSubscriptions()
         } else if !subscriptions.isEmpty {
             failSubscriptions(
                 MCPError.invalidRequest(
@@ -698,10 +714,10 @@ public actor Client {
             subscription.attemptTask = nil
             subscription.attemptGeneration = nil
             subscription.isAwaitingAcknowledgment = true
-            if subscription.hasBeenAcknowledged {
-                subscription.eventsContinuation.yield(.disconnected)
-            }
             subscriptions[id] = subscription
+            if subscription.hasBeenAcknowledged {
+                _ = await yieldSubscriptionEvent(.disconnected, to: id)
+            }
         }
 
         self.task = nil
@@ -814,6 +830,9 @@ public actor Client {
             throw MCPError.invalidRequest(
                 "subscriptions/listen requires the per-request-metadata lifecycle")
         }
+        guard configuration.subscriptionBufferCapacity > 0 else {
+            throw MCPError.invalidParams("Subscription buffer capacity must be positive")
+        }
 
         var id = ID.random
         while subscriptions[id] != nil || logicalRequestCancellations[id] != nil {
@@ -822,7 +841,17 @@ public actor Client {
         let subscriptionID = id
 
         let (events, eventsContinuation) =
-            AsyncThrowingStream<SubscriptionEvent, Swift.Error>.makeStream()
+            AsyncThrowingStream<SubscriptionEvent, Swift.Error>.makeStream(
+                bufferingPolicy: .bufferingOldest(configuration.subscriptionBufferCapacity)
+            )
+        eventsContinuation.onTermination = { @Sendable [weak self] _ in
+            Task {
+                try? await self?.cancelSubscription(
+                    subscriptionID,
+                    reason: "Listener terminated"
+                )
+            }
+        }
         let acknowledged = try await withTaskCancellationHandler {
             try await self.beginSubscription(
                 subscriptionID,
@@ -2229,13 +2258,13 @@ public actor Client {
         }
     }
 
-    private func reestablishSubscriptions() {
+    private func reestablishSubscriptions() async {
         for id in Array(subscriptions.keys) {
             do {
                 try startSubscriptionAttempt(id)
             } catch {
                 if subscriptions[id]?.hasBeenAcknowledged == true {
-                    subscriptions[id]?.eventsContinuation.yield(.disconnected)
+                    _ = await yieldSubscriptionEvent(.disconnected, to: id)
                 } else {
                     failSubscription(id, error: error)
                 }
@@ -2314,12 +2343,14 @@ public actor Client {
 
             let accepted = typedMessage.params.notifications
             let continuation = subscription.acknowledgmentContinuation
-            subscription.acknowledgmentContinuation = nil
             subscription.acknowledged = accepted
             subscription.isAwaitingAcknowledgment = false
             subscription.hasBeenAcknowledged = true
-            subscription.eventsContinuation.yield(.acknowledged(accepted))
             subscriptions[subscriptionID] = subscription
+            guard await yieldSubscriptionEvent(.acknowledged(accepted), to: subscriptionID) else {
+                return false
+            }
+            subscriptions[subscriptionID]?.acknowledgmentContinuation = nil
             continuation?.resume(returning: accepted)
             return true
         }
@@ -2346,12 +2377,14 @@ public actor Client {
             )
             return false
         }
-        subscription.eventsContinuation.yield(.notification(.init(
-            subscriptionID: subscriptionID,
-            method: message.method,
-            parameters: message.params
-        )))
-        return true
+        return await yieldSubscriptionEvent(
+            .notification(.init(
+                subscriptionID: subscriptionID,
+                method: message.method,
+                parameters: message.params
+            )),
+            to: subscriptionID
+        )
     }
 
     private func subscriptionCompleted(
@@ -2379,7 +2412,7 @@ public actor Client {
         subscription.eventsContinuation.finish()
     }
 
-    private func subscriptionFailed(_ id: ID, generation: Int, error: Swift.Error) {
+    private func subscriptionFailed(_ id: ID, generation: Int, error: Swift.Error) async {
         guard var subscription = subscriptions[id],
             subscription.attemptGeneration == generation
         else {
@@ -2392,7 +2425,7 @@ public actor Client {
 
         guard generation == connectionGeneration, connection != nil else { return }
         if subscription.hasBeenAcknowledged, Self.isSubscriptionDisconnection(error) {
-            subscription.eventsContinuation.yield(.disconnected)
+            await yieldSubscriptionEvent(.disconnected, to: id)
         } else {
             failSubscription(id, error: error)
         }
@@ -2414,6 +2447,33 @@ public actor Client {
         failSubscription(id, error: error)
         if shouldCancel {
             try? await cancelRequest(id, reason: "Invalid subscription stream")
+        }
+    }
+
+    @discardableResult
+    private func yieldSubscriptionEvent(
+        _ event: SubscriptionEvent,
+        to id: ID
+    ) async -> Bool {
+        guard let continuation = subscriptions[id]?.eventsContinuation else { return false }
+        switch continuation.yield(event) {
+        case .enqueued:
+            return true
+        case .dropped:
+            await failSubscriptionAndCancel(
+                id,
+                error: MCPError.internalError("Subscription event buffer is full")
+            )
+            return false
+        case .terminated:
+            try? await cancelSubscription(id, reason: "Listener terminated")
+            return false
+        @unknown default:
+            await failSubscriptionAndCancel(
+                id,
+                error: MCPError.internalError("Subscription event could not be delivered")
+            )
+            return false
         }
     }
 
