@@ -40,16 +40,22 @@ public actor Client {
         /// The protocol lifecycle selection policy.
         public var protocolMode: ProtocolMode
 
+        /// Maximum time to wait for a stdio-style discovery probe, in seconds.
+        /// Set to `0` to wait without an SDK-imposed limit.
+        public var discoveryProbeTimeout: Double
+
         public init(
             strict: Bool = false,
-            protocolMode: ProtocolMode = .initializationOnly
+            protocolMode: ProtocolMode = .initializationOnly,
+            discoveryProbeTimeout: Double = 2
         ) {
             self.strict = strict
             self.protocolMode = protocolMode
+            self.discoveryProbeTimeout = discoveryProbeTimeout
         }
 
         private enum CodingKeys: String, CodingKey {
-            case strict, protocolMode
+            case strict, protocolMode, discoveryProbeTimeout
         }
 
         public init(from decoder: Decoder) throws {
@@ -58,6 +64,9 @@ public actor Client {
             protocolMode =
                 try container.decodeIfPresent(ProtocolMode.self, forKey: .protocolMode)
                 ?? .initializationOnly
+            discoveryProbeTimeout =
+                try container.decodeIfPresent(Double.self, forKey: .discoveryProbeTimeout)
+                ?? 2
         }
     }
 
@@ -347,6 +356,8 @@ public actor Client {
     private var selectedProtocolLifecycle: ProtocolLifecycle?
     /// The protocol version selected for the active connection.
     private var selectedProtocolVersion: String?
+    /// Whether the initialization-based ready notification has been sent.
+    private var initializationNotificationSent = false
 
     /// A dictionary of type-erased notification handlers, keyed by method name
     private var notificationHandlers: [String: [NotificationHandlerBox]] = [:]
@@ -390,6 +401,7 @@ public actor Client {
         self.connection = transport
         selectedProtocolLifecycle = nil
         selectedProtocolVersion = nil
+        initializationNotificationSent = false
         try await self.connection?.connect()
 
         await logger?.debug(
@@ -471,6 +483,7 @@ public actor Client {
                 return try await discoverConnection()
             } catch {
                 guard !isRecognizedPerRequestMetadataError(error) else { throw error }
+                guard shouldFallbackToInitialization(after: error) else { throw error }
                 return try await initializeConnection()
             }
         case .perRequestMetadataOnly:
@@ -853,6 +866,7 @@ public actor Client {
     private func initializeConnection() async throws -> ConnectionInfo {
         selectedProtocolLifecycle = .initializationBased
         selectedProtocolVersion = Version.latestInitializationVersion
+        initializationNotificationSent = false
         let result = try await _initialize()
         await updateTransportLifecycle(
             .initializationBased, protocolVersion: result.protocolVersion)
@@ -865,36 +879,30 @@ public actor Client {
         )
     }
 
-    private func discoverConnection() async throws -> ConnectionInfo {
+    private struct DiscoveryProbeTimeout: Swift.Error {}
+
+    private func discoverConnection(
+        requestedVersion: String = Version.perRequestMetadataVersion,
+        mayRetryVersion: Bool = true
+    ) async throws -> ConnectionInfo {
         selectedProtocolLifecycle = .perRequestMetadata
-        selectedProtocolVersion = Version.perRequestMetadataVersion
+        selectedProtocolVersion = requestedVersion
 
         let request = Discover.request(.init())
         let context = try send(request)
         let result: Discover.Result
         do {
-            result = try await withThrowingTaskGroup(of: Discover.Result.self) { group in
-                group.addTask { try await context.value }
-                group.addTask {
-                    try await Task.sleep(for: .seconds(2))
-                    throw MCPError.internalError("Server discovery timed out")
-                }
-
-                do {
-                    guard let first = try await group.next() else {
-                        throw MCPError.internalError("Server discovery did not complete")
-                    }
-                    group.cancelAll()
-                    return first
-                } catch {
-                    if let pending = self.removePendingRequest(id: context.requestID) {
-                        pending.resume(throwing: error)
-                    }
-                    group.cancelAll()
-                    throw error
-                }
-            }
+            result = try await awaitDiscovery(context)
         } catch {
+            if mayRetryVersion,
+                let retryVersion = mutuallySupportedVersion(from: error),
+                retryVersion != requestedVersion
+            {
+                return try await discoverConnection(
+                    requestedVersion: retryVersion,
+                    mayRetryVersion: false
+                )
+            }
             selectedProtocolLifecycle = nil
             selectedProtocolVersion = nil
             throw error
@@ -913,7 +921,7 @@ public actor Client {
                 message: "Server does not advertise a mutually supported per-request metadata version",
                 data: try? Value(UnsupportedProtocolVersionData(
                     supported: result.supportedVersions,
-                    requested: Version.perRequestMetadataVersion
+                    requested: requestedVersion
                 ))
             )
         }
@@ -931,6 +939,45 @@ public actor Client {
             serverInfo: result.serverInfo,
             instructions: result.instructions
         )
+    }
+
+    private func awaitDiscovery(_ context: RequestContext<Discover.Result>) async throws
+        -> Discover.Result
+    {
+        guard !(connection is any HTTPProtocolNegotiationTransport),
+            configuration.discoveryProbeTimeout.isFinite,
+            configuration.discoveryProbeTimeout > 0
+        else {
+            return try await context.value
+        }
+        let timeout = configuration.discoveryProbeTimeout
+
+        return try await withThrowingTaskGroup(of: Discover.Result.self) { group in
+            group.addTask { try await context.value }
+            group.addTask {
+                try await Task.sleep(for: .seconds(timeout))
+                throw DiscoveryProbeTimeout()
+            }
+
+            do {
+                guard let first = try await group.next() else {
+                    throw MCPError.internalError("Server discovery did not complete")
+                }
+                group.cancelAll()
+                return first
+            } catch is DiscoveryProbeTimeout {
+                try? await cancelRequest(
+                    context.requestID,
+                    reason: "Server discovery timed out"
+                )
+                group.cancelAll()
+                throw MCPError.internalError("Server discovery timed out")
+            } catch is CancellationError {
+                try? await cancelRequest(context.requestID, reason: "Server discovery cancelled")
+                group.cancelAll()
+                throw CancellationError()
+            }
+        }
     }
 
     private func updateTransportLifecycle(
@@ -951,6 +998,27 @@ public actor Client {
         return code == ProtocolErrorCode.headerMismatch
             || code == ProtocolErrorCode.missingRequiredClientCapability
             || code == ProtocolErrorCode.unsupportedProtocolVersion
+    }
+
+    private func shouldFallbackToInitialization(after _: Swift.Error) -> Bool {
+        !(connection is any HTTPProtocolNegotiationTransport)
+    }
+
+    private func mutuallySupportedVersion(from error: Swift.Error) -> String? {
+        guard let mcpError = error as? MCPError,
+            case .remote(let code, _, let value) = mcpError,
+            code == ProtocolErrorCode.unsupportedProtocolVersion,
+            let value,
+            let data = try? JSONEncoder().encode(value),
+            let details = try? JSONDecoder().decode(
+                UnsupportedProtocolVersionData.self, from: data)
+        else {
+            return nil
+        }
+        return Version.preferenceOrder.first {
+            Version.perRequestMetadataSupported.contains($0)
+                && details.supported.contains($0)
+        }
     }
 
     private func encodeRequest<M: Method>(_ request: Request<M>) throws -> Data {
@@ -989,7 +1057,13 @@ public actor Client {
             await httpTransport.updateNegotiatedProtocolVersion(result.protocolVersion)
         }
 
-        try await notify(InitializedNotification.message())
+        initializationNotificationSent = true
+        do {
+            try await notify(InitializedNotification.message())
+        } catch {
+            initializationNotificationSent = false
+            throw error
+        }
 
         return result
     }
@@ -1344,6 +1418,20 @@ public actor Client {
         await logger?.trace(
             "Processing incoming request from server",
             metadata: ["method": "\(request.method)", "id": "\(request.id)"])
+
+        if configuration.strict,
+            selectedProtocolLifecycle == .initializationBased,
+            !initializationNotificationSent,
+            request.method != Ping.name
+        {
+            let response = AnyMethod.response(
+                id: request.id,
+                error: MCPError.invalidRequest(
+                    "Server request arrived before notifications/initialized")
+            )
+            try? await send(response)
+            return
+        }
 
         guard let handler = methodHandlers[request.method] else {
             await logger?.warning(

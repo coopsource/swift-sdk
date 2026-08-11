@@ -26,3 +26,6 @@ public protocol Transport: Actor {
 package protocol ProtocolLifecycleUpdating: Transport {
     func updateProtocolLifecycle(_ lifecycle: ProtocolLifecycle, protocolVersion: String) async
 }
+
+/// Identifies transports whose lifecycle fallback is determined by HTTP responses.
+package protocol HTTPProtocolNegotiationTransport: Transport {}

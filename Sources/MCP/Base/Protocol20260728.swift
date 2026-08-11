@@ -179,16 +179,16 @@ enum PerRequestMetadataWire {
         guard let parameters = request.params.objectValue,
             let metadata = parameters["_meta"]?.objectValue
         else {
-            throw MCPError.invalidRequest(
+            throw MCPError.invalidParams(
                 "Per-request metadata requires an object-valued params._meta field")
         }
         guard let protocolVersion = metadata[ProtocolMetadataKey.protocolVersion]?.stringValue
         else {
-            throw MCPError.invalidRequest(
+            throw MCPError.invalidParams(
                 "Per-request metadata is missing io.modelcontextprotocol/protocolVersion")
         }
         guard let capabilitiesValue = metadata[ProtocolMetadataKey.clientCapabilities] else {
-            throw MCPError.invalidRequest(
+            throw MCPError.invalidParams(
                 "Per-request metadata is missing io.modelcontextprotocol/clientCapabilities")
         }
 
@@ -205,7 +205,7 @@ enum PerRequestMetadataWire {
                 clientInfo = nil
             }
         } catch {
-            throw MCPError.invalidRequest("Per-request client metadata is malformed")
+            throw MCPError.invalidParams("Per-request client metadata is malformed")
         }
 
         return PerRequestProtocolMetadata(

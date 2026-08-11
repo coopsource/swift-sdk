@@ -13,6 +13,28 @@ private enum ContextProbe: MCP.Method {
     }
 }
 
+private enum CancellationProbeMethod: MCP.Method {
+    static let name = "test/cancellation"
+    typealias Result = Empty
+}
+
+private enum ClientRequestProbeMethod: MCP.Method {
+    static let name = "test/client-request"
+    typealias Result = Empty
+}
+
+private actor NegotiationEventProbe {
+    private(set) var initializedNotifications = 0
+    private(set) var requestStarted = false
+    private(set) var requestCancelled = false
+    private(set) var clientRequestHandled = false
+
+    func recordInitialized() { initializedNotifications += 1 }
+    func recordStart() { requestStarted = true }
+    func recordCancellation() { requestCancelled = true }
+    func recordClientRequest() { clientRequestHandled = true }
+}
+
 @Suite("MCP 2026-07-28 protocol negotiation", .timeLimit(.minutes(1)))
 struct ProtocolNegotiationTests {
     @Test("Per-request metadata client discovers a per-request server")
@@ -104,6 +126,47 @@ struct ProtocolNegotiationTests {
         await server.stop()
     }
 
+    @Test("Strict client accepts a request after its initialized notification is visible")
+    func clientInitializationNotificationOrdering() async throws {
+        let transport = MockTransport()
+        let probe = NegotiationEventProbe()
+        await transport.setSendObserver { data in
+            let decoder = JSONDecoder()
+            if let request = try? decoder.decode(AnyRequest.self, from: data),
+                request.method == Initialize.name
+            {
+                try? await transport.queue(
+                    response: Initialize.response(
+                        id: request.id,
+                        result: .init(
+                            protocolVersion: Version.latestInitializationVersion,
+                            capabilities: .init(),
+                            serverInfo: .init(name: "Server", version: "1.0")
+                        )
+                    )
+                )
+            } else if let message = try? decoder.decode(AnyMessage.self, from: data),
+                message.method == InitializedNotification.name
+            {
+                try? await transport.queue(request: ClientRequestProbeMethod.request())
+            }
+        }
+        let client = Client(
+            name: "StrictClient",
+            version: "1.0",
+            configuration: .strict
+        )
+        await client.withMethodHandler(ClientRequestProbeMethod.self) { _ in
+            await probe.recordClientRequest()
+            return Empty()
+        }
+
+        _ = try await client.connectWithInfo(transport: transport)
+        try await waitUntil { await probe.clientRequestHandled }
+
+        await client.disconnect()
+    }
+
     @Test("Recognized per-request errors do not trigger initialization fallback")
     func recognizedErrorDoesNotFallback() async throws {
         let transport = MockTransport()
@@ -146,6 +209,82 @@ struct ProtocolNegotiationTests {
         await client.disconnect()
     }
 
+    @Test("A timed-out discovery probe is cancelled before initialization fallback")
+    func timeoutCancellationPrecedesFallback() async throws {
+        let transport = MockTransport()
+        let client = Client(
+            name: "AutomaticClient",
+            version: "1.0",
+            configuration: .init(
+                protocolMode: .automatic,
+                discoveryProbeTimeout: 0.01
+            )
+        )
+        let connectionTask = Task {
+            try await client.connectWithInfo(transport: transport)
+        }
+
+        try await waitUntil { await transport.sentData.count >= 3 }
+        let sent = await transport.sentData
+        let discover = try JSONDecoder().decode(AnyRequest.self, from: sent[0])
+        let cancellation = try JSONDecoder().decode(AnyMessage.self, from: sent[1])
+        let initialize = try JSONDecoder().decode(AnyRequest.self, from: sent[2])
+        let discoverID = try Value(discover.id)
+
+        #expect(discover.method == Discover.name)
+        #expect(cancellation.method == CancelledNotification.name)
+        #expect(
+            cancellation.params.objectValue?["requestId"]
+                == discoverID
+        )
+        #expect(initialize.method == Initialize.name)
+
+        try await transport.queue(
+            response: Initialize.response(
+                id: initialize.id,
+                result: .init(
+                    protocolVersion: Version.latestInitializationVersion,
+                    capabilities: .init(),
+                    serverInfo: .init(name: "LegacyServer", version: "1.0")
+                )
+            )
+        )
+        let connection = try await connectionTask.value
+        #expect(connection.protocolLifecycle == .initializationBased)
+        await client.disconnect()
+    }
+
+    @Test("Per-request-only timeout cancels discovery without initialization")
+    func perRequestTimeoutDoesNotFallback() async throws {
+        let transport = MockTransport()
+        let client = Client(
+            name: "PerRequestClient",
+            version: "1.0",
+            configuration: .init(
+                protocolMode: .perRequestMetadataOnly,
+                discoveryProbeTimeout: 0.01
+            )
+        )
+        let connectionTask = Task {
+            try await client.connectWithInfo(transport: transport)
+        }
+
+        do {
+            _ = try await connectionTask.value
+            Issue.record("Expected discovery to time out")
+        } catch {
+            #expect(error is MCPError)
+        }
+        let sent = await transport.sentData
+        #expect(sent.count == 2)
+        #expect(try JSONDecoder().decode(AnyRequest.self, from: sent[0]).method == Discover.name)
+        #expect(
+            try JSONDecoder().decode(AnyMessage.self, from: sent[1]).method
+                == CancelledNotification.name
+        )
+        await client.disconnect()
+    }
+
     @Test("Per-request success responses include result type and server identity")
     func perRequestResponseFields() async throws {
         let transport = MockTransport()
@@ -167,6 +306,46 @@ struct ProtocolNegotiationTests {
                 .objectValue?["name"] == .string("ResponseServer")
         )
         await server.stop()
+    }
+
+    @Test("Per-request client rejects a success response without result type")
+    func missingResultType() async throws {
+        let transport = MockTransport()
+        let client = Client(
+            name: "PerRequestClient",
+            version: "1.0",
+            configuration: .init(protocolMode: .perRequestMetadataOnly)
+        )
+        let connectionTask = Task {
+            try await client.connectWithInfo(transport: transport)
+        }
+        try await waitUntil { await !transport.sentData.isEmpty }
+        let decodedRequest: AnyRequest? = await transport.decodeLastSentMessage()
+        let request = try #require(decodedRequest)
+        let response: Value = [
+            "jsonrpc": "2.0",
+            "id": try Value(request.id),
+            "result": [
+                "supportedVersions": [.string(Version.perRequestMetadataVersion)],
+                "capabilities": .object([:]),
+                "ttlMs": 0,
+                "cacheScope": "public",
+            ],
+        ]
+        await transport.queue(data: try JSONEncoder().encode(response))
+
+        do {
+            _ = try await connectionTask.value
+            Issue.record("Expected the response to be rejected")
+        } catch let error as MCPError {
+            guard case .internalError(let message) = error else {
+                Issue.record("Expected a result-type validation error")
+                await client.disconnect()
+                return
+            }
+            #expect(message?.contains("resultType") == true)
+        }
+        await client.disconnect()
     }
 
     @Test("Server rejects malformed per-request metadata")
@@ -194,8 +373,8 @@ struct ProtocolNegotiationTests {
         try await Task.sleep(for: .milliseconds(20))
 
         let response: AnyResponse? = await transport.decodeLastSentMessage()
-        guard case .failure(.invalidRequest(let message)) = response?.result else {
-            Issue.record("Expected an invalid-request response")
+        guard case .failure(.invalidParams(let message)) = response?.result else {
+            Issue.record("Expected an invalid-params response")
             await server.stop()
             return
         }
@@ -281,6 +460,120 @@ struct ProtocolNegotiationTests {
         await server.stop()
     }
 
+    @Test("Strict combined lifecycle enforces initialized notification ordering")
+    func combinedLifecycleInitializationOrdering() async throws {
+        let transport = MockTransport()
+        let probe = NegotiationEventProbe()
+        let server = Server(
+            name: "CombinedServer",
+            version: "1.0",
+            configuration: .init(
+                strict: true,
+                protocolMode: .initializationAndPerRequestMetadata
+            )
+        )
+        await server.onNotification(InitializedNotification.self) { _ in
+            await probe.recordInitialized()
+        }
+        try await server.start(transport: transport)
+
+        try await transport.queue(notification: InitializedNotification.message())
+        try await waitUntil { await !transport.sentData.isEmpty }
+        #expect(await probe.initializedNotifications == 0)
+        await transport.clearMessages()
+
+        let initializeRequest = Initialize.request(
+            .init(
+                protocolVersion: Version.latestInitializationVersion,
+                capabilities: .init(),
+                clientInfo: .init(name: "Client", version: "1.0")
+            )
+        )
+        try await transport.queue(request: initializeRequest)
+        try await waitUntil {
+            await transport.sentData.contains { data in
+                (try? JSONDecoder().decode(AnyResponse.self, from: data).id)
+                    == initializeRequest.id
+            }
+        }
+        let initializeResponseData = try #require(
+            await transport.sentData.first { data in
+                (try? JSONDecoder().decode(AnyResponse.self, from: data).id)
+                    == initializeRequest.id
+            })
+        let initializeResponse = try JSONDecoder().decode(
+            AnyResponse.self, from: initializeResponseData)
+        guard case .success = initializeResponse.result else {
+            Issue.record("Expected initialize to succeed")
+            await server.stop()
+            return
+        }
+        try await transport.queue(notification: InitializedNotification.message())
+        try await waitUntil { await probe.initializedNotifications == 1 }
+
+        await server.stop()
+    }
+
+    @Test("Strict combined lifecycle accepts cancellation for an active per-request call")
+    func combinedLifecycleRelatedCancellation() async throws {
+        let transport = MockTransport()
+        let probe = NegotiationEventProbe()
+        let server = Server(
+            name: "CombinedServer",
+            version: "1.0",
+            configuration: .init(
+                strict: true,
+                protocolMode: .initializationAndPerRequestMetadata
+            )
+        )
+        await server.withMethodHandler(CancellationProbeMethod.self) { _ in
+            await probe.recordStart()
+            do {
+                try await Task.sleep(for: .seconds(10))
+                return Empty()
+            } catch {
+                await probe.recordCancellation()
+                throw error
+            }
+        }
+        try await server.start(transport: transport)
+
+        await transport.queue(data: try JSONEncoder().encode(
+            validRequest(id: 91, method: CancellationProbeMethod.name)))
+        try await waitUntil { await probe.requestStarted }
+        try await transport.queue(
+            notification: CancelledNotification.message(
+                .init(requestId: .number(91), reason: "test cancellation")
+            )
+        )
+        try await waitUntil { await probe.requestCancelled }
+        try await Task.sleep(for: .milliseconds(10))
+        #expect(await transport.sentData.isEmpty)
+
+        await server.stop()
+    }
+
+    @Test("Per-request-only server rejects initialized notifications")
+    func perRequestOnlyRejectsInitialized() async throws {
+        let transport = MockTransport()
+        let probe = NegotiationEventProbe()
+        let server = Server(
+            name: "PerRequestServer",
+            version: "1.0",
+            configuration: .init(protocolMode: .perRequestMetadataOnly)
+        )
+        await server.onNotification(InitializedNotification.self) { _ in
+            await probe.recordInitialized()
+        }
+        try await server.start(transport: transport)
+
+        try await transport.queue(notification: InitializedNotification.message())
+        try await Task.sleep(for: .milliseconds(10))
+
+        #expect(await probe.initializedNotifications == 0)
+        await server.stop()
+    }
+
     @Test("Serialized configurations without a mode remain initialization-only")
     func configurationDecodingCompatibility() throws {
         let data = Data(#"{"strict":true}"#.utf8)
@@ -288,7 +581,26 @@ struct ProtocolNegotiationTests {
         let server = try JSONDecoder().decode(Server.Configuration.self, from: data)
 
         #expect(client.protocolMode == .initializationOnly)
+        #expect(client.discoveryProbeTimeout == 2)
         #expect(server.protocolMode == .initializationOnly)
+
+        let noTimeout = Client.Configuration(discoveryProbeTimeout: 0)
+        #expect(
+            try JSONDecoder().decode(
+                Client.Configuration.self,
+                from: JSONEncoder().encode(noTimeout)
+            ) == noTimeout
+        )
+    }
+
+    private func waitUntil(
+        _ condition: @escaping @Sendable () async -> Bool
+    ) async throws {
+        for _ in 0..<1_000 {
+            if await condition() { return }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        Issue.record("Timed out waiting for test condition")
     }
 
     private func validRequest(id: Int, method: String) -> Value {
