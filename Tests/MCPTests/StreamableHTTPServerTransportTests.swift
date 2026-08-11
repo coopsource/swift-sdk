@@ -113,6 +113,16 @@ private func makePerRequestHTTPPost(
     return HTTPRequest(method: "POST", headers: headers, body: body, path: "/mcp")
 }
 
+private func makeSubscriptionBody(id: ID, filter: SubscriptionFilter) throws -> Data {
+    try PerRequestMetadataWire.encodeRequest(
+        SubscriptionsListen.request(id: id, .init(notifications: filter)),
+        protocolVersion: Version.perRequestMetadataVersion,
+        clientInfo: .init(name: "HTTP test client", version: "1.0"),
+        clientCapabilities: .init(),
+        using: JSONEncoder()
+    )
+}
+
 private func decodeResponseObject(_ response: HTTPResponse) throws -> [String: Value] {
     let data = try #require(response.bodyData)
     return try #require(JSONDecoder().decode(Value.self, from: data).objectValue)
@@ -776,6 +786,65 @@ struct StreamableHTTPServerTransportTests {
         #expect(String(decoding: chunks[0], as: UTF8.self).contains("id:") == false)
 
         await server.stop()
+    }
+
+    @Test("Subscription stream preserves the client id and closes gracefully")
+    func subscriptionStream() async throws {
+        let transport = StreamableHTTPServerTransport(
+            validationPipeline: StandardValidationPipeline(validators: [])
+        )
+        let server = Server(
+            name: "HTTP server",
+            version: "1.0",
+            capabilities: .init(tools: .init(listChanged: true)),
+            configuration: .init(protocolMode: .perRequestMetadataOnly)
+        )
+        try await server.start(transport: transport)
+
+        let requestID = ID.string("listen-http")
+        let body = try makeSubscriptionBody(
+            id: requestID,
+            filter: .init(toolsListChanged: true)
+        )
+        let response = await transport.handleRequest(makePerRequestHTTPPost(body: body))
+        guard case .stream(let stream, let headers) = response else {
+            Issue.record("Expected a subscription SSE response")
+            await server.stop()
+            return
+        }
+        var iterator = stream.makeAsyncIterator()
+
+        let acknowledgment = try decodeSSEObject(try #require(await iterator.next()))
+        #expect(headers[HTTPHeaderName.contentType] == ContentType.sse)
+        #expect(
+            acknowledgment["method"]?.stringValue
+                == SubscriptionsAcknowledgedNotification.name
+        )
+        #expect(
+            acknowledgment["params"]?.objectValue?["_meta"]?
+                .objectValue?[ProtocolMetadataKey.subscriptionID]?.stringValue
+                == "listen-http"
+        )
+
+        try await server.notify(ToolListChangedNotification.message(.init()))
+        let notification = try decodeSSEObject(try #require(await iterator.next()))
+        #expect(notification["method"]?.stringValue == ToolListChangedNotification.name)
+        #expect(
+            notification["params"]?.objectValue?["_meta"]?
+                .objectValue?[ProtocolMetadataKey.subscriptionID]?.stringValue
+                == "listen-http"
+        )
+
+        let stopTask = Task { await server.stop() }
+        let completion = try decodeSSEObject(try #require(await iterator.next()))
+        #expect(completion["id"]?.stringValue == "listen-http")
+        #expect(
+            completion["result"]?.objectValue?["_meta"]?
+                .objectValue?[ProtocolMetadataKey.subscriptionID]?.stringValue
+                == "listen-http"
+        )
+        await stopTask.value
+        #expect(try await iterator.next() == nil)
     }
 
     @Test("Concurrent clients may reuse an id and complete out of order")

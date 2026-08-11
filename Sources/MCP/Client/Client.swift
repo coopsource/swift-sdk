@@ -16,6 +16,17 @@ private struct FulfilledEmbeddedInput: Sendable {
     let value: Value
 }
 
+private struct ActiveClientSubscription {
+    let requested: SubscriptionFilter
+    var acknowledged: SubscriptionFilter?
+    let eventsContinuation: AsyncThrowingStream<Client.SubscriptionEvent, Swift.Error>.Continuation
+    var acknowledgmentContinuation: CheckedContinuation<SubscriptionFilter, Swift.Error>?
+    var attemptTask: Task<Void, Never>?
+    var attemptGeneration: Int?
+    var isAwaitingAcknowledgment: Bool
+    var hasBeenAcknowledged: Bool
+}
+
 /// Model Context Protocol client
 public actor Client {
     /// Selects the protocol lifecycle used when connecting to a server.
@@ -451,6 +462,10 @@ public actor Client {
     private var cancelledLogicalRequests: Set<ID> = []
     /// Cancellation actions for active logical request tasks.
     private var logicalRequestCancellations: [ID: @Sendable () -> Void] = [:]
+    /// Subscription registrations survive a transport reconnect until explicitly cancelled.
+    private var subscriptions: [ID: ActiveClientSubscription] = [:]
+    /// Distinguishes completions from an earlier transport connection.
+    private var connectionGeneration = 0
 
     /// A dictionary of type-erased notification handlers, keyed by method name
     private var notificationHandlers: [String: [NotificationHandlerBox]] = [:]
@@ -502,6 +517,7 @@ public actor Client {
             lifecycleCacheKey = nil
             cachedProtocolLifecycle = nil
         }
+        connectionGeneration += 1
         self.connection = transport
         selectedProtocolLifecycle = nil
         selectedProtocolVersion = nil
@@ -643,6 +659,15 @@ public actor Client {
         if let lifecycleCacheKey {
             protocolLifecycleCache[lifecycleCacheKey] = connectionInfo.protocolLifecycle
         }
+
+        if connectionInfo.protocolLifecycle == .perRequestMetadata {
+            reestablishSubscriptions()
+        } else if !subscriptions.isEmpty {
+            failSubscriptions(
+                MCPError.invalidRequest(
+                    "subscriptions/listen requires the per-request-metadata lifecycle")
+            )
+        }
         return connectionInfo
     }
 
@@ -655,6 +680,19 @@ public actor Client {
         let connectionToDisconnect = self.connection
         let pendingRequestsToCancel = self.pendingRequests
         let logicalRequestsToCancel = self.logicalRequestCancellations.values
+        connectionGeneration += 1
+
+        for id in Array(subscriptions.keys) {
+            guard var subscription = subscriptions[id] else { continue }
+            subscription.attemptTask?.cancel()
+            subscription.attemptTask = nil
+            subscription.attemptGeneration = nil
+            subscription.isAwaitingAcknowledgment = true
+            if subscription.hasBeenAcknowledged {
+                subscription.eventsContinuation.yield(.disconnected)
+            }
+            subscriptions[id] = subscription
+        }
 
         self.task = nil
         self.connection = nil
@@ -740,9 +778,101 @@ public actor Client {
         guard let connection = connection else {
             throw MCPError.internalError("Client connection not initialized")
         }
+        if selectedProtocolLifecycle == .perRequestMetadata {
+            switch notification.method {
+            case InitializedNotification.name, RootsListChangedNotification.name:
+                throw MCPError.methodNotFound(
+                    "\(notification.method) is not part of protocol version \(Version.perRequestMetadataVersion)")
+            default:
+                break
+            }
+        }
 
         let notificationData = try encoder.encode(notification)
         try await connection.send(notificationData)
+    }
+
+    /// Opens a long-lived stream for selected server notifications.
+    ///
+    /// The returned stream remains registered across an explicit disconnect and is re-sent with
+    /// the same JSON-RPC ID after the client connects to another per-request-metadata transport.
+    /// Call ``cancelSubscription(_:reason:)`` to permanently remove the registration.
+    public func listen(
+        notifications: SubscriptionFilter
+    ) async throws -> Subscription {
+        guard selectedProtocolLifecycle == .perRequestMetadata else {
+            throw MCPError.invalidRequest(
+                "subscriptions/listen requires the per-request-metadata lifecycle")
+        }
+
+        var id = ID.random
+        while subscriptions[id] != nil || logicalRequestCancellations[id] != nil {
+            id = .random
+        }
+        let subscriptionID = id
+
+        let (events, eventsContinuation) =
+            AsyncThrowingStream<SubscriptionEvent, Swift.Error>.makeStream()
+        let acknowledged = try await withTaskCancellationHandler {
+            try await self.beginSubscription(
+                subscriptionID,
+                notifications: notifications,
+                eventsContinuation: eventsContinuation
+            )
+        } onCancel: {
+            Task {
+                try? await self.cancelSubscription(
+                    subscriptionID,
+                    reason: "Listener cancelled"
+                )
+            }
+        }
+
+        return Subscription(
+            id: subscriptionID,
+            requestedNotifications: notifications,
+            acknowledgedNotifications: acknowledged,
+            events: events
+        )
+    }
+
+    private func beginSubscription(
+        _ id: ID,
+        notifications: SubscriptionFilter,
+        eventsContinuation: AsyncThrowingStream<SubscriptionEvent, Swift.Error>.Continuation
+    ) async throws -> SubscriptionFilter {
+        try await withCheckedThrowingContinuation { continuation in
+            subscriptions[id] = ActiveClientSubscription(
+                requested: notifications,
+                acknowledged: nil,
+                eventsContinuation: eventsContinuation,
+                acknowledgmentContinuation: continuation,
+                attemptTask: nil,
+                attemptGeneration: nil,
+                isAwaitingAcknowledgment: true,
+                hasBeenAcknowledged: false
+            )
+            do {
+                try startSubscriptionAttempt(id)
+            } catch {
+                failSubscription(id, error: error)
+            }
+        }
+    }
+
+    /// Permanently cancels a subscription and finishes its event stream.
+    public func cancelSubscription(_ id: ID, reason: String? = nil) async throws {
+        guard let subscription = subscriptions.removeValue(forKey: id) else { return }
+        subscription.acknowledgmentContinuation?.resume(throwing: CancellationError())
+        subscription.eventsContinuation.finish()
+        subscription.attemptTask?.cancel()
+
+        guard connection != nil,
+            subscription.attemptGeneration == connectionGeneration
+        else {
+            return
+        }
+        try await cancelRequest(id, reason: reason)
     }
 
     /// Send a response back to the server for a server-to-client request
@@ -775,13 +905,42 @@ public actor Client {
     /// - Throws: MCPError if the client is not connected
     /// - SeeAlso: https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/cancellation
     public func send<M: Method>(_ request: Request<M>) throws -> RequestContext<M.Result> {
+        try send(request, logLevel: nil)
+    }
+
+    /// Sends a request with an optional request-scoped log level.
+    ///
+    /// The log level is carried in 2026-07-28 request metadata. Earlier lifecycle versions use
+    /// `logging/setLevel` and reject this overload when a level is supplied.
+    public func send<M: Method>(
+        _ request: Request<M>,
+        logLevel: LogLevel?
+    ) throws -> RequestContext<M.Result> {
         guard let connection = connection else {
             throw MCPError.internalError("Client connection not initialized")
+        }
+        if logLevel != nil, selectedProtocolLifecycle != .perRequestMetadata {
+            throw MCPError.invalidRequest(
+                "Request-scoped logging requires the per-request-metadata lifecycle")
+        }
+        if selectedProtocolLifecycle == .perRequestMetadata {
+            switch request.method {
+            case Initialize.name, Ping.name, SetLoggingLevel.name,
+                ResourceSubscribe.name, ResourceUnsubscribe.name:
+                throw MCPError.methodNotFound(
+                    "\(request.method) is not part of protocol version \(Version.perRequestMetadataVersion)")
+            default:
+                break
+            }
         }
 
         if selectedProtocolLifecycle == .perRequestMetadata {
             let requestTask = Task<M.Result, Error> {
-                try await self.performLogicalRequest(request, connection: connection)
+                try await self.performLogicalRequest(
+                    request,
+                    connection: connection,
+                    logLevel: logLevel
+                )
             }
             logicalRequestCancellations[request.id] = { @Sendable [requestTask] in
                 requestTask.cancel()
@@ -789,7 +948,7 @@ public actor Client {
             return RequestContext(requestID: request.id, requestTask: requestTask)
         }
 
-        let requestData = try encodeRequest(request)
+        let requestData = try encodeRequest(request, logLevel: nil)
 
         let requestTask = Task<M.Result, Error> {
             try await withCheckedThrowingContinuation { continuation in
@@ -892,11 +1051,12 @@ public actor Client {
 
     private func performLogicalRequest<M: Method>(
         _ request: Request<M>,
-        connection: any Transport
+        connection: any Transport,
+        logLevel: LogLevel?
     ) async throws -> M.Result {
         let logicalRequestID = request.id
         var attemptID = request.id
-        var attemptData = try encodeRequest(request)
+        var attemptData = try encodeRequest(request, logLevel: logLevel)
         var usedRequestIDs: Set<ID> = [attemptID]
         var round = 0
         var correctedToolHeaders = false
@@ -1022,7 +1182,8 @@ public actor Client {
                 request,
                 id: attemptID,
                 inputResponses: inputRequired.inputRequests == nil ? nil : inputResponses,
-                requestState: inputRequired.requestState
+                requestState: inputRequired.requestState,
+                logLevel: logLevel
             )
         }
     }
@@ -1179,7 +1340,8 @@ public actor Client {
         _ request: Request<M>,
         id: ID,
         inputResponses: [String: Value]?,
-        requestState: String?
+        requestState: String?,
+        logLevel: LogLevel?
     ) throws -> Data {
         guard case .object(var envelope) = try decoder.decode(
             Value.self, from: encoder.encode(request))
@@ -1206,7 +1368,8 @@ public actor Client {
             to: data,
             protocolVersion: selectedProtocolVersion,
             clientInfo: clientInfo,
-            clientCapabilities: capabilities,
+            clientCapabilities: perRequestMetadataCapabilities,
+            logLevel: logLevel,
             using: encoder
         )
     }
@@ -1364,7 +1527,7 @@ public actor Client {
                 to: encoded,
                 protocolVersion: selectedProtocolVersion,
                 clientInfo: clientInfo,
-                clientCapabilities: capabilities,
+                clientCapabilities: perRequestMetadataCapabilities,
                 using: encoder
             )
         } else {
@@ -1615,7 +1778,10 @@ public actor Client {
         }
     }
 
-    private func encodeRequest<M: Method>(_ request: Request<M>) throws -> Data {
+    private func encodeRequest<M: Method>(
+        _ request: Request<M>,
+        logLevel: LogLevel? = nil
+    ) throws -> Data {
         guard selectedProtocolLifecycle == .perRequestMetadata,
             let selectedProtocolVersion
         else {
@@ -1625,9 +1791,18 @@ public actor Client {
             request,
             protocolVersion: selectedProtocolVersion,
             clientInfo: clientInfo,
-            clientCapabilities: capabilities,
+            clientCapabilities: perRequestMetadataCapabilities,
+            logLevel: logLevel,
             using: encoder
         )
+    }
+
+    private var perRequestMetadataCapabilities: Capabilities {
+        var result = capabilities
+        if result.roots != nil {
+            result.roots = .init()
+        }
+        return result
     }
 
     /// Internal initialization implementation
@@ -1663,6 +1838,10 @@ public actor Client {
     }
 
     public func ping() async throws {
+        guard selectedProtocolLifecycle != .perRequestMetadata else {
+            throw MCPError.methodNotFound(
+                "ping is not part of protocol version \(Version.perRequestMetadataVersion)")
+        }
         let request = Ping.request()
         _ = try await sendAndAwait(request)
     }
@@ -1716,6 +1895,10 @@ public actor Client {
     }
 
     public func subscribeToResource(uri: String) async throws {
+        guard selectedProtocolLifecycle != .perRequestMetadata else {
+            throw MCPError.methodNotFound(
+                "Use subscriptions/listen for protocol version \(Version.perRequestMetadataVersion)")
+        }
         try validateServerCapability(\.resources?.subscribe, "Resource subscription")
         let request = ResourceSubscribe.request(.init(uri: uri))
         _ = try await sendAndAwait(request)
@@ -1878,6 +2061,10 @@ public actor Client {
     /// - Throws: MCPError if the client is not connected
     /// - SeeAlso: https://modelcontextprotocol.io/specification/2025-11-25/client/roots
     public func notifyRootsChanged() async throws {
+        guard selectedProtocolLifecycle != .perRequestMetadata else {
+            throw MCPError.methodNotFound(
+                "notifications/roots/list_changed is not part of protocol version \(Version.perRequestMetadataVersion)")
+        }
         let notification = RootsListChangedNotification.message()
         try await notify(notification)
     }
@@ -1894,6 +2081,10 @@ public actor Client {
     /// - Throws: MCPError if the client is not connected or if the server doesn't support logging
     /// - SeeAlso: https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/logging/
     public func setLoggingLevel(_ level: LogLevel) async throws {
+        guard selectedProtocolLifecycle != .perRequestMetadata else {
+            throw MCPError.methodNotFound(
+                "Use request-scoped log levels for protocol version \(Version.perRequestMetadataVersion)")
+        }
         try validateServerCapability(\.logging, "Logging")
         let request = SetLoggingLevel.request(.init(level: level))
         _ = try await sendAndAwait(request)
@@ -1999,11 +2190,16 @@ public actor Client {
             "Processing notification",
             metadata: ["method": "\(message.method)"])
 
+        // A received change notification invalidates connection-scoped state even when it
+        // cannot be delivered to a subscriber: a dropped, unfiltered, or unknown-subscription
+        // notification still reports that the server's list changed.
         if message.method == ToolListChangedNotification.name,
             let schemas = connection as? any ToolHeaderSchemaManaging
         {
             await schemas.clearToolHeaderSchemas()
         }
+
+        guard await processSubscriptionMessage(message) else { return }
 
         // Find notification handlers for this method
         guard let handlers = notificationHandlers[message.method] else { return }
@@ -2021,6 +2217,218 @@ public actor Client {
                     ])
             }
         }
+    }
+
+    private func reestablishSubscriptions() {
+        for id in Array(subscriptions.keys) {
+            do {
+                try startSubscriptionAttempt(id)
+            } catch {
+                if subscriptions[id]?.hasBeenAcknowledged == true {
+                    subscriptions[id]?.eventsContinuation.yield(.disconnected)
+                } else {
+                    failSubscription(id, error: error)
+                }
+            }
+        }
+    }
+
+    private func startSubscriptionAttempt(_ id: ID) throws {
+        guard connection != nil,
+            selectedProtocolLifecycle == .perRequestMetadata,
+            var subscription = subscriptions[id]
+        else {
+            throw MCPError.internalError("Client connection not initialized")
+        }
+        guard subscription.attemptTask == nil else { return }
+
+        let generation = connectionGeneration
+        subscription.attemptGeneration = generation
+        subscription.isAwaitingAcknowledgment = true
+        subscriptions[id] = subscription
+
+        let request = SubscriptionsListen.request(
+            id: id,
+            .init(notifications: subscription.requested)
+        )
+        let context = try send(request)
+        let attemptTask = Task { [weak self] in
+            do {
+                let result = try await context.value
+                await self?.subscriptionCompleted(id, generation: generation, result: result)
+            } catch {
+                await self?.subscriptionFailed(id, generation: generation, error: error)
+            }
+        }
+        if var current = subscriptions[id], current.attemptGeneration == generation {
+            current.attemptTask = attemptTask
+            subscriptions[id] = current
+        } else {
+            attemptTask.cancel()
+        }
+    }
+
+    private func processSubscriptionMessage(_ message: AnyMessage) async -> Bool {
+        let subscriptionID = Self.subscriptionID(in: message.params)
+        if message.method == SubscriptionsAcknowledgedNotification.name {
+            guard let subscriptionID else {
+                let error = MCPError.invalidRequest(
+                    "Subscription acknowledgment is missing its subscription ID")
+                for id in Array(subscriptions.keys)
+                where subscriptions[id]?.isAwaitingAcknowledgment == true {
+                    await failSubscriptionAndCancel(id, error: error)
+                }
+                return false
+            }
+            guard var subscription = subscriptions[subscriptionID] else {
+                await logger?.warning(
+                    "Received acknowledgment for an unknown subscription",
+                    metadata: ["subscriptionID": "\(subscriptionID)"]
+                )
+                return false
+            }
+            guard subscription.isAwaitingAcknowledgment,
+                let typedMessage = try? decoder.decode(
+                    Message<SubscriptionsAcknowledgedNotification>.self,
+                    from: encoder.encode(message)
+                ),
+                typedMessage.params.notifications.isSubset(of: subscription.requested)
+            else {
+                await failSubscriptionAndCancel(
+                    subscriptionID,
+                    error: MCPError.invalidRequest(
+                        "Subscription acknowledgment is duplicated, malformed, or exceeds the requested filter")
+                )
+                return false
+            }
+
+            let accepted = typedMessage.params.notifications
+            let continuation = subscription.acknowledgmentContinuation
+            subscription.acknowledgmentContinuation = nil
+            subscription.acknowledged = accepted
+            subscription.isAwaitingAcknowledgment = false
+            subscription.hasBeenAcknowledged = true
+            subscription.eventsContinuation.yield(.acknowledged(accepted))
+            subscriptions[subscriptionID] = subscription
+            continuation?.resume(returning: accepted)
+            return true
+        }
+
+        guard let subscriptionID else { return true }
+        guard let subscription = subscriptions[subscriptionID] else {
+            await logger?.warning(
+                "Received notification for an unknown subscription",
+                metadata: [
+                    "subscriptionID": "\(subscriptionID)",
+                    "method": "\(message.method)",
+                ]
+            )
+            return false
+        }
+        guard !subscription.isAwaitingAcknowledgment,
+            let acknowledged = subscription.acknowledged,
+            acknowledged.permits(method: message.method, parameters: message.params)
+        else {
+            await failSubscriptionAndCancel(
+                subscriptionID,
+                error: MCPError.invalidRequest(
+                    "Subscription notification arrived before acknowledgment or outside its filter")
+            )
+            return false
+        }
+        subscription.eventsContinuation.yield(.notification(.init(
+            subscriptionID: subscriptionID,
+            method: message.method,
+            parameters: message.params
+        )))
+        return true
+    }
+
+    private func subscriptionCompleted(
+        _ id: ID,
+        generation: Int,
+        result: SubscriptionsListen.Result
+    ) {
+        guard let subscription = subscriptions[id],
+            subscription.attemptGeneration == generation
+        else {
+            return
+        }
+        guard !subscription.isAwaitingAcknowledgment,
+            result.resultType == .complete,
+            result._meta.subscriptionID == id
+        else {
+            failSubscription(
+                id,
+                error: MCPError.invalidRequest(
+                    "Subscription closed with missing or mismatched correlation metadata")
+            )
+            return
+        }
+        subscriptions.removeValue(forKey: id)
+        subscription.eventsContinuation.finish()
+    }
+
+    private func subscriptionFailed(_ id: ID, generation: Int, error: Swift.Error) {
+        guard var subscription = subscriptions[id],
+            subscription.attemptGeneration == generation
+        else {
+            return
+        }
+        subscription.attemptTask = nil
+        subscription.attemptGeneration = nil
+        subscription.isAwaitingAcknowledgment = true
+        subscriptions[id] = subscription
+
+        guard generation == connectionGeneration, connection != nil else { return }
+        if subscription.hasBeenAcknowledged, Self.isSubscriptionDisconnection(error) {
+            subscription.eventsContinuation.yield(.disconnected)
+        } else {
+            failSubscription(id, error: error)
+        }
+    }
+
+    private static func isSubscriptionDisconnection(_ error: Swift.Error) -> Bool {
+        guard let error = error as? MCPError else { return false }
+        switch error {
+        case .connectionClosed, .transportError:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func failSubscriptionAndCancel(_ id: ID, error: Swift.Error) async {
+        guard let subscription = subscriptions[id] else { return }
+        let shouldCancel = subscription.attemptGeneration == connectionGeneration
+        failSubscription(id, error: error)
+        if shouldCancel {
+            try? await cancelRequest(id, reason: "Invalid subscription stream")
+        }
+    }
+
+    private func failSubscription(_ id: ID, error: Swift.Error) {
+        guard let subscription = subscriptions.removeValue(forKey: id) else { return }
+        subscription.acknowledgmentContinuation?.resume(throwing: error)
+        subscription.eventsContinuation.finish(throwing: error)
+        subscription.attemptTask?.cancel()
+    }
+
+    private func failSubscriptions(_ error: Swift.Error) {
+        for id in Array(subscriptions.keys) {
+            failSubscription(id, error: error)
+        }
+    }
+
+    private static func subscriptionID(in parameters: Value) -> ID? {
+        guard let value = parameters.objectValue?["_meta"]?
+            .objectValue?[ProtocolMetadataKey.subscriptionID]
+        else {
+            return nil
+        }
+        if let string = value.stringValue { return .string(string) }
+        if let number = value.intValue { return .number(number) }
+        return nil
     }
 
     private func handleIncomingRequest(_ request: Request<AnyMethod>) async {

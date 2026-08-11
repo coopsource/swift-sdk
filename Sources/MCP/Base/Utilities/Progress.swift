@@ -99,6 +99,39 @@ public struct Metadata: Hashable, Codable, Sendable {
     /// The underlying fields dictionary.
     public var fields: [String: Value]
 
+    /// The requested minimum level for request-scoped log notifications.
+    public var logLevel: LogLevel? {
+        get {
+            guard let value = fields[ProtocolMetadataKey.logLevel]?.stringValue else {
+                return nil
+            }
+            return LogLevel(rawValue: value)
+        }
+        set {
+            fields[ProtocolMetadataKey.logLevel] = newValue.map { .string($0.rawValue) }
+        }
+    }
+
+    /// The request ID identifying a `subscriptions/listen` stream.
+    public var subscriptionID: ID? {
+        get {
+            guard let value = fields[ProtocolMetadataKey.subscriptionID] else { return nil }
+            if let string = value.stringValue { return .string(string) }
+            if let number = value.intValue { return .number(number) }
+            return nil
+        }
+        set {
+            switch newValue {
+            case .string(let value):
+                fields[ProtocolMetadataKey.subscriptionID] = .string(value)
+            case .number(let value):
+                fields[ProtocolMetadataKey.subscriptionID] = .int(value)
+            case nil:
+                fields.removeValue(forKey: ProtocolMetadataKey.subscriptionID)
+            }
+        }
+    }
+
     /// The progress token for receiving progress notifications.
     ///
     /// If specified, the caller is requesting out-of-band progress notifications

@@ -335,8 +335,18 @@ public actor Server {
     private var clientCapabilities: Client.Capabilities?
     /// The protocol version
     private var protocolVersion: String?
-    /// The list of subscriptions
-    private var subscriptions: [String: Set<ID>] = [:]
+    /// One active long-lived notification stream, keyed by its transport routing ID.
+    private struct ActiveSubscription {
+        let requestID: ID
+        let notifications: SubscriptionFilter
+        var queuedMessages: [Data]
+        var isDraining: Bool
+        var isClosing: Bool
+        let closureContinuation: AsyncThrowingStream<Void, Swift.Error>.Continuation
+    }
+
+    private var subscriptions: [ID: ActiveSubscription] = [:]
+    private var subscriptionClosureWaiters: [CheckedContinuation<Void, Never>] = []
     /// The task for the message handling loop
     private var task: Task<Void, Never>?
 
@@ -446,6 +456,8 @@ public actor Server {
 
     /// Stop the server
     public func stop() async {
+        await closeSubscriptionsGracefully()
+
         task?.cancel()
         task = nil
 
@@ -484,6 +496,12 @@ public actor Server {
         /// (e.g. transports closing an SSE stream mid-call per SEP-1699).
         package let id: ID
 
+        /// The JSON-RPC request ID supplied by the client.
+        ///
+        /// This differs from the package-level routing ID only when a transport isolates
+        /// requests from independent clients that chose the same JSON-RPC ID.
+        public let requestID: ID
+
         /// The originating HTTP request, if the active transport conforms to
         /// ``HTTPContextProviding``. `nil` for transports that don't carry HTTP
         /// context (stdio, in-memory) or for handlers reached off the dispatch
@@ -502,20 +520,32 @@ public actor Server {
         /// Client capabilities supplied for this request or initialized connection.
         public let clientCapabilities: Client.Capabilities?
 
+        /// Minimum log level requested for this request, when present.
+        public let logLevel: LogLevel?
+
+        /// The method being handled.
+        public let method: String?
+
         package init(
             id: ID,
+            requestID: ID? = nil,
             httpContext: HTTPRequest?,
             protocolLifecycle: ProtocolLifecycle = .initializationBased,
             protocolVersion: String? = nil,
             clientInfo: Client.Info? = nil,
-            clientCapabilities: Client.Capabilities? = nil
+            clientCapabilities: Client.Capabilities? = nil,
+            logLevel: LogLevel? = nil,
+            method: String? = nil
         ) {
             self.id = id
+            self.requestID = requestID ?? id
             self.httpContext = httpContext
             self.protocolLifecycle = protocolLifecycle
             self.protocolVersion = protocolVersion
             self.clientInfo = clientInfo
             self.clientCapabilities = clientCapabilities
+            self.logLevel = logLevel
+            self.method = method
         }
     }
 
@@ -610,14 +640,50 @@ public actor Server {
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
 
         let notificationData = try encoder.encode(notification)
-        if let context = Server.currentHandlerContext,
-            context.protocolLifecycle == .perRequestMetadata,
-            let connection = connection as? any RequestScopedSending
+        if configuration.protocolMode == .initializationOnly
+            || Server.currentHandlerContext?.protocolLifecycle == .initializationBased
+            || (Server.currentHandlerContext == nil && isInitialized)
         {
-            try await connection.send(notificationData, relatedTo: context.id)
-        } else {
             try await connection.send(notificationData)
+            return
         }
+
+        if selectedSubscriptionNotificationMethod(notification.method) {
+            try await enqueueSubscriptionNotification(notificationData)
+            return
+        }
+
+        if notification.method == LogMessageNotification.name {
+            guard let context = Server.currentHandlerContext,
+                context.protocolLifecycle == .perRequestMetadata,
+                context.method != SubscriptionsListen.name,
+                let requestedLevel = context.logLevel,
+                let parameters = try? JSONDecoder().decode(
+                    Message<LogMessageNotification>.self,
+                    from: notificationData
+                ).params,
+                parameters.level.isAtLeast(requestedLevel)
+            else {
+                return
+            }
+        }
+
+        if let context = Server.currentHandlerContext,
+            context.protocolLifecycle == .perRequestMetadata
+        {
+            if let connection = connection as? any RequestScopedSending {
+                try await connection.send(notificationData, relatedTo: context.id)
+            } else {
+                try await connection.send(notificationData)
+            }
+            return
+        }
+
+        if configuration.protocolMode == .perRequestMetadataOnly {
+            throw MCPError.invalidRequest(
+                "Per-request-metadata notifications must relate to a request or subscription")
+        }
+        try await connection.send(notificationData)
     }
 
     /// Send a request to the client and return a Task for the response
@@ -1066,8 +1132,18 @@ public actor Server {
             let response = AnyMethod.response(id: request.id, error: error)
 
             if sendResponse {
-                try await send(
-                    response, protocolLifecycle: handlerContext.protocolLifecycle)
+                do {
+                    try await send(
+                        response, protocolLifecycle: handlerContext.protocolLifecycle)
+                    if request.method == SubscriptionsListen.name {
+                        removeSubscription(request.id)
+                    }
+                } catch {
+                    if request.method == SubscriptionsListen.name {
+                        removeSubscription(request.id)
+                    }
+                    throw error
+                }
                 return nil
             }
 
@@ -1119,12 +1195,20 @@ public actor Server {
                 do {
                     try await send(
                         response, protocolLifecycle: handlerContext.protocolLifecycle)
+                    if request.method == Initialize.name {
+                        try await finishInitializationResponseSend()
+                    }
+                    if request.method == SubscriptionsListen.name {
+                        removeSubscription(request.id)
+                    }
                 } catch {
-                    if request.method == Initialize.name { resetInitialization() }
+                    if request.method == Initialize.name {
+                        resetInitialization()
+                    }
+                    if request.method == SubscriptionsListen.name {
+                        removeSubscription(request.id)
+                    }
                     throw error
-                }
-                if request.method == Initialize.name {
-                    try await finishInitializationResponseSend()
                 }
                 return nil
             }
@@ -1132,6 +1216,9 @@ public actor Server {
             return response
         } catch is CancellationError {
             // Request was cancelled, don't send a response per MCP spec
+            if request.method == SubscriptionsListen.name {
+                removeSubscription(request.id)
+            }
             return nil
         } catch {
             // This should not happen as errors are caught in the task
@@ -1154,6 +1241,8 @@ public actor Server {
     private func makeHandlerContext(for request: AnyRequest) async throws -> HandlerContext {
         let httpContext = await (connection as? any HTTPContextProviding)?
             .httpRequestContext(for: request.id)
+        let originalRequestID = await (connection as? any OriginalRequestIDProviding)?
+            .originalRequestID(for: request.id) ?? request.id
         let carriesPerRequestMetadata =
             PerRequestMetadataWire.containsLifecycleMetadata(request)
 
@@ -1164,22 +1253,26 @@ public actor Server {
             }
             return HandlerContext(
                 id: request.id,
+                requestID: originalRequestID,
                 httpContext: httpContext,
                 protocolLifecycle: .initializationBased,
                 protocolVersion: protocolVersion,
                 clientInfo: clientInfo,
-                clientCapabilities: clientCapabilities
+                clientCapabilities: clientCapabilities,
+                method: request.method
             )
 
         case .initializationAndPerRequestMetadata:
             if !carriesPerRequestMetadata {
                 return HandlerContext(
                     id: request.id,
+                    requestID: originalRequestID,
                     httpContext: httpContext,
                     protocolLifecycle: .initializationBased,
                     protocolVersion: protocolVersion,
                     clientInfo: clientInfo,
-                    clientCapabilities: clientCapabilities
+                    clientCapabilities: clientCapabilities,
+                    method: request.method
                 )
             }
 
@@ -1214,14 +1307,24 @@ public actor Server {
             throw MCPError.methodNotFound(
                 "initialize is not part of the per-request-metadata lifecycle")
         }
+        switch request.method {
+        case Ping.name, SetLoggingLevel.name, ResourceSubscribe.name, ResourceUnsubscribe.name:
+            throw MCPError.methodNotFound(
+                "\(request.method) is not part of protocol version \(metadata.protocolVersion)")
+        default:
+            break
+        }
 
         return HandlerContext(
             id: request.id,
+            requestID: originalRequestID,
             httpContext: httpContext,
             protocolLifecycle: .perRequestMetadata,
             protocolVersion: metadata.protocolVersion,
             clientInfo: metadata.clientInfo,
-            clientCapabilities: metadata.clientCapabilities
+            clientCapabilities: metadata.clientCapabilities,
+            logLevel: metadata.logLevel,
+            method: request.method
         )
     }
 
@@ -1417,8 +1520,217 @@ public actor Server {
             )
         }
 
+        // Long-lived notification streams
+        withMethodHandler(SubscriptionsListen.self) { [weak self] parameters in
+            guard let self else {
+                throw MCPError.internalError("Server was deallocated")
+            }
+            return try await self.handleSubscriptionListen(parameters)
+        }
+
         // Ping
         withMethodHandler(Ping.self) { _ in return Empty() }
+    }
+
+    private func handleSubscriptionListen(
+        _ parameters: SubscriptionsListen.Parameters
+    ) async throws -> SubscriptionsListen.Result {
+        guard let context = Server.currentHandlerContext,
+            context.protocolLifecycle == .perRequestMetadata,
+            let connection
+        else {
+            throw MCPError.methodNotFound(
+                "subscriptions/listen requires the per-request-metadata lifecycle")
+        }
+
+        let accepted = acceptedSubscriptionFilter(parameters.notifications)
+        let acknowledgment = SubscriptionsAcknowledgedNotification.message(.init(
+            subscriptionID: context.requestID,
+            notifications: accepted
+        ))
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let acknowledgmentData = try encoder.encode(acknowledgment)
+
+        let (closure, closureContinuation) =
+            AsyncThrowingStream<Void, Swift.Error>.makeStream()
+        subscriptions[context.id] = ActiveSubscription(
+            requestID: context.requestID,
+            notifications: accepted,
+            queuedMessages: [acknowledgmentData],
+            isDraining: false,
+            isClosing: false,
+            closureContinuation: closureContinuation
+        )
+        beginDrainingSubscription(context.id, connection: connection)
+
+        do {
+            try await withTaskCancellationHandler {
+                for try await _ in closure {}
+                try Task.checkCancellation()
+            } onCancel: {
+                Task { await self.cancelSubscription(context.id) }
+            }
+        } catch {
+            cancelSubscription(context.id)
+            throw error
+        }
+
+        return SubscriptionsListen.Result(subscriptionID: context.requestID)
+    }
+
+    private func acceptedSubscriptionFilter(_ requested: SubscriptionFilter)
+        -> SubscriptionFilter
+    {
+        let resources = capabilities.resources
+        let resourceSubscriptions: [String]?
+        if resources?.subscribe == true,
+            let requestedResources = requested.resourceSubscriptions,
+            !requestedResources.isEmpty
+        {
+            resourceSubscriptions = requestedResources
+        } else {
+            resourceSubscriptions = nil
+        }
+
+        return SubscriptionFilter(
+            toolsListChanged: capabilities.tools?.listChanged == true
+                && requested.toolsListChanged == true ? true : nil,
+            promptsListChanged: capabilities.prompts?.listChanged == true
+                && requested.promptsListChanged == true ? true : nil,
+            resourcesListChanged: resources?.listChanged == true
+                && requested.resourcesListChanged == true ? true : nil,
+            resourceSubscriptions: resourceSubscriptions
+        )
+    }
+
+    private func selectedSubscriptionNotificationMethod(_ method: String) -> Bool {
+        switch method {
+        case ToolListChangedNotification.name,
+            PromptListChangedNotification.name,
+            ResourceListChangedNotification.name,
+            ResourceUpdatedNotification.name:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func enqueueSubscriptionNotification(_ data: Data) async throws {
+        guard let message = try? JSONDecoder().decode(AnyMessage.self, from: data) else {
+            throw MCPError.invalidRequest("Subscription notification is malformed")
+        }
+        guard let connection else {
+            throw MCPError.internalError("Server connection not initialized")
+        }
+
+        for routingID in Array(subscriptions.keys) {
+            guard var subscription = subscriptions[routingID],
+                !subscription.isClosing,
+                subscription.notifications.permits(
+                    method: message.method,
+                    parameters: message.params
+                )
+            else {
+                continue
+            }
+            subscription.queuedMessages.append(try Self.addingSubscriptionID(
+                subscription.requestID,
+                to: data
+            ))
+            subscriptions[routingID] = subscription
+            beginDrainingSubscription(routingID, connection: connection)
+        }
+    }
+
+    private func beginDrainingSubscription(
+        _ routingID: ID,
+        connection: any Transport
+    ) {
+        guard var subscription = subscriptions[routingID], !subscription.isDraining else {
+            return
+        }
+        subscription.isDraining = true
+        subscriptions[routingID] = subscription
+        Task { await self.drainSubscription(routingID, connection: connection) }
+    }
+
+    private func drainSubscription(
+        _ routingID: ID,
+        connection: any Transport
+    ) async {
+        while var subscription = subscriptions[routingID] {
+            guard !subscription.queuedMessages.isEmpty else {
+                subscription.isDraining = false
+                subscriptions[routingID] = subscription
+                if subscription.isClosing {
+                    subscription.closureContinuation.finish()
+                }
+                return
+            }
+
+            let data = subscription.queuedMessages.removeFirst()
+            subscriptions[routingID] = subscription
+            do {
+                if let connection = connection as? any RequestScopedSending {
+                    try await connection.send(data, relatedTo: routingID)
+                } else {
+                    try await connection.send(data)
+                }
+            } catch {
+                guard let subscription = subscriptions[routingID] else {
+                    return
+                }
+                removeSubscription(routingID)
+                subscription.closureContinuation.finish(throwing: error)
+                return
+            }
+        }
+    }
+
+    private func closeSubscriptionsGracefully() async {
+        guard let connection else { return }
+        guard !subscriptions.isEmpty else { return }
+        await withCheckedContinuation { continuation in
+            subscriptionClosureWaiters.append(continuation)
+            for routingID in Array(subscriptions.keys) {
+                guard var subscription = subscriptions[routingID] else { continue }
+                subscription.isClosing = true
+                subscriptions[routingID] = subscription
+                beginDrainingSubscription(routingID, connection: connection)
+            }
+        }
+    }
+
+    private func cancelSubscription(_ routingID: ID) {
+        guard let subscription = subscriptions[routingID] else { return }
+        removeSubscription(routingID)
+        subscription.closureContinuation.finish()
+    }
+
+    private func removeSubscription(_ routingID: ID) {
+        subscriptions.removeValue(forKey: routingID)
+        guard subscriptions.isEmpty, !subscriptionClosureWaiters.isEmpty else { return }
+        let waiters = subscriptionClosureWaiters
+        subscriptionClosureWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    private static func addingSubscriptionID(_ id: ID, to data: Data) throws -> Data {
+        guard case .object(var message) = try JSONDecoder().decode(Value.self, from: data) else {
+            throw MCPError.invalidRequest("Notification must encode as a JSON object")
+        }
+        var parameters = message["params"]?.objectValue ?? [:]
+        var metadata = parameters["_meta"]?.objectValue ?? [:]
+        metadata[ProtocolMetadataKey.subscriptionID] = try Value(id)
+        parameters["_meta"] = .object(metadata)
+        message["params"] = .object(parameters)
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        return try encoder.encode(Value.object(message))
     }
 
     private func setInitialState(

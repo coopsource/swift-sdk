@@ -3,8 +3,96 @@ import Testing
 
 @testable import MCP
 
+private enum RequestScopedLoggingProbe: MCP.Method {
+    static let name = "test/request-scoped-logging"
+
+    struct Result: Hashable, Codable, Sendable {
+        let requestedLevel: LogLevel?
+    }
+}
+
+private actor RequestScopedLogRecorder {
+    private(set) var levels: [LogLevel] = []
+
+    func record(_ level: LogLevel) {
+        levels.append(level)
+    }
+}
+
 @Suite("Logging Tests")
 struct LoggingTests {
+    @Test("Per-request log level filters notifications and reaches handler context")
+    func requestScopedLogLevel() async throws {
+        let pair = await InMemoryTransport.createConnectedPair()
+        let client = Client(
+            name: "Client",
+            version: "1.0",
+            configuration: .init(protocolMode: .perRequestMetadataOnly)
+        )
+        let server = Server(
+            name: "Server",
+            version: "1.0",
+            capabilities: .init(logging: .init()),
+            configuration: .init(protocolMode: .perRequestMetadataOnly)
+        )
+        await server.withMethodHandler(RequestScopedLoggingProbe.self) { _ in
+            try await server.log(level: .debug, data: .string("debug"))
+            try await server.log(level: .warning, data: .string("warning"))
+            try await server.log(level: .error, data: .string("error"))
+            return .init(requestedLevel: Server.currentHandlerContext?.logLevel)
+        }
+        let recorder = RequestScopedLogRecorder()
+        await client.onNotification(LogMessageNotification.self) { message in
+            await recorder.record(message.params.level)
+        }
+
+        try await server.start(transport: pair.server)
+        _ = try await client.connectWithInfo(transport: pair.client)
+        let context = try await client.send(
+            RequestScopedLoggingProbe.request(),
+            logLevel: .warning
+        )
+        let result = try await context.value
+
+        #expect(result.requestedLevel == .warning)
+        #expect(await recorder.levels == [.warning, .error])
+        await client.disconnect()
+        await server.stop()
+    }
+
+    @Test("Per-request server suppresses logs without an explicit level")
+    func requestScopedLoggingRequiresOptIn() async throws {
+        let pair = await InMemoryTransport.createConnectedPair()
+        let client = Client(
+            name: "Client",
+            version: "1.0",
+            configuration: .init(protocolMode: .perRequestMetadataOnly)
+        )
+        let server = Server(
+            name: "Server",
+            version: "1.0",
+            capabilities: .init(logging: .init()),
+            configuration: .init(protocolMode: .perRequestMetadataOnly)
+        )
+        await server.withMethodHandler(RequestScopedLoggingProbe.self) { _ in
+            try await server.log(level: .error, data: .string("suppressed"))
+            return .init(requestedLevel: Server.currentHandlerContext?.logLevel)
+        }
+        let recorder = RequestScopedLogRecorder()
+        await client.onNotification(LogMessageNotification.self) { message in
+            await recorder.record(message.params.level)
+        }
+
+        try await server.start(transport: pair.server)
+        _ = try await client.connectWithInfo(transport: pair.client)
+        let result = try await client.sendAndAwait(RequestScopedLoggingProbe.request())
+
+        #expect(result.requestedLevel == nil)
+        #expect(await recorder.levels.isEmpty)
+        await client.disconnect()
+        await server.stop()
+    }
+
     // MARK: - LogLevel Tests
 
     @Test("LogLevel case values")
