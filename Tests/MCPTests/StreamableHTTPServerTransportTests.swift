@@ -187,7 +187,41 @@ struct StreamableHTTPServerTransportTests {
         ))
         #expect(absentMetadata.statusCode == 400)
         #expect(try decodeResponseObject(absentMetadata)["error"]?.objectValue?["code"]?.intValue
-            == ProtocolErrorCode.headerMismatch)
+            == -32602)
+    }
+
+    @Test("Malformed required request metadata returns invalid params")
+    func malformedRequiredMetadata() async throws {
+        let transport = StreamableHTTPServerTransport(
+            validationPipeline: StandardValidationPipeline(validators: [])
+        )
+        let malformedMetadata: [Value] = [
+            .string("not an object"),
+            .object([
+                ProtocolMetadataKey.protocolVersion: .int(2026),
+                ProtocolMetadataKey.clientCapabilities: .object([:]),
+            ]),
+            .object([
+                ProtocolMetadataKey.protocolVersion: .string(
+                    Version.perRequestMetadataVersion),
+                ProtocolMetadataKey.clientCapabilities: .string("not capabilities"),
+            ]),
+        ]
+
+        for metadata in malformedMetadata {
+            let body = try JSONEncoder().encode(Value.object([
+                "jsonrpc": .string("2.0"),
+                "id": .string("malformed-metadata"),
+                "method": .string(Ping.name),
+                "params": .object(["_meta": metadata]),
+            ]))
+            let response = await transport.handleRequest(makePerRequestHTTPPost(body: body))
+            let object = try decodeResponseObject(response)
+
+            #expect(response.statusCode == 400)
+            #expect(object["id"]?.stringValue == "malformed-metadata")
+            #expect(object["error"]?.objectValue?["code"]?.intValue == -32602)
+        }
     }
 
     @Test("Unsupported version error advertises supported per-request versions")
@@ -375,7 +409,7 @@ struct StreamableHTTPServerTransportTests {
 
         #expect(response.statusCode == 400)
         #expect(object["id"]?.stringValue == "missing-capabilities")
-        #expect(object["error"]?.objectValue?["code"]?.intValue == -32600)
+        #expect(object["error"]?.objectValue?["code"]?.intValue == -32602)
 
         await server.stop()
     }
