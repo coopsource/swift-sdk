@@ -20,12 +20,14 @@ private func makeStreamableHTTPValidationPipeline(
 public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
     RequestScopedSending, RequestCancellationRegistering, TransportProtocolVersionProviding
 {
+    /// Resolves the definition used to validate one tool call in its HTTP request context.
+    public typealias ToolHeaderSchemaProvider =
+        @Sendable (_ toolName: String, _ request: HTTPRequest) async throws -> Tool?
+
     public nonisolated let logger: Logger
 
     private struct ActiveRequest {
         let originalID: ID
-        let method: String
-        let listToolsCursor: String?
         let stream: AsyncThrowingStream<Data, Swift.Error>
         let streamContinuation: AsyncThrowingStream<Data, Swift.Error>.Continuation
         var initialResponse: CheckedContinuation<HTTPResponse, Never>?
@@ -51,6 +53,7 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
 
     private let validationPipeline: any HTTPRequestValidationPipeline
     private let bindingSupportedProtocolVersions: Set<String>
+    private let toolHeaderSchemaProvider: ToolHeaderSchemaProvider?
 
     private let incomingStream: AsyncThrowingStream<Data, Swift.Error>
     private let incomingContinuation: AsyncThrowingStream<Data, Swift.Error>.Continuation
@@ -69,7 +72,8 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
     /// with request metadata are always enforced by the transport.
     public init(
         validationPipeline: (any HTTPRequestValidationPipeline)? = nil,
-        logger: Logger? = nil
+        logger: Logger? = nil,
+        toolHeaderSchemaProvider: ToolHeaderSchemaProvider? = nil
     ) {
         self.validationPipeline = validationPipeline ?? makeStreamableHTTPValidationPipeline(
             originValidator: .localhost()
@@ -77,6 +81,7 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
         self.bindingSupportedProtocolVersions = Version.streamableHTTPSupported(
             for: .perRequestMetadata
         )
+        self.toolHeaderSchemaProvider = toolHeaderSchemaProvider
         self.logger = logger ?? Logger(
             label: "mcp.transport.http.server.per-request-metadata",
             factory: { _ in SwiftLogNoOpLogHandler() }
@@ -91,13 +96,15 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
     /// standard validation enabled.
     public init(
         originValidator: OriginValidator,
-        logger: Logger? = nil
+        logger: Logger? = nil,
+        toolHeaderSchemaProvider: ToolHeaderSchemaProvider? = nil
     ) {
         self.init(
             validationPipeline: makeStreamableHTTPValidationPipeline(
                 originValidator: originValidator
             ),
-            logger: logger
+            logger: logger,
+            toolHeaderSchemaProvider: toolHeaderSchemaProvider
         )
     }
 
@@ -128,9 +135,6 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
     }
 
     /// Replaces the tool definitions used to validate `Mcp-Param-*` headers.
-    ///
-    /// Responses to `tools/list` also update these definitions automatically. Calling
-    /// this method allows validation before the first list request reaches the server.
     public func updateTools(_ tools: [Tool]) throws {
         var plans: [String: ToolHeaderPlan] = [:]
         for tool in tools {
@@ -226,9 +230,19 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
         if let versionError = validateProtocolVersion(request: request, message: message) {
             return versionError
         }
+        let validationToolPlans: [String: ToolHeaderPlan]
+        do {
+            validationToolPlans = try await toolHeaderPlans(for: request)
+        } catch {
+            return makeErrorResponse(
+                statusCode: 500,
+                id: message.id,
+                error: .internalError("Could not resolve tool header schema")
+            )
+        }
         if let headerError = MCPHTTPHeaders.validationFailure(
             for: request,
-            toolPlans: toolHeaderPlans
+            toolPlans: validationToolPlans
         ) {
             return makeErrorResponse(
                 statusCode: 400,
@@ -246,20 +260,14 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
             incomingContinuation.yield(body)
             return .accepted()
 
-        case .request(let id, let method, _):
-            return await handleJSONRPCRequest(
-                body,
-                requestID: id,
-                method: method,
-                request: request
-            )
+        case .request(let id, _, _):
+            return await handleJSONRPCRequest(body, requestID: id, request: request)
         }
     }
 
     private func handleJSONRPCRequest(
         _ body: Data,
         requestID: ID,
-        method: String,
         request: HTTPRequest
     ) async -> HTTPResponse {
         let routingID = makeRoutingID()
@@ -282,8 +290,6 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
 
                 activeRequests[routingID] = ActiveRequest(
                     originalID: requestID,
-                    method: method,
-                    listToolsCursor: Self.listToolsCursor(in: body, method: method),
                     stream: stream,
                     streamContinuation: streamContinuation,
                     initialResponse: continuation,
@@ -343,13 +349,6 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
                 .internalError("Could not restore the response id")
             ))
             return
-        }
-
-        if activeRequest.method == ListTools.name {
-            updateToolsFromListResponse(
-                clientData,
-                replacing: activeRequest.listToolsCursor == nil
-            )
         }
 
         if activeRequest.isStreaming {
@@ -525,43 +524,22 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
         return id(from: idValue)
     }
 
-    private static func listToolsCursor(in data: Data, method: String) -> String? {
-        guard method == ListTools.name,
-            let value = try? JSONDecoder().decode(Value.self, from: data)
+    private func toolHeaderPlans(
+        for request: HTTPRequest
+    ) async throws -> [String: ToolHeaderPlan] {
+        guard let toolHeaderSchemaProvider,
+            let body = request.body,
+            let toolName = MCPHTTPHeaders.toolName(in: body)
         else {
-            return nil
+            return toolHeaderPlans
         }
-        return value.objectValue?["params"]?.objectValue?["cursor"]?.stringValue
-    }
-
-    private func updateToolsFromListResponse(_ data: Data, replacing: Bool) {
-        guard let value = try? JSONDecoder().decode(Value.self, from: data),
-            let toolsValue = value.objectValue?["result"]?.objectValue?["tools"],
-            let tools = try? JSONDecoder().decode(
-                [Tool].self,
-                from: JSONEncoder().encode(toolsValue)
-            )
-        else {
-            return
+        guard let tool = try await toolHeaderSchemaProvider(toolName, request) else {
+            return [:]
         }
-
-        if replacing {
-            toolHeaderPlans.removeAll()
+        guard tool.name == toolName else {
+            throw MCPError.invalidParams("Tool header schema name does not match the request")
         }
-        for tool in tools {
-            do {
-                toolHeaderPlans[tool.name] = try ToolHeaderPlan(tool: tool)
-            } catch {
-                toolHeaderPlans.removeValue(forKey: tool.name)
-                logger.warning(
-                    "Cannot validate headers for tool with invalid x-mcp-header schema",
-                    metadata: [
-                        "tool": "\(tool.name)",
-                        "error": "\(error.localizedDescription)",
-                    ]
-                )
-            }
-        }
+        return [toolName: try ToolHeaderPlan(tool: tool)]
     }
 
     private static func replacingMessageID(in data: Data, with id: ID) throws -> Data {
