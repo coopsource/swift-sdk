@@ -1219,9 +1219,11 @@ public actor Client {
         guard let connection = connection else {
             throw MCPError.internalError("Client connection not initialized")
         }
-        guard selectedProtocolLifecycle != .perRequestMetadata else {
+        guard selectedProtocolLifecycle != .perRequestMetadata
+            || !(connection is any HTTPProtocolNegotiationTransport)
+        else {
             throw MCPError.invalidRequest(
-                "JSON-RPC batches are not supported by per-request metadata transports")
+                "JSON-RPC batches are not supported by per-request metadata HTTP")
         }
 
         // Create Batch actor, passing self (Client)
@@ -1364,9 +1366,19 @@ public actor Client {
     private func awaitDiscovery(_ context: RequestContext<Discover.Result>) async throws
         -> Discover.Result
     {
-        guard !(connection is any HTTPProtocolNegotiationTransport) else {
-            return try await context.value
+        if connection is any HTTPProtocolNegotiationTransport {
+            return try await withTaskCancellationHandler {
+                try await context.value
+            } onCancel: {
+                Task {
+                    try? await self.cancelRequest(
+                        context.requestID,
+                        reason: "Server discovery cancelled"
+                    )
+                }
+            }
         }
+
         guard configuration.discoveryProbeTimeout.isFinite,
             configuration.discoveryProbeTimeout > 0
         else {

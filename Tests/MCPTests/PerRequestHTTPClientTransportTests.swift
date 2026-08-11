@@ -220,9 +220,57 @@ import Testing
         }
     }
 
+    private final class SingleRetryAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
+        let maxAuthorizationAttempts = 1
+
+        private let lock = NSLock()
+        private var token = "stale-token"
+        private var challengeCount = 0
+
+        func validateEndpointSecurity(for endpoint: URL) throws {}
+
+        func authorizationHeader(for endpoint: URL) -> String? {
+            lock.lock()
+            let token = self.token
+            lock.unlock()
+            return "Bearer \(token)"
+        }
+
+        func handleChallenge(
+            statusCode: Int,
+            headers: [String: String],
+            endpoint: URL,
+            operationKey: String?,
+            session: URLSession
+        ) async throws -> Bool {
+            recordChallenge()
+            return true
+        }
+
+        private func recordChallenge() {
+            lock.lock()
+            challengeCount += 1
+            token = "fresh-token"
+            lock.unlock()
+        }
+
+        func handledChallengeCount() -> Int {
+            lock.lock()
+            let count = challengeCount
+            lock.unlock()
+            return count
+        }
+    }
+
     @Suite("MCP 2026-07-28 HTTP client transport", .serialized, .timeLimit(.minutes(1)))
     struct PerRequestHTTPClientTransportTests {
         private let endpoint = URL(string: "https://localhost:8080/mcp")!
+
+        @Test("Direct transports default to the latest initialization version")
+        func initializationVersionDefault() async {
+            let transport = makeTransport()
+            #expect(await transport.protocolVersion == Version.latestInitializationVersion)
+        }
 
         @Test("Per-request JSON response uses one POST without session state")
         func jsonResponse() async throws {
@@ -334,6 +382,42 @@ import Testing
             await transport.disconnect()
         }
 
+        @Test("Request-scoped SSE ignores one leading byte-order mark split across chunks")
+        func requestScopedSSEByteOrderMark() async throws {
+            await PerRequestHTTPURLProtocol.storage.reset()
+            let requestData = try makePerRequestData(id: 8)
+            let response = #"{"jsonrpc":"2.0","id":8,"result":{}}"#
+            await PerRequestHTTPURLProtocol.storage.setHandler { [endpoint] _ in
+                StreamingHTTPScript(
+                    response: HTTPURLResponse(
+                        url: endpoint,
+                        statusCode: 200,
+                        httpVersion: "HTTP/1.1",
+                        headerFields: ["Content-Type": ContentType.sse]
+                    )!,
+                    events: [
+                        .data(Data([0xEF]), delayMilliseconds: 0),
+                        .data(Data([0xBB]), delayMilliseconds: 0),
+                        .data(Data([0xBF]) + Data("data: \(response)\n\n".utf8), delayMilliseconds: 0),
+                        .finish(delayMilliseconds: 0),
+                    ]
+                )
+            }
+
+            let transport = makeStreamingTransport()
+            await transport.updateProtocolLifecycle(
+                .perRequestMetadata,
+                protocolVersion: Version.perRequestMetadataVersion
+            )
+            try await transport.connect()
+            let stream = await transport.receive()
+            var iterator = stream.makeAsyncIterator()
+
+            try await transport.send(requestData)
+            #expect(try await iterator.next() == Data(response.utf8))
+            await transport.disconnect()
+        }
+
         @Test("Cancelling a request closes its request-scoped SSE response")
         func requestScopedCancellation() async throws {
             await PerRequestHTTPURLProtocol.storage.reset()
@@ -411,6 +495,24 @@ import Testing
             }
             #expect(await PerRequestHTTPURLProtocol.storage.emittedChunkCount == 0)
             #expect(await PerRequestHTTPURLProtocol.storage.stoppedRequestCount >= 1)
+            await transport.disconnect()
+        }
+
+        @Test("Cancellation before HTTP task registration prevents network I/O")
+        func cancellationBeforeTaskRegistration() async throws {
+            await PerRequestHTTPURLProtocol.storage.reset()
+            let transport = makeTransport()
+            await transport.updateProtocolLifecycle(
+                .perRequestMetadata,
+                protocolVersion: Version.perRequestMetadataVersion
+            )
+            try await transport.connect()
+            await transport.cancelRequestStream(id: 11)
+
+            await #expect(throws: CancellationError.self) {
+                try await transport.send(makePerRequestData(id: 11))
+            }
+            await PerRequestHTTPURLProtocol.verifyCallCount(0, for: endpoint)
             await transport.disconnect()
         }
 
@@ -555,6 +657,83 @@ import Testing
             await transport.disconnect()
         }
 
+        @Test("One allowed authorization retry performs one retry in each lifecycle")
+        func authorizationRetryLimit() async throws {
+            for usesPerRequestMetadata in [false, true] {
+                let authorizer = SingleRetryAuthorizer()
+                let transport = makeTransport(authorizer: authorizer)
+                if usesPerRequestMetadata {
+                    await transport.updateProtocolLifecycle(
+                        .perRequestMetadata,
+                        protocolVersion: Version.perRequestMetadataVersion
+                    )
+                }
+                try await transport.connect()
+
+                let requestData = usesPerRequestMetadata
+                    ? try makePerRequestData(id: 12)
+                    : try JSONEncoder().encode(Ping.request(id: 12))
+                await PerRequestHTTPURLProtocol.setHandler { [endpoint] request in
+                    if request.value(forHTTPHeaderField: HTTPHeaderName.authorization)
+                        == "Bearer stale-token"
+                    {
+                        return (
+                            HTTPURLResponse(
+                                url: endpoint,
+                                statusCode: 401,
+                                httpVersion: "HTTP/1.1",
+                                headerFields: ["WWW-Authenticate": "Bearer"]
+                            )!,
+                            Data()
+                        )
+                    }
+                    return (
+                        HTTPURLResponse(
+                            url: endpoint,
+                            statusCode: 200,
+                            httpVersion: "HTTP/1.1",
+                            headerFields: ["Content-Type": ContentType.json]
+                        )!,
+                        Data(#"{"jsonrpc":"2.0","id":12,"result":{}}"#.utf8)
+                    )
+                }
+
+                let stream = await transport.receive()
+                var iterator = stream.makeAsyncIterator()
+                try await transport.send(requestData)
+                #expect(try await iterator.next() != nil)
+                await PerRequestHTTPURLProtocol.verifyCallCount(2, for: endpoint)
+                #expect(authorizer.handledChallengeCount() == 1)
+                await transport.disconnect()
+            }
+
+            let authorizer = SingleRetryAuthorizer()
+            let transport = makeTransport(authorizer: authorizer)
+            await transport.updateProtocolLifecycle(
+                .perRequestMetadata,
+                protocolVersion: Version.perRequestMetadataVersion
+            )
+            try await transport.connect()
+            await PerRequestHTTPURLProtocol.setHandler { [endpoint] _ in
+                (
+                    HTTPURLResponse(
+                        url: endpoint,
+                        statusCode: 401,
+                        httpVersion: "HTTP/1.1",
+                        headerFields: ["WWW-Authenticate": "Bearer"]
+                    )!,
+                    Data()
+                )
+            }
+
+            await #expect(throws: MCPError.self) {
+                try await transport.send(makePerRequestData(id: 13))
+            }
+            await PerRequestHTTPURLProtocol.verifyCallCount(2, for: endpoint)
+            #expect(authorizer.handledChallengeCount() == 1)
+            await transport.disconnect()
+        }
+
         @Test("Automatic mode selects per-request metadata without opening a GET")
         func automaticSelection() async throws {
             await PerRequestHTTPURLProtocol.setHandler { [endpoint] request in
@@ -593,6 +772,44 @@ import Testing
             #expect(info.protocolLifecycle == .perRequestMetadata)
             #expect(info.protocolVersion == Version.perRequestMetadataVersion)
             await PerRequestHTTPURLProtocol.verifyCallCount(1, for: endpoint)
+            await client.disconnect()
+        }
+
+        @Test("Cancelling HTTP discovery does not start initialization fallback")
+        func cancelledAutomaticDiscovery() async throws {
+            await PerRequestHTTPURLProtocol.storage.reset()
+            await PerRequestHTTPURLProtocol.storage.setHandler { [endpoint] _ in
+                try await Task.sleep(for: .milliseconds(200))
+                return StreamingHTTPScript(
+                    response: HTTPURLResponse(
+                        url: endpoint,
+                        statusCode: 200,
+                        httpVersion: "HTTP/1.1",
+                        headerFields: ["Content-Type": ContentType.json]
+                    )!,
+                    events: [.finish(delayMilliseconds: 0)]
+                )
+            }
+
+            let client = Client(
+                name: "HTTPClient",
+                version: "1.0",
+                configuration: .init(protocolMode: .automatic)
+            )
+            let connectionTask = Task {
+                try await client.connectWithInfo(transport: makeTransport())
+            }
+            while await PerRequestHTTPURLProtocol.storage.requestCount == 0 {
+                try await Task.sleep(for: .milliseconds(1))
+            }
+            connectionTask.cancel()
+
+            await #expect(throws: CancellationError.self) {
+                _ = try await connectionTask.value
+            }
+            await PerRequestHTTPURLProtocol.verifyCallCount(1, for: endpoint)
+            try await Task.sleep(for: .milliseconds(20))
+            #expect(await PerRequestHTTPURLProtocol.storage.stoppedRequestCount >= 1)
             await client.disconnect()
         }
 
