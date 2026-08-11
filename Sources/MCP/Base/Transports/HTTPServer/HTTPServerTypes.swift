@@ -163,6 +163,9 @@ public enum HTTPHeaderName {
     public static let connection = "Connection"
     public static let allow = "Allow"
     public static let xAccelBuffering = "X-Accel-Buffering"
+    public static let mcpMethod = "Mcp-Method"
+    public static let mcpName = "Mcp-Name"
+    public static let parameterPrefix = "Mcp-Param-"
 }
 
 // MARK: - Content Types

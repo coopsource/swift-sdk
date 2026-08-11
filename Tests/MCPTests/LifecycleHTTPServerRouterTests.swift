@@ -76,6 +76,9 @@ private func makeRouterRequest(
     if let sessionID {
         headers[HTTPHeaderName.sessionID] = sessionID
     }
+    if let generated = try? MCPHTTPHeaders.requestHeaders(for: body, toolPlans: [:]) {
+        headers.merge(generated) { _, new in new }
+    }
     return HTTPRequest(method: method, headers: headers, body: body, path: "/mcp")
 }
 

@@ -506,6 +506,9 @@ public actor Client {
         selectedProtocolLifecycle = nil
         selectedProtocolVersion = nil
         initializationNotificationSent = false
+        if let transport = transport as? any ToolHeaderSchemaManaging {
+            await transport.clearToolHeaderSchemas()
+        }
         if let transport = transport as? any ProtocolLifecycleUpdating {
             switch configuration.protocolMode {
             case .initializationOnly:
@@ -662,6 +665,10 @@ public actor Client {
         self.cancelledLogicalRequests = []
         self.logicalRequestCancellations = [:]
 
+        if let connectionToDisconnect = connectionToDisconnect as? any ToolHeaderSchemaManaging {
+            await connectionToDisconnect.clearToolHeaderSchemas()
+        }
+
         // Part 2: Outside actor - Resume continuations, disconnect transport, await task
 
         // Resume continuations first
@@ -772,9 +779,7 @@ public actor Client {
             throw MCPError.internalError("Client connection not initialized")
         }
 
-        if selectedProtocolLifecycle == .perRequestMetadata,
-            configuration.multiRoundTripMode != .disabled
-        {
+        if selectedProtocolLifecycle == .perRequestMetadata {
             let requestTask = Task<M.Result, Error> {
                 try await self.performLogicalRequest(request, connection: connection)
             }
@@ -894,6 +899,7 @@ public actor Client {
         var attemptData = try encodeRequest(request)
         var usedRequestIDs: Set<ID> = [attemptID]
         var round = 0
+        var correctedToolHeaders = false
 
         defer {
             logicalRequestAttempts.removeValue(forKey: logicalRequestID)
@@ -908,8 +914,28 @@ public actor Client {
             }
 
             logicalRequestAttempts[logicalRequestID] = attemptID
-            let value = try await sendRawRequest(
-                data: attemptData, id: attemptID, connection: connection)
+            let value: Value
+            do {
+                value = try await sendRawRequest(
+                    data: attemptData, id: attemptID, connection: connection)
+            } catch let error as MCPError {
+                if !correctedToolHeaders,
+                    await refreshToolHeadersIfNeeded(
+                        after: error,
+                        requestData: attemptData,
+                        connection: connection
+                    )
+                {
+                    correctedToolHeaders = true
+                    repeat {
+                        attemptID = .random
+                    } while usedRequestIDs.contains(attemptID)
+                    usedRequestIDs.insert(attemptID)
+                    attemptData = try replacingRequestID(in: attemptData, with: attemptID)
+                    continue
+                }
+                throw error
+            }
             guard let result = value.objectValue else {
                 throw MCPError.invalidRequest("Response result must be a JSON object")
             }
@@ -1018,6 +1044,59 @@ public actor Client {
                 }
             }
         }
+    }
+
+    private func refreshToolHeadersIfNeeded(
+        after error: MCPError,
+        requestData: Data,
+        connection: any Transport
+    ) async -> Bool {
+        guard error.code == ProtocolErrorCode.headerMismatch,
+            error.errorDescription?.lowercased().contains("mcp-param-") == true,
+            let schemas = connection as? any ToolHeaderSchemaManaging,
+            let toolName = MCPHTTPHeaders.toolName(in: requestData)
+        else {
+            return false
+        }
+
+        let previousPlan = await schemas.toolHeaderPlan(named: toolName)
+        do {
+            var cursor: String?
+            var seenCursors: Set<String> = []
+            repeat {
+                let page = try await listTools(cursor: cursor)
+                cursor = page.nextCursor
+                if let cursor, !seenCursors.insert(cursor).inserted {
+                    throw MCPError.invalidRequest(
+                        "tools/list returned a repeated pagination cursor")
+                }
+            } while cursor != nil
+        } catch {
+            await logger?.warning(
+                "Could not refresh tool headers after HeaderMismatch",
+                metadata: [
+                    "tool": "\(toolName)",
+                    "error": "\(error.localizedDescription)",
+                ]
+            )
+            return false
+        }
+
+        guard let refreshedPlan = await schemas.toolHeaderPlan(named: toolName),
+            !refreshedPlan.fields.isEmpty,
+            refreshedPlan != previousPlan
+        else {
+            return false
+        }
+        return true
+    }
+
+    private func replacingRequestID(in data: Data, with id: ID) throws -> Data {
+        guard case .object(var object) = try decoder.decode(Value.self, from: data) else {
+            throw MCPError.invalidRequest("Request must encode as a JSON object")
+        }
+        object["id"] = try Value(id)
+        return try encoder.encode(Value.object(object))
     }
 
     private func fulfillEmbeddedInputRequests(
@@ -1669,6 +1748,15 @@ public actor Client {
             request = ListTools.request(.init())
         }
         let result = try await sendAndAwait(request)
+        if selectedProtocolLifecycle == .perRequestMetadata,
+            let schemas = connection as? any ToolHeaderSchemaManaging
+        {
+            let tools = await schemas.updateToolHeaderSchemas(
+                result.tools,
+                replacing: cursor == nil
+            )
+            return (tools: tools, nextCursor: result.nextCursor)
+        }
         return (tools: result.tools, nextCursor: result.nextCursor)
     }
 
@@ -1910,6 +1998,12 @@ public actor Client {
         await logger?.trace(
             "Processing notification",
             metadata: ["method": "\(message.method)"])
+
+        if message.method == ToolListChangedNotification.name,
+            let schemas = connection as? any ToolHeaderSchemaManaging
+        {
+            await schemas.clearToolHeaderSchemas()
+        }
 
         // Find notification handlers for this method
         guard let handlers = notificationHandlers[message.method] else { return }

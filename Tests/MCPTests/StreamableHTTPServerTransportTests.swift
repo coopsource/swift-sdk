@@ -84,6 +84,9 @@ private func makePerRequestHTTPPost(
     if let authorization {
         headers[HTTPHeaderName.authorization] = authorization
     }
+    if let generated = try? MCPHTTPHeaders.requestHeaders(for: body, toolPlans: [:]) {
+        headers.merge(generated) { _, new in new }
+    }
     headers.merge(extraHeaders) { _, new in new }
     return HTTPRequest(method: "POST", headers: headers, body: body, path: "/mcp")
 }
@@ -473,6 +476,95 @@ struct StreamableHTTPServerTransportTests {
         #expect(response.statusCode == 400)
         #expect(object["id"]?.stringValue == "missing-capabilities")
         #expect(object["error"]?.objectValue?["code"]?.intValue == -32602)
+
+        await server.stop()
+    }
+
+    @Test("Tool-list responses activate schema-derived header validation")
+    func schemaDerivedHeaderValidation() async throws {
+        let tool = Tool(
+            name: "weather",
+            description: nil,
+            inputSchema: .object([
+                "type": "object",
+                "properties": .object([
+                    "region": .object([
+                        "type": "string",
+                        "x-mcp-header": "Region",
+                    ])
+                ]),
+            ])
+        )
+        let transport = StreamableHTTPServerTransport(
+            validationPipeline: StandardValidationPipeline(validators: [])
+        )
+        let server = Server(
+            name: "HTTP server",
+            version: "1.0",
+            configuration: .init(protocolMode: .perRequestMetadataOnly)
+        )
+        await server.withMethodHandler(ListTools.self) { _ in
+            .init(tools: [tool])
+        }
+        await server.withMethodHandler(CallTool.self) { _ in
+            .init(content: [])
+        }
+        try await server.start(transport: transport)
+
+        func body(id: String, method: String, parameters: [String: Value]) throws -> Data {
+            var parameters = parameters
+            parameters["_meta"] = .object([
+                ProtocolMetadataKey.protocolVersion: .string(
+                    Version.perRequestMetadataVersion),
+                ProtocolMetadataKey.clientCapabilities: .object([:]),
+                ProtocolMetadataKey.clientInfo: .object([
+                    "name": "Header client",
+                    "version": "1.0",
+                ]),
+            ])
+            return try JSONEncoder().encode(Value.object([
+                "jsonrpc": "2.0",
+                "id": .string(id),
+                "method": .string(method),
+                "params": .object(parameters),
+            ]))
+        }
+
+        let listBody = try body(id: "list", method: ListTools.name, parameters: [:])
+        let listResponse = await transport.handleRequest(makePerRequestHTTPPost(body: listBody))
+        #expect(listResponse.statusCode == 200)
+
+        let callBody = try body(
+            id: "call-missing",
+            method: CallTool.name,
+            parameters: [
+                "name": "weather",
+                "arguments": .object(["region": "us-west1"]),
+            ]
+        )
+        let missing = await transport.handleRequest(makePerRequestHTTPPost(body: callBody))
+        #expect(missing.statusCode == 400)
+        #expect(try decodeResponseObject(missing)["error"]?.objectValue?["code"]?.intValue
+            == ProtocolErrorCode.headerMismatch)
+
+        let plan = try ToolHeaderPlan(tool: tool)
+        let customHeaders = try MCPHTTPHeaders.requestHeaders(
+            for: callBody,
+            toolPlans: [tool.name: plan]
+        )
+        let validBody = try body(
+            id: "call-valid",
+            method: CallTool.name,
+            parameters: [
+                "name": "weather",
+                "arguments": .object(["region": "us-west1"]),
+            ]
+        )
+        let valid = await transport.handleRequest(makePerRequestHTTPPost(
+            body: validBody,
+            extraHeaders: customHeaders
+        ))
+        #expect(valid.statusCode == 200)
 
         await server.stop()
     }
