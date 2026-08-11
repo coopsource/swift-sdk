@@ -37,10 +37,13 @@ public enum Version {
 
     static let perRequestMetadataSupported: Set<String> = [perRequestMetadataVersion]
 
-    /// Negotiates the protocol version based on the client's request and server's capabilities.
+    /// Negotiates an initialization-based protocol version from the client's request.
+    ///
+    /// Per-request-metadata versions are selected independently on each request and are not valid
+    /// results for the `initialize` method.
     /// - Parameter clientRequestedVersion: The protocol version requested by the client.
-    /// - Returns: The negotiated protocol version. If the client's requested version is supported,
-    ///            that version is returned. Otherwise, the server's latest supported version is returned.
+    /// - Returns: The requested initialization-based version when supported; otherwise the latest
+    ///            supported initialization-based version.
     static func negotiate(clientRequestedVersion: String) -> String {
         if supported.contains(clientRequestedVersion)
             && clientRequestedVersion != perRequestMetadataVersion
