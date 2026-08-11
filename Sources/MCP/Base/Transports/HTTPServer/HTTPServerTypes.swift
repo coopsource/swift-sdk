@@ -88,6 +88,12 @@ public enum HTTPResponse: Sendable {
     /// 200 OK with data body (typically JSON).
     case data(Data, headers: [String: String] = [:])
 
+    /// A data response with an explicit status code.
+    ///
+    /// Used when the HTTP binding assigns a non-200 status to a complete JSON-RPC
+    /// response whose original request id and structured error data must be retained.
+    case dataWithStatus(statusCode: Int, Data, headers: [String: String] = [:])
+
     /// 200 OK with SSE streaming body.
     case stream(AsyncThrowingStream<Data, Swift.Error>, headers: [String: String] = [:])
 
@@ -101,13 +107,15 @@ public enum HTTPResponse: Sendable {
         switch self {
         case .accepted: 202
         case .ok, .data, .stream: 200
+        case .dataWithStatus(let code, _, _): code
         case .error(let code, _, _, _): code
         }
     }
 
     public var headers: [String: String] {
         switch self {
-        case .accepted(let headers), .ok(let headers), .data(_, let headers), .stream(_, let headers):
+        case .accepted(let headers), .ok(let headers), .data(_, let headers),
+            .dataWithStatus(_, _, let headers), .stream(_, let headers):
             return headers
         case .error(_, _, let sessionID, let extraHeaders):
             var headers: [String: String] = [HTTPHeaderName.contentType: ContentType.json]
@@ -122,7 +130,7 @@ public enum HTTPResponse: Sendable {
         switch self {
         case .accepted, .ok, .stream:
             return nil
-        case .data(let data, _):
+        case .data(let data, _), .dataWithStatus(_, let data, _):
             return data
         case .error(_, let error, _, _):
             let errorBody: [String: Any] = [
@@ -154,6 +162,7 @@ public enum HTTPHeaderName {
     public static let cacheControl = "Cache-Control"
     public static let connection = "Connection"
     public static let allow = "Allow"
+    public static let xAccelBuffering = "X-Accel-Buffering"
 }
 
 // MARK: - Content Types

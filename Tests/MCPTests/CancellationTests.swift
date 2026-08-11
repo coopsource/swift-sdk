@@ -1,7 +1,82 @@
 import Foundation
+import Logging
 import Testing
 
 @testable import MCP
+
+private actor CancellationProbe {
+    private(set) var handlerRan = false
+    private(set) var cancellationSeen = false
+    func recordHandlerRan() { handlerRan = true }
+    func recordCancellationSeen() { cancellationSeen = true }
+}
+
+/// Suspends a handler-context lookup, once armed, until the test releases it.
+private actor HandlerContextGate {
+    private var isArmed = false
+    private var entered = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var isOpen = false
+
+    func arm() { isArmed = true }
+
+    func wait() async {
+        guard isArmed, !isOpen else { return }
+        entered = true
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func waitUntilEntered() async throws {
+        for _ in 0..<2000 {
+            if entered { return }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        Issue.record("Handler-context lookup never parked")
+    }
+
+    func open() {
+        isOpen = true
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+/// A transport whose HTTP-context lookup parks, reproducing the suspension that separates a
+/// request being received from its handler task being registered.
+private actor GatedContextTransport: Transport, HTTPContextProviding {
+    nonisolated let logger = Logger(label: "mcp.test.gated-context")
+    private let base: InMemoryTransport
+    private let gate: HandlerContextGate
+
+    init(base: InMemoryTransport, gate: HandlerContextGate) {
+        self.base = base
+        self.gate = gate
+    }
+
+    func connect() async throws { try await base.connect() }
+    func disconnect() async { await base.disconnect() }
+    func send(_ data: Data) async throws { try await base.send(data) }
+    func receive() -> AsyncThrowingStream<Data, Swift.Error> {
+        AsyncThrowingStream { continuation in
+            let forwarding = Task {
+                do {
+                    for try await data in await base.receive() {
+                        continuation.yield(data)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in forwarding.cancel() }
+        }
+    }
+
+    func httpRequestContext(for id: ID) async -> HTTPRequest? {
+        await gate.wait()
+        return nil
+    }
+}
 
 @Suite("Cancellation Tests")
 struct CancellationTests {
@@ -246,4 +321,56 @@ struct CancellationTests {
         await client.disconnect()
         await server.stop()
     }
+
+    @Test("A cancellation that arrives before the handler task is registered is honored")
+    func cancellationBeforeHandlerRegistration() async throws {
+        let gate = HandlerContextGate()
+        let probe = CancellationProbe()
+        let base = await InMemoryTransport.createConnectedPair()
+        let serverTransport = GatedContextTransport(base: base.server, gate: gate)
+
+        let server = Server(name: "TestServer", version: "1.0", capabilities: .init(tools: .init()))
+        await server.withMethodHandler(CallTool.self) { _ in
+            await probe.recordHandlerRan()
+            return .init(content: [.text(text: "should not run", annotations: nil, _meta: nil)])
+        }
+        try await server.start(transport: serverTransport)
+        // Registered after `start`, so it runs after the built-in cancellation handler and
+        // therefore observes the server only once that handler has recorded the cancellation.
+        await server.onNotification(CancelledNotification.self) { _ in
+            await probe.recordCancellationSeen()
+        }
+
+        let client = Client(name: "TestClient", version: "1.0")
+        _ = try await client.connect(transport: base.client)
+
+        // Arm only after connecting, so the handshake is not parked.
+        await gate.arm()
+
+        // The request parks inside the server's handler-context lookup, which runs before the
+        // handler task is registered — the window a cancellation used to fall into.
+        let context = try await client.send(CallTool.request(.init(name: "slow")))
+        try await gate.waitUntilEntered()
+
+        try await client.cancelRequest(context.requestID, reason: "cancel before dispatch")
+        for _ in 0..<2000 where !(await probe.cancellationSeen) {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(await probe.cancellationSeen)
+        await gate.open()
+
+        // The handler must never start, and the client must not receive a result.
+        try await Task.sleep(for: .milliseconds(60))
+        #expect(await probe.handlerRan == false)
+        do {
+            _ = try await context.value
+            Issue.record("Expected the cancelled request not to produce a result")
+        } catch {
+            // CancellationError from the client's own bookkeeping is the expected outcome.
+        }
+
+        await client.disconnect()
+        await server.stop()
+    }
+
 }

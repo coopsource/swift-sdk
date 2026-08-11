@@ -44,6 +44,18 @@ package protocol RequestStreamCancelling: Transport {
     func cancelRequestStream(id: ID) async
 }
 
+/// Optional transport hook for messages that belong to one request-scoped response.
+package protocol RequestScopedSending: Transport {
+    func send(_ data: Data, relatedTo requestID: ID?) async throws
+}
+
+/// Optional transport hook for bindings where closing a response cancels server work.
+package protocol RequestCancellationRegistering: Transport {
+    func setRequestCancellationHandler(
+        _ handler: (@Sendable (ID) async -> Void)?
+    ) async
+}
+
 /// Classifies the result of an HTTP per-request metadata compatibility probe.
 package enum ProtocolLifecycleProbeError: Error {
     case initializationBasedResponse
