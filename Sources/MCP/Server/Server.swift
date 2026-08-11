@@ -629,12 +629,17 @@ public actor Server {
 
     /// Send a response to a request
     public func send<M: Method>(_ response: Response<M>) async throws {
-        try await send(response, protocolLifecycle: Server.currentHandlerContext?.protocolLifecycle)
+        try await send(
+            response,
+            protocolLifecycle: Server.currentHandlerContext?.protocolLifecycle,
+            requestMethod: Server.currentHandlerContext?.method
+        )
     }
 
     private func send<M: Method>(
         _ response: Response<M>,
-        protocolLifecycle: ProtocolLifecycle?
+        protocolLifecycle: ProtocolLifecycle?,
+        requestMethod: String? = nil
     ) async throws {
         guard let connection = connection else {
             throw MCPError.internalError("Server connection not initialized")
@@ -645,6 +650,7 @@ public actor Server {
 
         let responseData: Data
         if protocolLifecycle == .perRequestMetadata {
+            let response = validatedCacheFields(in: response, requestMethod: requestMethod)
             responseData = try PerRequestMetadataWire.encodeResponse(
                 response, serverInfo: serverInfo, using: encoder)
         } else {
@@ -1157,7 +1163,10 @@ public actor Server {
             if sendResponse {
                 do {
                     try await send(
-                        response, protocolLifecycle: handlerContext.protocolLifecycle)
+                        response,
+                        protocolLifecycle: handlerContext.protocolLifecycle,
+                        requestMethod: request.method
+                    )
                     if request.method == SubscriptionsListen.name {
                         removeSubscription(request.id)
                     }
@@ -1217,7 +1226,10 @@ public actor Server {
                 }
                 do {
                     try await send(
-                        response, protocolLifecycle: handlerContext.protocolLifecycle)
+                        response,
+                        protocolLifecycle: handlerContext.protocolLifecycle,
+                        requestMethod: request.method
+                    )
                     if request.method == Initialize.name {
                         try await finishInitializationResponseSend()
                     }
@@ -1253,13 +1265,63 @@ public actor Server {
 
             if sendResponse {
                 try await send(
-                    response, protocolLifecycle: handlerContext.protocolLifecycle)
+                    response,
+                    protocolLifecycle: handlerContext.protocolLifecycle,
+                    requestMethod: request.method
+                )
                 return nil
             }
 
             return response
         }
     }
+
+    private func validatedCacheFields<M: Method>(
+        in response: Response<M>,
+        requestMethod: String?
+    ) -> Response<M> {
+        guard let requestMethod, Self.cacheableResultMethods.contains(requestMethod),
+            case .success(let result) = response.result,
+            case .object(let object) = try? Value(result)
+        else {
+            return response
+        }
+
+        let resultType = object["resultType"]?.stringValue ?? "complete"
+        if resultType == "input_required" {
+            guard object["ttlMs"] == nil, object["cacheScope"] == nil else {
+                return Response(
+                    id: response.id,
+                    error: .internalError(
+                        "input_required results must not include cache fields")
+                )
+            }
+            return response
+        }
+
+        guard resultType == "complete",
+            let ttlMs = object["ttlMs"]?.intValue,
+            ttlMs >= 0,
+            let rawScope = object["cacheScope"]?.stringValue,
+            CacheScope(rawValue: rawScope) != nil
+        else {
+            return Response(
+                id: response.id,
+                error: .internalError(
+                    "A complete \(requestMethod) result requires ttlMs >= 0 and a valid cacheScope")
+            )
+        }
+        return response
+    }
+
+    private static let cacheableResultMethods: Set<String> = [
+        Discover.name,
+        ListTools.name,
+        ListPrompts.name,
+        ListResources.name,
+        ListResourceTemplates.name,
+        ReadResource.name,
+    ]
 
     private func makeHandlerContext(for request: AnyRequest) async throws -> HandlerContext {
         let httpContext = await (connection as? any HTTPContextProviding)?

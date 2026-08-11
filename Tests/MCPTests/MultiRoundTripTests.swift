@@ -32,7 +32,8 @@ struct MultiRoundTripTests {
     func configurationCoding() throws {
         let configuration = Client.Configuration(
             protocolMode: .perRequestMetadataOnly,
-            multiRoundTripMode: .automatic(maxRounds: 4)
+            multiRoundTripMode: .automatic(maxRounds: 4),
+            responseCacheMode: .enabled(maxEntries: 24)
         )
         let decoded = try JSONDecoder().decode(
             Client.Configuration.self,

@@ -87,6 +87,57 @@ public actor Client {
         }
     }
 
+    /// Controls storage of fresh 2026-07-28 protocol responses.
+    public enum ResponseCacheMode: Hashable, Codable, Sendable {
+        /// Store at most the requested number of fresh responses.
+        case enabled(maxEntries: Int)
+
+        /// Do not read or store protocol responses.
+        case disabled
+
+        private enum CodingKeys: String, CodingKey {
+            case mode, maxEntries
+        }
+
+        private enum Mode: String, Codable {
+            case enabled, disabled
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            switch try container.decode(Mode.self, forKey: .mode) {
+            case .enabled:
+                self = .enabled(
+                    maxEntries: try container.decode(Int.self, forKey: .maxEntries))
+            case .disabled:
+                self = .disabled
+            }
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            switch self {
+            case .enabled(let maxEntries):
+                try container.encode(Mode.enabled, forKey: .mode)
+                try container.encode(maxEntries, forKey: .maxEntries)
+            case .disabled:
+                try container.encode(Mode.disabled, forKey: .mode)
+            }
+        }
+    }
+
+    /// Selects cache behavior for one request.
+    public enum ResponseCachePolicy: String, Hashable, Codable, Sendable {
+        /// Return a matching fresh response, otherwise fetch and store the new response.
+        case useIfFresh
+
+        /// Fetch a new response and replace a matching cached response.
+        case reload
+
+        /// Fetch without reading or storing a cached response.
+        case bypass
+    }
+
     /// An aggregate request passed to a manual multi-round-trip handler.
     public struct MultiRoundTripContext: Hashable, Codable, Sendable {
         public let method: String
@@ -141,23 +192,28 @@ public actor Client {
         /// Maximum number of subscription events buffered for a slow consumer.
         public var subscriptionBufferCapacity: Int
 
+        /// Storage policy for cacheable per-request-metadata responses.
+        public var responseCacheMode: ResponseCacheMode
+
         public init(
             strict: Bool = false,
             protocolMode: ProtocolMode = .initializationOnly,
             discoveryProbeTimeout: Double = 15,
             multiRoundTripMode: MultiRoundTripMode = .automatic(maxRounds: 8),
-            subscriptionBufferCapacity: Int = 32
+            subscriptionBufferCapacity: Int = 32,
+            responseCacheMode: ResponseCacheMode = .enabled(maxEntries: 512)
         ) {
             self.strict = strict
             self.protocolMode = protocolMode
             self.discoveryProbeTimeout = discoveryProbeTimeout
             self.multiRoundTripMode = multiRoundTripMode
             self.subscriptionBufferCapacity = subscriptionBufferCapacity
+            self.responseCacheMode = responseCacheMode
         }
 
         private enum CodingKeys: String, CodingKey {
             case strict, protocolMode, discoveryProbeTimeout, multiRoundTripMode
-            case subscriptionBufferCapacity
+            case subscriptionBufferCapacity, responseCacheMode
         }
 
         public init(from decoder: Decoder) throws {
@@ -183,6 +239,10 @@ public actor Client {
                     debugDescription: "Subscription buffer capacity must be positive"
                 )
             }
+            responseCacheMode =
+                try container.decodeIfPresent(
+                    ResponseCacheMode.self, forKey: .responseCacheMode)
+                ?? .disabled
         }
     }
 
@@ -488,6 +548,8 @@ public actor Client {
     private var subscriptions: [ID: ActiveClientSubscription] = [:]
     /// Distinguishes completions from an earlier transport connection.
     private var connectionGeneration = 0
+    private var responseCache = ResponseCacheStorage()
+    private var responseCacheClock: any ResponseCacheClock = ContinuousResponseCacheClock()
 
     /// A dictionary of type-erased notification handlers, keyed by method name
     private var notificationHandlers: [String: [NotificationHandlerBox]] = [:]
@@ -528,6 +590,7 @@ public actor Client {
     /// Connects to a server and reports the selected protocol lifecycle.
     @discardableResult
     public func connectWithInfo(transport: any Transport) async throws -> ConnectionInfo {
+        try validateResponseCacheConfiguration()
         let lifecycleCacheKey: String?
         let cachedProtocolLifecycle: ProtocolLifecycle?
         if configuration.protocolMode == .automatic,
@@ -540,6 +603,7 @@ public actor Client {
             cachedProtocolLifecycle = nil
         }
         connectionGeneration += 1
+        responseCache.removeAll()
         self.connection = transport
         selectedProtocolLifecycle = nil
         selectedProtocolVersion = nil
@@ -728,6 +792,7 @@ public actor Client {
         self.logicalRequestAttempts = [:]
         self.cancelledLogicalRequests = []
         self.logicalRequestCancellations = [:]
+        self.responseCache.removeAll()
 
         if let connectionToDisconnect = connectionToDisconnect as? any ToolHeaderSchemaManaging {
             await connectionToDisconnect.clearToolHeaderSchemas()
@@ -762,6 +827,20 @@ public actor Client {
         await logger?.debug("Client message loop task finished.")
 
         await logger?.debug("Client disconnect complete.")
+    }
+
+    /// Removes all cached protocol responses held by this client.
+    public func invalidateResponseCache() {
+        responseCache.removeAll()
+    }
+
+    package func setResponseCacheClock(_ clock: any ResponseCacheClock) {
+        responseCache.removeAll()
+        responseCacheClock = clock
+    }
+
+    package var responseCacheEntryCount: Int {
+        responseCache.count
     }
 
     // MARK: - Registration
@@ -944,7 +1023,15 @@ public actor Client {
     /// - Throws: MCPError if the client is not connected
     /// - SeeAlso: https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/cancellation
     public func send<M: Method>(_ request: Request<M>) throws -> RequestContext<M.Result> {
-        try send(request, logLevel: nil)
+        try send(request, logLevel: nil, cachePolicy: .useIfFresh)
+    }
+
+    /// Sends a request with explicit response-cache behavior.
+    public func send<M: Method>(
+        _ request: Request<M>,
+        cachePolicy: ResponseCachePolicy
+    ) throws -> RequestContext<M.Result> {
+        try send(request, logLevel: nil, cachePolicy: cachePolicy)
     }
 
     /// Sends a request with an optional request-scoped log level.
@@ -954,6 +1041,15 @@ public actor Client {
     public func send<M: Method>(
         _ request: Request<M>,
         logLevel: LogLevel?
+    ) throws -> RequestContext<M.Result> {
+        try send(request, logLevel: logLevel, cachePolicy: .useIfFresh)
+    }
+
+    /// Sends a request with request-scoped logging and explicit response-cache behavior.
+    public func send<M: Method>(
+        _ request: Request<M>,
+        logLevel: LogLevel?,
+        cachePolicy: ResponseCachePolicy
     ) throws -> RequestContext<M.Result> {
         guard let connection = connection else {
             throw MCPError.internalError("Client connection not initialized")
@@ -978,7 +1074,8 @@ public actor Client {
                 try await self.performLogicalRequest(
                     request,
                     connection: connection,
-                    logLevel: logLevel
+                    logLevel: logLevel,
+                    cachePolicy: cachePolicy
                 )
             }
             logicalRequestCancellations[request.id] = { @Sendable [requestTask] in
@@ -1069,8 +1166,11 @@ public actor Client {
     /// - Parameter request: The request to send
     /// - Returns: The result of the request
     /// - Throws: MCPError if the client is not connected
-    func sendAndAwait<M: Method>(_ request: Request<M>) async throws -> M.Result {
-        let context = try send(request)
+    func sendAndAwait<M: Method>(
+        _ request: Request<M>,
+        cachePolicy: ResponseCachePolicy = .useIfFresh
+    ) async throws -> M.Result {
+        let context = try send(request, cachePolicy: cachePolicy)
         return try await context.value
     }
 
@@ -1091,7 +1191,8 @@ public actor Client {
     private func performLogicalRequest<M: Method>(
         _ request: Request<M>,
         connection: any Transport,
-        logLevel: LogLevel?
+        logLevel: LogLevel?,
+        cachePolicy: ResponseCachePolicy
     ) async throws -> M.Result {
         let logicalRequestID = request.id
         var attemptID = request.id
@@ -1099,11 +1200,29 @@ public actor Client {
         var usedRequestIDs: Set<ID> = [attemptID]
         var round = 0
         var correctedToolHeaders = false
+        let responseCacheKey = try makeResponseCacheKey(for: request)
 
         defer {
             logicalRequestAttempts.removeValue(forKey: logicalRequestID)
             cancelledLogicalRequests.remove(logicalRequestID)
             logicalRequestCancellations.removeValue(forKey: logicalRequestID)
+        }
+
+        if cachePolicy == .useIfFresh,
+            logLevel == nil,
+            let responseCacheKey,
+            case .enabled = configuration.responseCacheMode
+        {
+            let authorizationContext = await responseCacheAuthorizationContext(
+                for: connection)
+            let now = await responseCacheClock.now()
+            if let cached = responseCache.value(
+                for: responseCacheKey,
+                authorizationContext: authorizationContext,
+                now: now
+            ) {
+                return try decoder.decode(M.Result.self, from: encoder.encode(cached))
+            }
         }
 
         while true {
@@ -1133,6 +1252,15 @@ public actor Client {
                     attemptData = try replacingRequestID(in: attemptData, with: attemptID)
                     continue
                 }
+                if let responseCacheKey,
+                    Self.cacheableListMethods.contains(responseCacheKey.method),
+                    responseCacheKey.parameters.objectValue?["cursor"] != nil
+                {
+                    responseCache.invalidate(
+                        method: responseCacheKey.method,
+                        connectionGeneration: connectionGeneration
+                    )
+                }
                 throw error
             }
             guard let result = value.objectValue else {
@@ -1151,12 +1279,48 @@ public actor Client {
 
             switch resultType {
             case .complete:
+                let policy = try responseCachePolicy(
+                    from: value,
+                    method: M.name,
+                    resultType: resultType
+                )
+                if let responseCacheKey, let policy {
+                    let authorizationContext = await responseCacheAuthorizationContext(
+                        for: connection)
+                    try responseCache.validateListScope(
+                        policy.cacheScope,
+                        request: responseCacheKey,
+                        result: value,
+                        authorizationContext: authorizationContext
+                    )
+                    if cachePolicy != .bypass,
+                        logLevel == nil,
+                        round == 0,
+                        case .enabled(let maximumEntries) = configuration.responseCacheMode
+                    {
+                        let now = await responseCacheClock.now()
+                        responseCache.store(
+                            value,
+                            policy: policy,
+                            for: responseCacheKey,
+                            authorizationContext: authorizationContext,
+                            now: now,
+                            maximumEntries: maximumEntries
+                        )
+                    }
+                }
                 return try decoder.decode(M.Result.self, from: encoder.encode(value))
             case .other(let value):
                 throw MCPError.invalidRequest("Unsupported resultType: \(value)")
             case .inputRequired:
                 break
             }
+
+            _ = try responseCachePolicy(
+                from: value,
+                method: M.name,
+                resultType: resultType
+            )
 
             guard M.self is any MultiRoundTripMethod.Type else {
                 throw MCPError.invalidRequest(
@@ -1264,7 +1428,7 @@ public actor Client {
             var cursor: String?
             var seenCursors: Set<String> = []
             repeat {
-                let page = try await listTools(cursor: cursor)
+                let page = try await listTools(cursor: cursor, cachePolicy: .reload)
                 cursor = page.nextCursor
                 if let cursor, !seenCursors.insert(cursor).inserted {
                     throw MCPError.invalidRequest(
@@ -1817,6 +1981,92 @@ public actor Client {
         }
     }
 
+    private func validateResponseCacheConfiguration() throws {
+        guard case .enabled(let maximumEntries) = configuration.responseCacheMode else {
+            return
+        }
+        guard (1...512).contains(maximumEntries) else {
+            throw MCPError.invalidParams(
+                "Response cache maxEntries must be between 1 and 512")
+        }
+    }
+
+    private func makeResponseCacheKey<M: Method>(
+        for request: Request<M>
+    ) throws -> ResponseCacheRequestKey? {
+        guard Self.cacheableMethods.contains(M.name) else { return nil }
+        guard case .object(let envelope) = try decoder.decode(
+            Value.self,
+            from: encoder.encode(request)
+        ) else {
+            throw MCPError.invalidRequest("Request must encode as a JSON object")
+        }
+        var parameters = envelope["params"]?.objectValue ?? [:]
+        guard parameters["inputResponses"] == nil, parameters["requestState"] == nil else {
+            return nil
+        }
+        parameters.removeValue(forKey: "_meta")
+        return ResponseCacheRequestKey(
+            connectionGeneration: connectionGeneration,
+            method: M.name,
+            parameters: .object(parameters)
+        )
+    }
+
+    private func responseCachePolicy(
+        from result: Value,
+        method: String,
+        resultType: ResultType
+    ) throws -> CachePolicy? {
+        guard Self.cacheableMethods.contains(method), let object = result.objectValue else {
+            return nil
+        }
+        if resultType == .inputRequired {
+            guard object["ttlMs"] == nil, object["cacheScope"] == nil else {
+                throw MCPError.invalidRequest(
+                    "input_required results must not include cache fields")
+            }
+            return nil
+        }
+        guard resultType == .complete else { return nil }
+        guard let ttlMs = object["ttlMs"]?.intValue else {
+            throw MCPError.invalidRequest(
+                "A complete \(method) result requires an integer ttlMs")
+        }
+        guard let rawScope = object["cacheScope"]?.stringValue,
+            let cacheScope = CacheScope(rawValue: rawScope)
+        else {
+            throw MCPError.invalidRequest(
+                "A complete \(method) result requires a valid cacheScope")
+        }
+        return CachePolicy(ttlMs: max(0, ttlMs), cacheScope: cacheScope)
+    }
+
+    private func responseCacheAuthorizationContext(
+        for connection: any Transport
+    ) async -> ResponseCacheAuthorizationContext {
+        if let provider = connection as? any ResponseCacheAuthorizationContextProviding {
+            return await provider.responseCacheAuthorizationContext()
+        }
+        return .known("")
+    }
+
+    private static let cacheableMethods: Set<String> = [
+        Discover.name,
+        ListTools.name,
+        ListPrompts.name,
+        ListResources.name,
+        ListResourceTemplates.name,
+        ReadResource.name,
+    ]
+
+    private static let cacheableListMethods: Set<String> = [
+        ListTools.name,
+        ListPrompts.name,
+        ListResources.name,
+        ListResourceTemplates.name,
+    ]
+
     private func encodeRequest<M: Method>(
         _ request: Request<M>,
         logLevel: LogLevel? = nil
@@ -1899,6 +2149,15 @@ public actor Client {
     public func listPrompts(cursor: String? = nil) async throws
         -> (prompts: [Prompt], nextCursor: String?)
     {
+        try await listPrompts(cursor: cursor, cachePolicy: .useIfFresh)
+    }
+
+    public func listPrompts(
+        cursor: String? = nil,
+        cachePolicy: ResponseCachePolicy
+    ) async throws
+        -> (prompts: [Prompt], nextCursor: String?)
+    {
         try validateServerCapability(\.prompts, "Prompts")
         let request: Request<ListPrompts>
         if let cursor = cursor {
@@ -1906,20 +2165,36 @@ public actor Client {
         } else {
             request = ListPrompts.request(.init())
         }
-        let result = try await sendAndAwait(request)
+        let result = try await sendAndAwait(request, cachePolicy: cachePolicy)
         return (prompts: result.prompts, nextCursor: result.nextCursor)
     }
 
     // MARK: - Resources
 
     public func readResource(uri: String) async throws -> [Resource.Content] {
+        try await readResource(uri: uri, cachePolicy: .useIfFresh)
+    }
+
+    public func readResource(
+        uri: String,
+        cachePolicy: ResponseCachePolicy
+    ) async throws -> [Resource.Content] {
         try validateServerCapability(\.resources, "Resources")
         let request = ReadResource.request(.init(uri: uri))
-        let result = try await sendAndAwait(request)
+        let result = try await sendAndAwait(request, cachePolicy: cachePolicy)
         return result.contents
     }
 
     public func listResources(cursor: String? = nil) async throws -> (
+        resources: [Resource], nextCursor: String?
+    ) {
+        try await listResources(cursor: cursor, cachePolicy: .useIfFresh)
+    }
+
+    public func listResources(
+        cursor: String? = nil,
+        cachePolicy: ResponseCachePolicy
+    ) async throws -> (
         resources: [Resource], nextCursor: String?
     ) {
         try validateServerCapability(\.resources, "Resources")
@@ -1929,7 +2204,7 @@ public actor Client {
         } else {
             request = ListResources.request(.init())
         }
-        let result = try await sendAndAwait(request)
+        let result = try await sendAndAwait(request, cachePolicy: cachePolicy)
         return (resources: result.resources, nextCursor: result.nextCursor)
     }
 
@@ -1946,6 +2221,15 @@ public actor Client {
     public func listResourceTemplates(cursor: String? = nil) async throws -> (
         templates: [Resource.Template], nextCursor: String?
     ) {
+        try await listResourceTemplates(cursor: cursor, cachePolicy: .useIfFresh)
+    }
+
+    public func listResourceTemplates(
+        cursor: String? = nil,
+        cachePolicy: ResponseCachePolicy
+    ) async throws -> (
+        templates: [Resource.Template], nextCursor: String?
+    ) {
         try validateServerCapability(\.resources, "Resources")
         let request: Request<ListResourceTemplates>
         if let cursor = cursor {
@@ -1953,13 +2237,22 @@ public actor Client {
         } else {
             request = ListResourceTemplates.request(.init())
         }
-        let result = try await sendAndAwait(request)
+        let result = try await sendAndAwait(request, cachePolicy: cachePolicy)
         return (templates: result.templates, nextCursor: result.nextCursor)
     }
 
     // MARK: - Tools
 
     public func listTools(cursor: String? = nil) async throws -> (
+        tools: [Tool], nextCursor: String?
+    ) {
+        try await listTools(cursor: cursor, cachePolicy: .useIfFresh)
+    }
+
+    public func listTools(
+        cursor: String? = nil,
+        cachePolicy: ResponseCachePolicy
+    ) async throws -> (
         tools: [Tool], nextCursor: String?
     ) {
         try validateServerCapability(\.tools, "Tools")
@@ -1969,7 +2262,7 @@ public actor Client {
         } else {
             request = ListTools.request(.init())
         }
-        let result = try await sendAndAwait(request)
+        let result = try await sendAndAwait(request, cachePolicy: cachePolicy)
         if selectedProtocolLifecycle == .perRequestMetadata,
             let schemas = connection as? any ToolHeaderSchemaManaging
         {
@@ -2232,6 +2525,8 @@ public actor Client {
         // A received change notification invalidates connection-scoped state even when it
         // cannot be delivered to a subscriber: a dropped, unfiltered, or unknown-subscription
         // notification still reports that the server's list changed.
+        invalidateResponseCache(for: message)
+
         if message.method == ToolListChangedNotification.name,
             let schemas = connection as? any ToolHeaderSchemaManaging
         {
@@ -2255,6 +2550,42 @@ public actor Client {
                         "error": "\(error)",
                     ])
             }
+        }
+    }
+
+    private func invalidateResponseCache(for message: AnyMessage) {
+        switch message.method {
+        case ToolListChangedNotification.name:
+            responseCache.invalidate(
+                method: ListTools.name,
+                connectionGeneration: connectionGeneration
+            )
+        case PromptListChangedNotification.name:
+            responseCache.invalidate(
+                method: ListPrompts.name,
+                connectionGeneration: connectionGeneration
+            )
+        case ResourceListChangedNotification.name:
+            responseCache.invalidate(
+                method: ListResources.name,
+                connectionGeneration: connectionGeneration
+            )
+            responseCache.invalidate(
+                method: ListResourceTemplates.name,
+                connectionGeneration: connectionGeneration
+            )
+        case ResourceUpdatedNotification.name:
+            let uri = message.params.objectValue?["uri"]?.stringValue
+            responseCache.invalidate(
+                method: ReadResource.name,
+                connectionGeneration: connectionGeneration,
+                parameters: { parameters in
+                    guard let uri else { return true }
+                    return parameters.objectValue?["uri"]?.stringValue == uri
+                }
+            )
+        default:
+            break
         }
     }
 

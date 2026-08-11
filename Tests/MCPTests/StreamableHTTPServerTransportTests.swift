@@ -535,6 +535,9 @@ struct StreamableHTTPServerTransportTests {
             version: "1.0",
             configuration: .init(protocolMode: .perRequestMetadataOnly)
         )
+        await server.withMethodHandler(ListTools.self) { _ in
+            .init(tools: [tool], ttlMs: 0, cacheScope: .public)
+        }
         await server.withMethodHandler(CallTool.self) { _ in
             .init(content: [])
         }

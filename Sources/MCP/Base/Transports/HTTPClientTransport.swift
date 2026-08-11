@@ -237,7 +237,8 @@ private struct RequestScopedSSEParser {
 /// // and deliver them through the client's notification handlers
 /// ```
 public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestStreamCancelling,
-    ProtocolLifecycleCacheKeyProviding, ToolHeaderSchemaManaging
+    ProtocolLifecycleCacheKeyProviding, ToolHeaderSchemaManaging,
+    ResponseCacheAuthorizationContextProviding
 {
     /// The server endpoint URL to connect to
     public let endpoint: URL
@@ -292,6 +293,7 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
 
     /// Active request-scoped HTTP tasks, keyed by JSON-RPC request ID.
     private var activeRequestTasks: [ID: URLSessionDataTask] = [:]
+    private var usesUntrackedAuthorization = false
 
     /// Cancellations received before the corresponding HTTP task is registered.
     private var pendingRequestCancellations: Set<ID> = []
@@ -547,6 +549,11 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
         toolHeaderPlans.removeAll()
     }
 
+    package func responseCacheAuthorizationContext() -> ResponseCacheAuthorizationContext {
+        guard !usesUntrackedAuthorization else { return .unavailable }
+        return .known(authorizer?.authorizationHeader(for: endpoint) ?? "")
+    }
+
     /// Sends data through an HTTP POST request
     public func send(_ data: Data) async throws {
         guard isConnected else {
@@ -721,6 +728,11 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
                 request.setValue(authValue, forHTTPHeaderField: HTTPHeaderName.authorization)
             }
             request = requestModifier(request)
+            if request.value(forHTTPHeaderField: HTTPHeaderName.authorization)
+                != authorizationHeader
+            {
+                usesUntrackedAuthorization = true
+            }
 
             do {
                 try await performPerRequestMetadataPOST(
