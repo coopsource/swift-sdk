@@ -852,14 +852,27 @@ public actor Client {
             logicalRequestAttempts[logicalRequestID] = attemptID
             let value = try await sendRawRequest(
                 data: attemptData, id: attemptID, connection: connection)
-            guard let resultTypeValue = value.objectValue?["resultType"]?.stringValue else {
-                throw MCPError.internalError(
-                    "Per-request metadata response is missing a string-valued resultType")
+            guard let result = value.objectValue else {
+                throw MCPError.invalidRequest("Response result must be a JSON object")
             }
-            let resultType = try decoder.decode(
-                ResultType.self, from: encoder.encode(Value.string(resultTypeValue)))
-            if resultType != .inputRequired {
+            let resultType: ResultType
+            if let resultTypeValue = result["resultType"] {
+                guard let rawResultType = resultTypeValue.stringValue else {
+                    throw MCPError.invalidRequest("Response resultType must be a string")
+                }
+                resultType = try decoder.decode(
+                    ResultType.self, from: encoder.encode(Value.string(rawResultType)))
+            } else {
+                resultType = .complete
+            }
+
+            switch resultType {
+            case .complete:
                 return try decoder.decode(M.Result.self, from: encoder.encode(value))
+            case .other(let value):
+                throw MCPError.invalidRequest("Unsupported resultType: \(value)")
+            case .inputRequired:
+                break
             }
 
             guard M.self is any MultiRoundTripMethod.Type else {
@@ -907,6 +920,10 @@ public actor Client {
                             + missingKeys.sorted().joined(separator: ", "))
                 }
             }
+            try validateInputResponses(
+                inputResponses,
+                for: inputRequired.inputRequests ?? [:]
+            )
 
             try Task.checkCancellation()
             if cancelledLogicalRequests.contains(logicalRequestID) {
@@ -989,6 +1006,35 @@ public actor Client {
                 responses[fulfilled.key] = fulfilled.value
             }
             return responses
+        }
+    }
+
+    private func validateInputResponses(
+        _ responses: [String: Value],
+        for requests: [String: Value]
+    ) throws {
+        for (key, request) in requests {
+            guard let method = request.objectValue?["method"]?.stringValue,
+                let response = responses[key]
+            else {
+                continue
+            }
+            do {
+                let data = try encoder.encode(response)
+                switch method {
+                case CreateElicitation.name:
+                    _ = try decoder.decode(CreateElicitation.Result.self, from: data)
+                case CreateSamplingMessage.name:
+                    _ = try decoder.decode(CreateSamplingMessage.Result.self, from: data)
+                case ListRoots.name:
+                    _ = try decoder.decode(ListRoots.Result.self, from: data)
+                default:
+                    continue
+                }
+            } catch {
+                throw MCPError.invalidParams(
+                    "Invalid embedded input response for \(key)")
+            }
         }
     }
 
@@ -1768,6 +1814,16 @@ public actor Client {
         await logger?.trace(
             "Processing incoming request from server",
             metadata: ["method": "\(request.method)", "id": "\(request.id)"])
+
+        if selectedProtocolLifecycle == .perRequestMetadata {
+            let response = AnyMethod.response(
+                id: request.id,
+                error: MCPError.invalidRequest(
+                    "Standalone server requests are not supported by this protocol lifecycle")
+            )
+            try? await send(response)
+            return
+        }
 
         if configuration.strict,
             selectedProtocolLifecycle == .initializationBased,

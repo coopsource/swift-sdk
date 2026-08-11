@@ -18,6 +18,14 @@ private actor MultiRoundTripState {
     }
 }
 
+private enum StandaloneRequestProbe: MCP.Method {
+    static let name = "test/standalone-server-requests"
+
+    struct Result: Hashable, Codable, Sendable {
+        let rejectedRequests: Int
+    }
+}
+
 @Suite("MCP 2026-07-28 multi-round-trip requests", .timeLimit(.minutes(1)))
 struct MultiRoundTripTests {
     @Test("Multi-round-trip configuration round-trips")
@@ -233,6 +241,173 @@ struct MultiRoundTripTests {
 
         await client.disconnect()
         await server.stop()
+    }
+
+    @Test("Manual mode validates embedded response values")
+    func manualResponseValueValidation() async throws {
+        let transports = await InMemoryTransport.createConnectedPair()
+        let server = Server(
+            name: "ManualServer",
+            version: "1.0",
+            capabilities: .init(tools: .init()),
+            configuration: .init(protocolMode: .perRequestMetadataOnly)
+        )
+        await server.withMultiRoundTripHandler(CallTool.self) { _ in
+            .inputRequired(.init(inputRequests: [
+                "roots": try Self.embeddedRequest(
+                    method: ListRoots.name,
+                    parameters: Empty()
+                )
+            ]))
+        }
+        try await server.start(transport: transports.server)
+
+        let client = Client(
+            name: "Client",
+            version: "1.0",
+            capabilities: .init(roots: .init()),
+            configuration: .init(
+                protocolMode: .perRequestMetadataOnly,
+                multiRoundTripMode: .manual
+            )
+        )
+        await client.withMultiRoundTripHandler { _ in
+            ["roots": .string("not a roots result")]
+        }
+        _ = try await client.connectWithInfo(transport: transports.client)
+
+        await #expect(throws: MCPError.self) {
+            _ = try await client.sendAndAwait(CallTool.request(.init(name: "manual")))
+        }
+
+        await client.disconnect()
+        await server.stop()
+    }
+
+    @Test("Per-request lifecycle rejects standalone server requests")
+    func standaloneServerRequests() async throws {
+        let transports = await InMemoryTransport.createConnectedPair()
+        let server = Server(
+            name: "Server",
+            version: "1.0",
+            configuration: .init(protocolMode: .perRequestMetadataOnly)
+        )
+        await server.withMethodHandler(StandaloneRequestProbe.self) { _ in
+            var rejectedRequests = 0
+            do {
+                _ = try await server.listRoots()
+            } catch {
+                rejectedRequests += 1
+            }
+            do {
+                _ = try await server.requestSampling(messages: [], maxTokens: 1)
+            } catch {
+                rejectedRequests += 1
+            }
+            do {
+                _ = try await server.requestElicitation(
+                    message: "Confirm",
+                    requestedSchema: .init()
+                )
+            } catch {
+                rejectedRequests += 1
+            }
+            return .init(rejectedRequests: rejectedRequests)
+        }
+        try await server.start(transport: transports.server)
+
+        await #expect(throws: MCPError.self) {
+            _ = try await server.listRoots()
+        }
+
+        let client = Client(
+            name: "Client",
+            version: "1.0",
+            capabilities: .init(
+                sampling: .init(),
+                elicitation: .init(),
+                roots: .init()
+            ),
+            configuration: .init(protocolMode: .perRequestMetadataOnly)
+        )
+        _ = try await client.connectWithInfo(transport: transports.client)
+        let result = try await client.sendAndAwait(StandaloneRequestProbe.request())
+        #expect(result.rejectedRequests == 3)
+
+        await client.disconnect()
+        await server.stop()
+    }
+
+    @Test("Per-request client rejects a standalone request from its peer")
+    func clientRejectsStandaloneRequest() async throws {
+        let transport = MockTransport()
+        let state = MultiRoundTripState()
+        let client = Client(
+            name: "Client",
+            version: "1.0",
+            capabilities: .init(roots: .init()),
+            configuration: .init(protocolMode: .perRequestMetadataOnly)
+        )
+        await client.withRootsHandler {
+            await state.recordCompletion("roots handler")
+            return []
+        }
+        try await connectPerRequestClient(client, transport: transport)
+        await transport.clearMessages()
+
+        try await transport.queue(request: ListRoots.request())
+        try await waitUntil { await !transport.sentData.isEmpty }
+
+        let response: AnyResponse? = await transport.decodeLastSentMessage()
+        guard case .failure(.invalidRequest) = response?.result else {
+            Issue.record("Expected a standalone-request protocol error")
+            await client.disconnect()
+            return
+        }
+        #expect(await state.completionOrder.isEmpty)
+        await client.disconnect()
+    }
+
+    @Test("Unknown result types are rejected for single and batch requests")
+    func unknownResultTypes() async throws {
+        let transport = MockTransport()
+        let client = Client(
+            name: "Client",
+            version: "1.0",
+            configuration: .init(protocolMode: .perRequestMetadataOnly)
+        )
+        try await connectPerRequestClient(client, transport: transport)
+        await transport.clearMessages()
+
+        let request = Ping.request()
+        let context = try await client.send(request)
+        try await waitUntil { await !transport.sentData.isEmpty }
+        await transport.queue(data: try JSONEncoder().encode(Value.object([
+            "jsonrpc": "2.0",
+            "id": try Value(request.id),
+            "result": .object(["resultType": "future_result"]),
+        ])))
+        await #expect(throws: MCPError.self) {
+            _ = try await context.value
+        }
+
+        await transport.clearMessages()
+        let batchRequest = Ping.request()
+        nonisolated(unsafe) var batchTask: Task<Ping.Result, Error>?
+        try await client.withBatch { batch in
+            batchTask = try await batch.addRequest(batchRequest)
+        }
+        try await waitUntil { await !transport.sentData.isEmpty }
+        await transport.queue(data: try JSONEncoder().encode(Value.array([.object([
+            "jsonrpc": "2.0",
+            "id": try Value(batchRequest.id),
+            "result": .object(["resultType": "future_result"]),
+        ])])))
+        await #expect(throws: MCPError.self) {
+            _ = try await #require(batchTask).value
+        }
+
+        await client.disconnect()
     }
 
     @Test("Server rejects embedded requests not declared by client capabilities")
@@ -459,5 +634,37 @@ struct MultiRoundTripTests {
 
     private static func decode<T: Decodable>(_ type: T.Type, from value: Value) throws -> T {
         try JSONDecoder().decode(T.self, from: JSONEncoder().encode(value))
+    }
+
+    private func connectPerRequestClient(
+        _ client: Client,
+        transport: MockTransport
+    ) async throws {
+        let connectionTask = Task {
+            try await client.connectWithInfo(transport: transport)
+        }
+        try await waitUntil { await !transport.sentData.isEmpty }
+        let request: AnyRequest? = await transport.decodeLastSentMessage()
+        let discover = try #require(request)
+        try await transport.queue(response: Discover.response(
+            id: discover.id,
+            result: .init(
+                supportedVersions: [Version.perRequestMetadataVersion],
+                capabilities: .init(),
+                ttlMs: 0,
+                cacheScope: .public
+            )
+        ))
+        _ = try await connectionTask.value
+    }
+
+    private func waitUntil(
+        _ condition: @escaping @Sendable () async -> Bool
+    ) async throws {
+        for _ in 0..<1_000 {
+            if await condition() { return }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        Issue.record("Timed out waiting for test condition")
     }
 }
