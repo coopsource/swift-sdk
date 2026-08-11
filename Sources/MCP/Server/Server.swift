@@ -98,12 +98,24 @@ public actor Server {
 
         /// Logging capabilities
         public struct Logging: Hashable, Codable, Sendable {
-            public init() {}
+            public var settings: [String: Value]
+
+            public init(settings: [String: Value] = [:]) { self.settings = settings }
+            public init(from decoder: Decoder) throws {
+                settings = try [String: Value](from: decoder)
+            }
+            public func encode(to encoder: Encoder) throws { try settings.encode(to: encoder) }
         }
 
         /// Completions capabilities
         public struct Completions: Hashable, Codable, Sendable {
-            public init() {}
+            public var settings: [String: Value]
+
+            public init(settings: [String: Value] = [:]) { self.settings = settings }
+            public init(from decoder: Decoder) throws {
+                settings = try [String: Value](from: decoder)
+            }
+            public func encode(to encoder: Encoder) throws { try settings.encode(to: encoder) }
         }
 
         /// Completions capabilities
@@ -120,6 +132,8 @@ public actor Server {
         public var experimental: [String: Value]?
         /// MCP extensions supported by the server and their settings.
         public var extensions: [String: Value]?
+        /// Additional capabilities not defined by this SDK version.
+        public var additionalCapabilities: [String: Value]
 
         public init(
             completions: Completions? = nil,
@@ -128,7 +142,8 @@ public actor Server {
             resources: Resources? = nil,
             tools: Tools? = nil,
             experimental: [String: Value]? = nil,
-            extensions: [String: Value]? = nil
+            extensions: [String: Value]? = nil,
+            additionalCapabilities: [String: Value] = [:]
         ) {
             self.completions = completions
             self.logging = logging
@@ -137,6 +152,79 @@ public actor Server {
             self.tools = tools
             self.experimental = experimental
             self.extensions = extensions
+            self.additionalCapabilities = additionalCapabilities
+        }
+
+        private enum CodingKeys: String, CodingKey, CaseIterable {
+            case completions, logging, prompts, resources, tools, experimental, extensions
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            completions = try container.decodeIfPresent(Completions.self, forKey: .completions)
+            logging = try container.decodeIfPresent(Logging.self, forKey: .logging)
+            prompts = try container.decodeIfPresent(Prompts.self, forKey: .prompts)
+            resources = try container.decodeIfPresent(Resources.self, forKey: .resources)
+            tools = try container.decodeIfPresent(Tools.self, forKey: .tools)
+            experimental = try container.decodeIfPresent([String: Value].self, forKey: .experimental)
+            extensions = try container.decodeIfPresent([String: Value].self, forKey: .extensions)
+
+            let dynamicContainer = try decoder.container(
+                keyedBy: ProtocolCapabilityCodingKey.self)
+            let known = Set(CodingKeys.allCases.map(\.stringValue))
+            additionalCapabilities = try Dictionary(uniqueKeysWithValues:
+                dynamicContainer.allKeys.compactMap { key in
+                    guard !known.contains(key.stringValue) else { return nil }
+                    return (key.stringValue, try dynamicContainer.decode(Value.self, forKey: key))
+                }
+            )
+
+            if let reason = ProtocolCapabilityValidation.invalidReason(
+                experimental: experimental,
+                extensions: extensions
+            ) {
+                throw DecodingError.dataCorrupted(
+                    .init(codingPath: decoder.codingPath, debugDescription: reason))
+            }
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            if let reason = ProtocolCapabilityValidation.invalidReason(
+                experimental: experimental,
+                extensions: extensions
+            ) {
+                throw EncodingError.invalidValue(
+                    extensions as Any,
+                    .init(codingPath: encoder.codingPath, debugDescription: reason)
+                )
+            }
+            if let collision = additionalCapabilities.keys.first(where: {
+                CodingKeys(rawValue: $0) != nil
+            }) {
+                throw EncodingError.invalidValue(
+                    additionalCapabilities,
+                    .init(
+                        codingPath: encoder.codingPath,
+                        debugDescription: "Additional capability conflicts with \(collision)"
+                    )
+                )
+            }
+
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encodeIfPresent(completions, forKey: .completions)
+            try container.encodeIfPresent(logging, forKey: .logging)
+            try container.encodeIfPresent(prompts, forKey: .prompts)
+            try container.encodeIfPresent(resources, forKey: .resources)
+            try container.encodeIfPresent(tools, forKey: .tools)
+            try container.encodeIfPresent(experimental, forKey: .experimental)
+            try container.encodeIfPresent(extensions, forKey: .extensions)
+
+            var dynamicContainer = encoder.container(keyedBy: ProtocolCapabilityCodingKey.self)
+            for (name, value) in additionalCapabilities {
+                try dynamicContainer.encode(
+                    value,
+                    forKey: ProtocolCapabilityCodingKey(stringValue: name)!)
+            }
         }
     }
 

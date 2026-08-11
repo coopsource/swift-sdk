@@ -61,6 +61,9 @@ struct Protocol20260728Tests {
     @Test("Capability extension settings retain JSON objects")
     func extensionSettings() throws {
         let capabilities = Client.Capabilities(
+            experimental: [
+                "com.example/feature": .object(["enabled": .bool(true)])
+            ],
             extensions: [
                 "io.modelcontextprotocol/ui": .object([
                     "mimeTypes": .array([.string("text/html;profile=mcp-app")])
@@ -71,6 +74,91 @@ struct Protocol20260728Tests {
         let encoded = try JSONEncoder().encode(capabilities)
         let decoded = try JSONDecoder().decode(Client.Capabilities.self, from: encoded)
         #expect(decoded == capabilities)
+    }
+
+    @Test("Capability objects preserve settings and unknown capabilities")
+    func capabilitySettings() throws {
+        let capabilities = Client.Capabilities(
+            sampling: .init(
+                tools: .init(settings: ["formats": .array([.string("json")])])
+            ),
+            elicitation: .init(
+                form: .init(settings: ["draft": .string("2020-12")])
+            ),
+            additionalCapabilities: [
+                "com.example/custom": .object(["enabled": .bool(true)])
+            ]
+        )
+
+        let data = try JSONEncoder().encode(capabilities)
+        let decoded = try JSONDecoder().decode(Client.Capabilities.self, from: data)
+
+        #expect(decoded == capabilities)
+    }
+
+    @Test("Capability maps require JSON-object values")
+    func capabilityObjectValues() throws {
+        let json = Data(
+            #"{"experimental":{"com.example/feature":"enabled"},"extensions":{"com.example/extension":true}}"#.utf8
+        )
+
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(Client.Capabilities.self, from: json)
+        }
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(Server.Capabilities.self, from: json)
+        }
+
+        let invalid = Client.Capabilities(
+            experimental: ["com.example/feature": .string("enabled")]
+        )
+        #expect(throws: EncodingError.self) {
+            try JSONEncoder().encode(invalid)
+        }
+    }
+
+    @Test("Extension identifiers require a valid prefix")
+    func extensionIdentifiers() throws {
+        let invalid = Client.Capabilities(extensions: ["unprefixed": .object([:])])
+
+        #expect(throws: EncodingError.self) {
+            try JSONEncoder().encode(invalid)
+        }
+
+        let malformed = Data(#"{"extensions":{"com..example/feature":{}}}"#.utf8)
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(Client.Capabilities.self, from: malformed)
+        }
+    }
+
+    @Test("Sampling tool results accept every JSON structured-content shape")
+    func samplingToolResultStructuredContent() throws {
+        let values: [Value] = [
+            .object(["answer": .int(42)]),
+            .array([.string("first"), .bool(true)]),
+            .string("text"),
+            .int(42),
+            .double(4.2),
+            .bool(false),
+            .null,
+        ]
+
+        for value in values {
+            let content = Sampling.Message.Content.ContentBlock.toolResult(
+                .init(
+                    toolUseId: "call-1",
+                    content: [.text("result")],
+                    structuredContent: value
+                )
+            )
+            let encoded = try JSONEncoder().encode(content)
+            let decoded = try JSONDecoder().decode(
+                Sampling.Message.Content.ContentBlock.self,
+                from: encoded
+            )
+
+            #expect(decoded == content)
+        }
     }
 
     @Test("Official resource-link fixture remains compatible")

@@ -78,12 +78,24 @@ public actor Client {
         public struct Sampling: Hashable, Sendable {
             /// Tools sub-capability for sampling
             public struct Tools: Hashable, Codable, Sendable {
-                public init() {}
+                public var settings: [String: Value]
+
+                public init(settings: [String: Value] = [:]) { self.settings = settings }
+                public init(from decoder: Decoder) throws {
+                    settings = try [String: Value](from: decoder)
+                }
+                public func encode(to encoder: Encoder) throws { try settings.encode(to: encoder) }
             }
 
             /// Context sub-capability for sampling
             public struct Context: Hashable, Codable, Sendable {
-                public init() {}
+                public var settings: [String: Value]
+
+                public init(settings: [String: Value] = [:]) { self.settings = settings }
+                public init(from decoder: Decoder) throws {
+                    settings = try [String: Value](from: decoder)
+                }
+                public func encode(to encoder: Encoder) throws { try settings.encode(to: encoder) }
             }
 
             /// Whether tools are supported in sampling
@@ -101,12 +113,24 @@ public actor Client {
         public struct Elicitation: Hashable, Sendable {
             /// Form-based elicitation sub-capability
             public struct Form: Hashable, Codable, Sendable {
-                public init() {}
+                public var settings: [String: Value]
+
+                public init(settings: [String: Value] = [:]) { self.settings = settings }
+                public init(from decoder: Decoder) throws {
+                    settings = try [String: Value](from: decoder)
+                }
+                public func encode(to encoder: Encoder) throws { try settings.encode(to: encoder) }
             }
 
             /// URL-based elicitation sub-capability
             public struct URL: Hashable, Codable, Sendable {
-                public init() {}
+                public var settings: [String: Value]
+
+                public init(settings: [String: Value] = [:]) { self.settings = settings }
+                public init(from decoder: Decoder) throws {
+                    settings = try [String: Value](from: decoder)
+                }
+                public func encode(to encoder: Encoder) throws { try settings.encode(to: encoder) }
             }
 
             /// Whether form-based elicitation is supported
@@ -124,25 +148,97 @@ public actor Client {
         public var sampling: Sampling?
         /// Whether the client supports elicitation
         public var elicitation: Elicitation?
-        /// Experimental features supported by the client
-        public var experimental: [String: String]?
+        /// Experimental features supported by the client.
+        public var experimental: [String: Value]?
         /// MCP extensions supported by the client and their settings.
         public var extensions: [String: Value]?
         /// Whether the client supports roots
         public var roots: Capabilities.Roots?
+        /// Additional capabilities not defined by this SDK version.
+        public var additionalCapabilities: [String: Value]
 
         public init(
             sampling: Sampling? = nil,
             elicitation: Elicitation? = nil,
-            experimental: [String: String]? = nil,
+            experimental: [String: Value]? = nil,
             roots: Capabilities.Roots? = nil,
-            extensions: [String: Value]? = nil
+            extensions: [String: Value]? = nil,
+            additionalCapabilities: [String: Value] = [:]
         ) {
             self.sampling = sampling
             self.elicitation = elicitation
             self.experimental = experimental
             self.roots = roots
             self.extensions = extensions
+            self.additionalCapabilities = additionalCapabilities
+        }
+
+        private enum CodingKeys: String, CodingKey, CaseIterable {
+            case sampling, elicitation, experimental, extensions, roots
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            sampling = try container.decodeIfPresent(Sampling.self, forKey: .sampling)
+            elicitation = try container.decodeIfPresent(Elicitation.self, forKey: .elicitation)
+            experimental = try container.decodeIfPresent([String: Value].self, forKey: .experimental)
+            extensions = try container.decodeIfPresent([String: Value].self, forKey: .extensions)
+            roots = try container.decodeIfPresent(Roots.self, forKey: .roots)
+
+            let dynamicContainer = try decoder.container(
+                keyedBy: ProtocolCapabilityCodingKey.self)
+            let known = Set(CodingKeys.allCases.map(\.stringValue))
+            additionalCapabilities = try Dictionary(uniqueKeysWithValues:
+                dynamicContainer.allKeys.compactMap { key in
+                    guard !known.contains(key.stringValue) else { return nil }
+                    return (key.stringValue, try dynamicContainer.decode(Value.self, forKey: key))
+                }
+            )
+
+            if let reason = ProtocolCapabilityValidation.invalidReason(
+                experimental: experimental,
+                extensions: extensions
+            ) {
+                throw DecodingError.dataCorrupted(
+                    .init(codingPath: decoder.codingPath, debugDescription: reason))
+            }
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            if let reason = ProtocolCapabilityValidation.invalidReason(
+                experimental: experimental,
+                extensions: extensions
+            ) {
+                throw EncodingError.invalidValue(
+                    extensions as Any,
+                    .init(codingPath: encoder.codingPath, debugDescription: reason)
+                )
+            }
+            if let collision = additionalCapabilities.keys.first(where: {
+                CodingKeys(rawValue: $0) != nil
+            }) {
+                throw EncodingError.invalidValue(
+                    additionalCapabilities,
+                    .init(
+                        codingPath: encoder.codingPath,
+                        debugDescription: "Additional capability conflicts with \(collision)"
+                    )
+                )
+            }
+
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encodeIfPresent(sampling, forKey: .sampling)
+            try container.encodeIfPresent(elicitation, forKey: .elicitation)
+            try container.encodeIfPresent(experimental, forKey: .experimental)
+            try container.encodeIfPresent(extensions, forKey: .extensions)
+            try container.encodeIfPresent(roots, forKey: .roots)
+
+            var dynamicContainer = encoder.container(keyedBy: ProtocolCapabilityCodingKey.self)
+            for (name, value) in additionalCapabilities {
+                try dynamicContainer.encode(
+                    value,
+                    forKey: ProtocolCapabilityCodingKey(stringValue: name)!)
+            }
         }
     }
 

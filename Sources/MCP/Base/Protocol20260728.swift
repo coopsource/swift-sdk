@@ -8,6 +8,73 @@ public enum ProtocolMetadataKey {
     public static let subscriptionID = "io.modelcontextprotocol/subscriptionId"
 }
 
+enum ProtocolExtensionIdentifier {
+    /// MCP 2026-07-28 versioning requires extension identifiers to use the
+    /// `_meta` key format with a prefix.
+    static func isValid(_ identifier: String) -> Bool {
+        let segments = identifier.split(separator: "/", omittingEmptySubsequences: false)
+        guard segments.count == 2, !segments[0].isEmpty else { return false }
+
+        let labels = segments[0].split(separator: ".", omittingEmptySubsequences: false)
+        guard labels.allSatisfy(validLabel) else { return false }
+
+        let name = segments[1]
+        guard !name.isEmpty else { return true }
+        guard let first = name.first, let last = name.last,
+            first.isLetter || first.isNumber,
+            last.isLetter || last.isNumber
+        else {
+            return false
+        }
+        return name.allSatisfy {
+            $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" || $0 == "."
+        }
+    }
+
+    private static func validLabel(_ label: Substring) -> Bool {
+        guard let first = label.first, let last = label.last,
+            first.isLetter,
+            last.isLetter || last.isNumber
+        else {
+            return false
+        }
+        return label.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" }
+    }
+}
+
+enum ProtocolCapabilityValidation {
+    static func invalidReason(
+        experimental: [String: Value]?,
+        extensions: [String: Value]?
+    ) -> String? {
+        if let name = experimental?.first(where: { $0.value.objectValue == nil })?.key {
+            return "Experimental capability settings for \(name) must be a JSON object"
+        }
+        if let name = extensions?.first(where: { $0.value.objectValue == nil })?.key {
+            return "Extension settings for \(name) must be a JSON object"
+        }
+        if let name = extensions?.keys.first(where: {
+            !ProtocolExtensionIdentifier.isValid($0)
+        }) {
+            return "Invalid MCP extension identifier: \(name)"
+        }
+        return nil
+    }
+}
+
+struct ProtocolCapabilityCodingKey: CodingKey {
+    let stringValue: String
+    let intValue: Int? = nil
+
+    init?(stringValue: String) {
+        self.stringValue = stringValue
+    }
+
+    init?(intValue: Int) {
+        return nil
+    }
+}
+
 /// The disposition of a successful MCP result.
 public enum ResultType: Hashable, Codable, Sendable {
     case complete

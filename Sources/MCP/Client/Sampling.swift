@@ -194,8 +194,10 @@ public enum Sampling {
         public let toolUseId: String
         /// Content blocks from tool execution
         public let content: [ContentBlock]
-        /// Structured data from tool execution
-        public let structuredContent: [String: Value]?
+        /// Structured data from tool execution.
+        ///
+        /// MCP 2026-07-28 permits any JSON value in this field.
+        public let structuredContent: Value?
         /// Whether the tool execution resulted in an error
         public let isError: Bool?
         /// Optional metadata
@@ -222,7 +224,7 @@ public enum Sampling {
         public init(
             toolUseId: String,
             content: [ContentBlock],
-            structuredContent: [String: Value]? = nil,
+            structuredContent: Value? = nil,
             isError: Bool? = nil,
             _meta: Metadata? = nil
         ) {
@@ -231,6 +233,23 @@ public enum Sampling {
             self.structuredContent = structuredContent
             self.isError = isError
             self._meta = _meta
+        }
+
+        /// Creates tool-result content from an object-valued structured result.
+        public init(
+            toolUseId: String,
+            content: [ContentBlock],
+            structuredContent: [String: Value],
+            isError: Bool? = nil,
+            _meta: Metadata? = nil
+        ) {
+            self.init(
+                toolUseId: toolUseId,
+                content: content,
+                structuredContent: .object(structuredContent),
+                isError: isError,
+                _meta: _meta
+            )
         }
     }
 }
@@ -289,7 +308,9 @@ extension Sampling.Message.Content.ContentBlock: Codable {
         case "tool_result":
             let toolUseId = try container.decode(String.self, forKey: .toolUseId)
             let content = try container.decode([Sampling.ToolResultContent.ContentBlock].self, forKey: .content)
-            let structuredContent = try container.decodeIfPresent([String: Value].self, forKey: .structuredContent)
+            let structuredContent = try container.contains(.structuredContent)
+                ? container.decode(Value.self, forKey: .structuredContent)
+                : nil
             let isError = try container.decodeIfPresent(Bool.self, forKey: .isError)
             let _meta = try container.decodeIfPresent(Metadata.self, forKey: ._meta)
             self = .toolResult(Sampling.ToolResultContent(
