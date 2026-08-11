@@ -595,6 +595,7 @@ public actor Server {
         guard let connection = connection else {
             throw MCPError.internalError("Server connection not initialized")
         }
+        try validateStandaloneServerRequest()
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
@@ -624,6 +625,26 @@ public actor Server {
         }
 
         return requestTask
+    }
+
+    private func validateStandaloneServerRequest() throws {
+        if Server.currentHandlerContext?.protocolLifecycle == .perRequestMetadata {
+            throw MCPError.invalidRequest(
+                "Standalone server requests are not supported by per-request metadata")
+        }
+
+        switch configuration.protocolMode {
+        case .perRequestMetadataOnly:
+            throw MCPError.invalidRequest(
+                "Standalone server requests are not supported by per-request metadata")
+        case .initializationAndPerRequestMetadata:
+            guard protocolVersion != nil else {
+                throw MCPError.invalidRequest(
+                    "Standalone server requests require an initialization-based connection")
+            }
+        case .initializationOnly:
+            break
+        }
     }
 
     /// Send a request and await its response
