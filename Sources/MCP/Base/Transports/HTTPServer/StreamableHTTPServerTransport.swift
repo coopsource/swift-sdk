@@ -175,6 +175,11 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
             )
         }
 
+        if case .request = message,
+            let metadataError = validateRequiredMetadata(body, message: message)
+        {
+            return metadataError
+        }
         if let versionError = validateProtocolVersion(request: request, message: message) {
             return versionError
         }
@@ -314,7 +319,7 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
         switch code {
         case -32601:
             return 404
-        case -32700, -32600,
+        case -32700, -32600, -32602,
             ProtocolErrorCode.headerMismatch,
             ProtocolErrorCode.missingRequiredClientCapability,
             ProtocolErrorCode.unsupportedProtocolVersion:
@@ -325,6 +330,25 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
     }
 
     // MARK: - Protocol validation
+
+    private func validateRequiredMetadata(
+        _ body: Data,
+        message: IncomingMessage
+    ) -> HTTPResponse? {
+        do {
+            let request = try JSONDecoder().decode(AnyRequest.self, from: body)
+            _ = try PerRequestMetadataWire.decodeRequestMetadata(from: request)
+            return nil
+        } catch let error as MCPError {
+            return makeErrorResponse(statusCode: 400, id: message.id, error: error)
+        } catch {
+            return makeErrorResponse(
+                statusCode: 400,
+                id: message.id,
+                error: .invalidParams("Per-request metadata is malformed")
+            )
+        }
+    }
 
     private func validateProtocolVersion(
         request: HTTPRequest,
