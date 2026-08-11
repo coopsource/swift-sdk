@@ -813,8 +813,11 @@ import Testing
             await client.disconnect()
         }
 
-        @Test("Automatic mode falls back only for unrecognized compatibility responses")
-        func automaticFallback() async throws {
+        @Test(
+            "Automatic mode falls back for unrecognized compatibility responses",
+            arguments: [400, 404, 405]
+        )
+        func automaticFallback(statusCode: Int) async throws {
             await PerRequestHTTPURLProtocol.setHandler { [endpoint] request in
                 let body = try #require(requestBody(request))
                 let envelope = try #require(
@@ -826,7 +829,7 @@ import Testing
                     return (
                         HTTPURLResponse(
                             url: endpoint,
-                            statusCode: 404,
+                            statusCode: statusCode,
                             httpVersion: "HTTP/1.1",
                             headerFields: [:]
                         )!,
@@ -880,7 +883,7 @@ import Testing
 
         @Test("Authentication and transient failures do not select initialization")
         func inconclusiveProbeFailures() async throws {
-            for statusCode in [401, 500] {
+            for statusCode in [401, 403, 408, 429, 500] {
                 await PerRequestHTTPURLProtocol.storage.reset()
                 await PerRequestHTTPURLProtocol.setHandler { [endpoint] _ in
                     (
@@ -907,18 +910,22 @@ import Testing
             }
         }
 
-        @Test("Recognized protocol errors do not select initialization")
-        func recognizedProtocolError() async throws {
+        @Test(
+            "Recognized protocol errors do not select initialization",
+            arguments: [
+                ProtocolErrorCode.headerMismatch,
+                ProtocolErrorCode.missingRequiredClientCapability,
+                ProtocolErrorCode.unsupportedProtocolVersion,
+            ]
+        )
+        func recognizedProtocolError(expectedCode: Int) async throws {
             await PerRequestHTTPURLProtocol.setHandler { [endpoint] request in
                 let body = try #require(requestBody(request))
                 let rpcRequest = try JSONDecoder().decode(AnyRequest.self, from: body)
                 let error = MCPError.remote(
-                    code: ProtocolErrorCode.unsupportedProtocolVersion,
-                    message: "Unsupported protocol version",
-                    data: try Value(UnsupportedProtocolVersionData(
-                        supported: ["2099-01-01"],
-                        requested: Version.perRequestMetadataVersion
-                    ))
+                    code: expectedCode,
+                    message: "Recognized per-request error",
+                    data: nil
                 )
                 return (
                     HTTPURLResponse(
@@ -938,9 +945,9 @@ import Testing
             )
             do {
                 _ = try await client.connectWithInfo(transport: makeTransport())
-                Issue.record("Expected unsupported protocol version")
+                Issue.record("Expected a recognized per-request error")
             } catch let error as MCPError {
-                #expect(error.code == ProtocolErrorCode.unsupportedProtocolVersion)
+                #expect(error.code == expectedCode)
             }
             await PerRequestHTTPURLProtocol.verifyCallCount(1, for: endpoint)
             await client.disconnect()
