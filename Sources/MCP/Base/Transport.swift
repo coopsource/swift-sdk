@@ -38,3 +38,14 @@ package protocol TransportProtocolVersionProviding: Transport {
 
 /// Identifies transports whose lifecycle fallback is determined by HTTP responses.
 package protocol HTTPProtocolNegotiationTransport: Transport {}
+
+/// Optional transport hook for bindings that cancel by closing a request-scoped response.
+package protocol RequestStreamCancelling: Transport {
+    func cancelRequestStream(id: ID) async
+}
+
+/// Classifies the result of an HTTP per-request metadata compatibility probe.
+package enum ProtocolLifecycleProbeError: Error {
+    case initializationBasedResponse
+    case inconclusive(MCPError)
+}

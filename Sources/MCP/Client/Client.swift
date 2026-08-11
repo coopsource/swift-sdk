@@ -499,6 +499,20 @@ public actor Client {
         selectedProtocolLifecycle = nil
         selectedProtocolVersion = nil
         initializationNotificationSent = false
+        if let transport = transport as? any ProtocolLifecycleUpdating {
+            switch configuration.protocolMode {
+            case .initializationOnly:
+                await transport.updateProtocolLifecycle(
+                    .initializationBased,
+                    protocolVersion: Version.latestInitializationVersion
+                )
+            case .automatic, .perRequestMetadataOnly:
+                await transport.updateProtocolLifecycle(
+                    .perRequestMetadata,
+                    protocolVersion: Version.perRequestMetadataVersion
+                )
+            }
+        }
         try await self.connection?.connect()
 
         await logger?.debug(
@@ -580,6 +594,10 @@ public actor Client {
                 return try await discoverConnection()
             } catch is CancellationError {
                 throw CancellationError()
+            } catch ProtocolLifecycleProbeError.initializationBasedResponse {
+                return try await initializeConnection()
+            } catch ProtocolLifecycleProbeError.inconclusive(let error) {
+                throw error
             } catch {
                 guard !isRecognizedPerRequestMetadataError(error) else { throw error }
                 guard shouldFallbackToInitialization(after: error) else { throw error }
@@ -729,7 +747,9 @@ public actor Client {
             let requestTask = Task<M.Result, Error> {
                 try await self.performLogicalRequest(request, connection: connection)
             }
-            logicalRequestCancellations[request.id] = { requestTask.cancel() }
+            logicalRequestCancellations[request.id] = { @Sendable [requestTask] in
+                requestTask.cancel()
+            }
             return RequestContext(requestID: request.id, requestTask: requestTask)
         }
 
@@ -761,9 +781,11 @@ public actor Client {
         return RequestContext(requestID: request.id, requestTask: requestTask)
     }
 
-    /// Cancel a request by sending a CancelledNotification to the server.
+    /// Cancel an active request.
     ///
-    /// According to the MCP specification, cancellation is advisory:
+    /// Per-request-metadata HTTP closes the request-scoped response. Other transports send a
+    /// `notifications/cancelled` message. According to the MCP specification, notification-based
+    /// cancellation is advisory:
     /// - The server SHOULD stop processing and free resources
     /// - The server MAY ignore the cancellation if the request is unknown, already completed,
     ///   or cannot be cancelled
@@ -792,6 +814,11 @@ public actor Client {
         // This ensures any response that arrives after cancellation is ignored
         if let pendingRequest = removePendingRequest(id: activeRequestID) {
             pendingRequest.resume(throwing: CancellationError())
+        }
+
+        if let transport = connection as? any RequestStreamCancelling {
+            await transport.cancelRequestStream(id: activeRequestID)
+            return
         }
 
         // Send cancellation notification to server
@@ -1192,6 +1219,10 @@ public actor Client {
         guard let connection = connection else {
             throw MCPError.internalError("Client connection not initialized")
         }
+        guard selectedProtocolLifecycle != .perRequestMetadata else {
+            throw MCPError.invalidRequest(
+                "JSON-RPC batches are not supported by per-request metadata transports")
+        }
 
         // Create Batch actor, passing self (Client)
         let batch = Batch(client: self)
@@ -1253,6 +1284,8 @@ public actor Client {
         selectedProtocolLifecycle = .initializationBased
         selectedProtocolVersion = Version.latestInitializationVersion
         initializationNotificationSent = false
+        await updateTransportLifecycle(
+            .initializationBased, protocolVersion: Version.latestInitializationVersion)
         let result = try await _initialize()
         await updateTransportLifecycle(
             .initializationBased, protocolVersion: result.protocolVersion)
@@ -1273,6 +1306,8 @@ public actor Client {
     ) async throws -> ConnectionInfo {
         selectedProtocolLifecycle = .perRequestMetadata
         selectedProtocolVersion = requestedVersion
+        await updateTransportLifecycle(
+            .perRequestMetadata, protocolVersion: requestedVersion)
 
         let request = Discover.request(.init())
         let context = try send(request)
