@@ -58,8 +58,18 @@ let package = Package(
             ],
             exclude: ["Fixtures"]
         ),
-        .executableTarget(
-            name: "MCPConformanceServer",
+        .testTarget(
+            name: "MCPConformanceTests",
+            dependencies: [
+                "MCP",
+                "MCPConformanceServerSupport",
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOEmbedded", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
+            ]
+        ),
+        .target(
+            name: "MCPConformanceServerSupport",
             dependencies: [
                 "MCP",
                 .product(name: "Logging", package: "swift-log"),
@@ -67,7 +77,20 @@ let package = Package(
                 .product(name: "NIOPosix", package: "swift-nio"),
                 .product(name: "NIOHTTP1", package: "swift-nio"),
             ],
-            path: "Sources/MCPConformance/Server"
+            path: "Sources/MCPConformance/Server",
+            exclude: ["main.swift"],
+            sources: ["HTTPApp.swift"]
+        ),
+        .executableTarget(
+            name: "MCPConformanceServer",
+            dependencies: [
+                "MCP",
+                "MCPConformanceServerSupport",
+                .product(name: "Logging", package: "swift-log"),
+            ],
+            path: "Sources/MCPConformance/Server",
+            exclude: ["HTTPApp.swift"],
+            sources: ["main.swift"]
         ),
         .executableTarget(
             name: "MCPConformanceClient",

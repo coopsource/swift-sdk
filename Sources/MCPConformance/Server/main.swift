@@ -10,6 +10,7 @@
 import Foundation
 import Logging
 import MCP
+import MCPConformanceServerSupport
 
 #if canImport(FoundationNetworking)
     import FoundationNetworking
@@ -19,6 +20,242 @@ import MCP
 
 private let testImageBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="
 private let testAudioBase64 = "UklGRiYAAABXQVZFZm10IBAAAAABAAEAQB8AAAB9AAACABAAZGF0YQIAAAA="
+
+private func conformanceInputRequest(
+    method: String,
+    parameters: Value = .object([:])
+) -> Value {
+    .object([
+        "method": .string(method),
+        "params": parameters,
+    ])
+}
+
+private func conformanceElicitationRequest(
+    message: String,
+    property: String,
+    type: String
+) -> Value {
+    conformanceInputRequest(
+        method: CreateElicitation.name,
+        parameters: .object([
+            "message": .string(message),
+            "requestedSchema": .object([
+                "type": .string("object"),
+                "properties": .object([
+                    property: .object(["type": .string(type)])
+                ]),
+                "required": .array([.string(property)]),
+            ]),
+        ])
+    )
+}
+
+private func conformanceSamplingRequest(_ text: String, maxTokens: Int) -> Value {
+    conformanceInputRequest(
+        method: CreateSamplingMessage.name,
+        parameters: .object([
+            "messages": .array([
+                .object([
+                    "role": .string("user"),
+                    "content": .object([
+                        "type": .string("text"),
+                        "text": .string(text),
+                    ]),
+                ])
+            ]),
+            "maxTokens": .int(maxTokens),
+        ])
+    )
+}
+
+private func completeToolResult(_ text: String) -> MultiRoundTripResult<CallTool.Result> {
+    .complete(.init(content: [.text(text: text, annotations: nil, _meta: nil)]))
+}
+
+private func conformanceMultiRoundTripTool(
+    _ parameters: CallTool.Parameters
+) throws -> MultiRoundTripResult<CallTool.Result>? {
+    switch parameters.name {
+    case "test_input_required_result_elicitation":
+        guard parameters.inputResponses?["user_name"]?.objectValue != nil else {
+            return .inputRequired(.init(inputRequests: [
+                "user_name": conformanceElicitationRequest(
+                    message: "What is your name?", property: "name", type: "string")
+            ]))
+        }
+        return completeToolResult("Hello, Alice!")
+
+    case "test_input_required_result_sampling":
+        guard parameters.inputResponses?["sample_request"]?.objectValue != nil else {
+            return .inputRequired(.init(inputRequests: [
+                "sample_request": conformanceSamplingRequest(
+                    "What is the capital of France?", maxTokens: 100)
+            ]))
+        }
+        return completeToolResult("Sampling result received")
+
+    case "test_input_required_result_list_roots":
+        guard parameters.inputResponses?["roots_request"]?.objectValue != nil else {
+            return .inputRequired(.init(inputRequests: [
+                "roots_request": conformanceInputRequest(method: ListRoots.name)
+            ]))
+        }
+        return completeToolResult("Roots received")
+
+    case "test_input_required_result_request_state":
+        let expectedState = "request-state:v1"
+        if let state = parameters.requestState, state != expectedState {
+            throw MCPError.invalidParams("requestState integrity check failed")
+        }
+        guard parameters.requestState == expectedState,
+            parameters.inputResponses?["confirm"]?.objectValue != nil
+        else {
+            return .inputRequired(.init(
+                inputRequests: [
+                    "confirm": conformanceElicitationRequest(
+                        message: "Please confirm", property: "ok", type: "boolean")
+                ],
+                requestState: expectedState
+            ))
+        }
+        return completeToolResult("state-ok: requestState validated")
+
+    case "test_input_required_result_multiple_inputs":
+        let expectedState = "multiple-inputs:v1"
+        if let state = parameters.requestState, state != expectedState {
+            throw MCPError.invalidParams("requestState integrity check failed")
+        }
+        let responses = parameters.inputResponses
+        guard parameters.requestState == expectedState,
+            responses?["user_name"]?.objectValue != nil,
+            responses?["greeting"]?.objectValue != nil,
+            responses?["client_roots"]?.objectValue != nil
+        else {
+            return .inputRequired(.init(
+                inputRequests: [
+                    "user_name": conformanceElicitationRequest(
+                        message: "What is your name?", property: "name", type: "string"),
+                    "greeting": conformanceSamplingRequest(
+                        "Generate a greeting", maxTokens: 50),
+                    "client_roots": conformanceInputRequest(method: ListRoots.name),
+                ],
+                requestState: expectedState
+            ))
+        }
+        return completeToolResult("Multiple inputs received")
+
+    case "test_input_required_result_multi_round":
+        switch parameters.requestState {
+        case nil:
+            return .inputRequired(.init(
+                inputRequests: [
+                    "step1": conformanceElicitationRequest(
+                        message: "Step 1: What is your name?",
+                        property: "name",
+                        type: "string")
+                ],
+                requestState: "multi-round:1"
+            ))
+        case "multi-round:1":
+            guard parameters.inputResponses?["step1"]?.objectValue != nil else {
+                return .inputRequired(.init(
+                    inputRequests: [
+                        "step1": conformanceElicitationRequest(
+                            message: "Step 1: What is your name?",
+                            property: "name",
+                            type: "string")
+                    ],
+                    requestState: "multi-round:1"
+                ))
+            }
+            return .inputRequired(.init(
+                inputRequests: [
+                    "step2": conformanceElicitationRequest(
+                        message: "Step 2: What is your favorite color?",
+                        property: "color",
+                        type: "string")
+                ],
+                requestState: "multi-round:2"
+            ))
+        case "multi-round:2":
+            guard parameters.inputResponses?["step2"]?.objectValue != nil else {
+                return .inputRequired(.init(
+                    inputRequests: [
+                        "step2": conformanceElicitationRequest(
+                            message: "Step 2: What is your favorite color?",
+                            property: "color",
+                            type: "string")
+                    ],
+                    requestState: "multi-round:2"
+                ))
+            }
+            return completeToolResult("Multi-round workflow complete")
+        default:
+            throw MCPError.invalidParams("requestState integrity check failed")
+        }
+
+    case "test_input_required_result_tampered_state":
+        let expectedState = "tamper-state:v1.signature"
+        if let state = parameters.requestState, state != expectedState {
+            throw MCPError.invalidParams("requestState integrity check failed")
+        }
+        guard parameters.requestState == expectedState,
+            parameters.inputResponses?["confirm"]?.objectValue != nil
+        else {
+            return .inputRequired(.init(
+                inputRequests: [
+                    "confirm": conformanceElicitationRequest(
+                        message: "Please confirm", property: "ok", type: "boolean")
+                ],
+                requestState: expectedState
+            ))
+        }
+        return completeToolResult("integrity-ok: state verified")
+
+    case "test_input_required_result_capabilities":
+        if let responses = parameters.inputResponses, !responses.isEmpty {
+            return completeToolResult("Capability inputs received")
+        }
+        let capabilities = Server.currentHandlerContext?.clientCapabilities
+        var requests: [String: Value] = [:]
+        if capabilities?.elicitation != nil {
+            requests["elicit_input"] = conformanceElicitationRequest(
+                message: "Elicitation input", property: "value", type: "string")
+        }
+        if capabilities?.sampling != nil {
+            requests["sample_input"] = conformanceSamplingRequest(
+                "Sample request", maxTokens: 50)
+        }
+        guard !requests.isEmpty else {
+            return completeToolResult("No supported capabilities declared")
+        }
+        return .inputRequired(.init(
+            inputRequests: requests,
+            requestState: "capabilities:v1"
+        ))
+
+    default:
+        return nil
+    }
+}
+
+private func conformanceMultiRoundTripPrompt(
+    _ parameters: GetPrompt.Parameters
+) -> MultiRoundTripResult<GetPrompt.Result>? {
+    guard parameters.name == "test_input_required_result_prompt" else { return nil }
+    guard parameters.inputResponses?["user_context"]?.objectValue != nil else {
+        return .inputRequired(.init(inputRequests: [
+            "user_context": conformanceElicitationRequest(
+                message: "What context should the prompt use?",
+                property: "context",
+                type: "string")
+        ]))
+    }
+    return .complete(.init(messages: [
+        .user(.text(text: "Prompt with context: test context"))
+    ]))
+}
 
 // MARK: - Server State
 
@@ -45,7 +282,14 @@ actor ServerState {
 
 // MARK: - Server Setup
 
-func createConformanceServer(state: ServerState, transport: StatefulHTTPServerTransport) async -> Server {
+func createConformanceServer(
+    state: ServerState,
+    initializationTransport: StatefulHTTPServerTransport? = nil,
+    protocolMode: Server.ProtocolMode
+) async -> Server {
+    let cachePolicy: CachePolicy? =
+        protocolMode == .initializationOnly
+        ? nil : .init(ttlMs: 0, cacheScope: .public)
     let server = Server(
         name: "mcp-conformance-test-server",
         version: "1.0.0",
@@ -55,7 +299,8 @@ func createConformanceServer(state: ServerState, transport: StatefulHTTPServerTr
             prompts: .init(listChanged: true),
             resources: .init(subscribe: true, listChanged: true),
             tools: .init(listChanged: true)
-        )
+        ),
+        configuration: .init(protocolMode: protocolMode)
     )
 
     // Tools
@@ -78,11 +323,30 @@ func createConformanceServer(state: ServerState, transport: StatefulHTTPServerTr
             Tool(name: "test_elicitation_sep1034_defaults", description: "Tests elicitation with default values (SEP-1034)", inputSchema: .object(["type": "object", "properties": [:]])),
             Tool(name: "test_elicitation_sep1330_enums", description: "Tests elicitation with enum variants (SEP-1330)", inputSchema: .object(["type": "object", "properties": [:]])),
             Tool(name: "test_client_elicitation_defaults", description: "Tests that client applies defaults for omitted elicitation fields", inputSchema: .object(["type": "object", "properties": [:]])),
+            Tool(name: "test_missing_capability", description: "Requires the sampling client capability", inputSchema: .object(["type": "object", "properties": [:]])),
+            Tool(name: "test_input_required_result_elicitation", description: "Returns an elicitation input request", inputSchema: .object(["type": "object", "properties": [:]])),
+            Tool(name: "test_input_required_result_sampling", description: "Returns a sampling input request", inputSchema: .object(["type": "object", "properties": [:]])),
+            Tool(name: "test_input_required_result_list_roots", description: "Returns a roots input request", inputSchema: .object(["type": "object", "properties": [:]])),
+            Tool(name: "test_input_required_result_request_state", description: "Round-trips opaque request state", inputSchema: .object(["type": "object", "properties": [:]])),
+            Tool(name: "test_input_required_result_multiple_inputs", description: "Returns multiple input requests", inputSchema: .object(["type": "object", "properties": [:]])),
+            Tool(name: "test_input_required_result_multi_round", description: "Runs a multi-round input workflow", inputSchema: .object(["type": "object", "properties": [:]])),
+            Tool(name: "test_input_required_result_tampered_state", description: "Rejects changed request state", inputSchema: .object(["type": "object", "properties": [:]])),
+            Tool(name: "test_input_required_result_capabilities", description: "Uses only declared client capabilities", inputSchema: .object(["type": "object", "properties": [:]])),
+            Tool(name: "test_header_validation", description: "Validates schema-derived HTTP headers", inputSchema: .object([
+                "type": "object",
+                "properties": .object([
+                    "value": .object([
+                        "type": "string",
+                        "x-mcp-header": "Value",
+                    ])
+                ]),
+            ])),
             Tool(name: "json_schema_2020_12_tool", description: "Tool with JSON Schema 2020-12 features", inputSchema: .object([
                 "$schema": .string("https://json-schema.org/draft/2020-12/schema"),
                 "type": .string("object"),
                 "$defs": .object([
                     "address": .object([
+                        "$anchor": .string("address"),
                         "type": .string("object"),
                         "properties": .object([
                             "street": .object(["type": .string("string")]),
@@ -94,12 +358,30 @@ func createConformanceServer(state: ServerState, transport: StatefulHTTPServerTr
                     "name": .object(["type": .string("string")]),
                     "address": .object(["$ref": .string("#/$defs/address")])
                 ]),
+                "allOf": .array([
+                    .object([
+                        "anyOf": .array([
+                            .object(["required": .array([.string("name")])]),
+                            .object(["required": .array([.string("address")])]),
+                        ])
+                    ])
+                ]),
+                "if": .object(["required": .array([.string("name")])]),
+                "then": .object([
+                    "properties": .object([
+                        "name": .object(["minLength": .int(1)])
+                    ])
+                ]),
+                "else": .object([
+                    "required": .array([.string("address")])
+                ]),
                 "additionalProperties": .bool(false)
             ]))
-        ])
+        ], ttlMs: cachePolicy?.ttlMs, cacheScope: cachePolicy?.cacheScope)
     }
 
-    await server.withMethodHandler(CallTool.self) { [weak server, transport] params in
+    let standardToolHandler: @Sendable (CallTool.Parameters) async throws -> CallTool.Result = {
+        [weak server, initializationTransport] params in
         switch params.name {
         case "test_simple_text":
             return .init(content: [.text(text: "This is a simple text response for testing.", annotations: nil, _meta: nil)], isError: false)
@@ -180,8 +462,11 @@ func createConformanceServer(state: ServerState, transport: StatefulHTTPServerTr
             // SEP-1699: Close the SSE stream mid-call to trigger client reconnection.
             // The client should reconnect via GET with Last-Event-ID and receive the
             // response on the new stream.
-            if let requestID = Server.currentHandlerContext?.id {
-                await transport.closeSSEStream(forRequestID: requestID.description)
+            if let requestID = Server.currentHandlerContext?.id,
+                let initializationTransport
+            {
+                await initializationTransport.closeSSEStream(
+                    forRequestID: requestID.description)
             }
             // Wait briefly for the client to reconnect before sending the response.
             try await Task.sleep(for: .milliseconds(100))
@@ -365,9 +650,32 @@ func createConformanceServer(state: ServerState, transport: StatefulHTTPServerTr
                 content: [.text(text: "Client correctly applied all default values", annotations: nil, _meta: nil)],
                 isError: false
             )
+        case "test_missing_capability":
+            guard Server.currentHandlerContext?.clientCapabilities?.sampling != nil else {
+                throw MCPError.remote(
+                    code: ProtocolErrorCode.missingRequiredClientCapability,
+                    message: "Missing required sampling client capability",
+                    data: try? Value(MissingRequiredClientCapabilityData(
+                        requiredCapabilities: .init(sampling: .init())
+                    ))
+                )
+            }
+            return .init(content: [.text(
+                text: "Sampling capability is available", annotations: nil, _meta: nil
+            )])
+        case "test_header_validation":
+            return .init(content: [.text(
+                text: "Header validation completed", annotations: nil, _meta: nil
+            )])
         default:
             return .init(content: [.text(text: "Unknown tool: \(params.name)", annotations: nil, _meta: nil)], isError: true)
         }
+    }
+    await server.withMultiRoundTripHandler(CallTool.self) { parameters in
+        if let result = try conformanceMultiRoundTripTool(parameters) {
+            return result
+        }
+        return .complete(try await standardToolHandler(parameters))
     }
 
     // Resources
@@ -376,29 +684,55 @@ func createConformanceServer(state: ServerState, transport: StatefulHTTPServerTr
             Resource(name: "Static Text Resource", uri: "test://static-text", description: "A simple static text resource", mimeType: "text/plain"),
             Resource(name: "Static Binary Resource", uri: "test://static-binary", description: "A simple static binary resource", mimeType: "application/octet-stream"),
             Resource(name: "Watched Resource", uri: "test://watched", description: "A resource that can be subscribed to for updates", mimeType: "text/plain"),
-            Resource(name: "Template Resource", uri: "test://template/{id}", description: "A resource template with URI parameters", mimeType: "text/plain"),
-        ])
+            Resource(name: "Template Resource", uri: "test://template/example", description: "A resource produced from the template", mimeType: "text/plain"),
+        ], ttlMs: cachePolicy?.ttlMs, cacheScope: cachePolicy?.cacheScope)
     }
 
     await server.withMethodHandler(ReadResource.self) { params in
+        func result(_ contents: [Resource.Content]) -> ReadResource.Result {
+            .init(
+                contents: contents,
+                ttlMs: cachePolicy?.ttlMs,
+                cacheScope: cachePolicy?.cacheScope
+            )
+        }
         switch params.uri {
         case "test://static-text":
-            return .init(contents: [.text("This is static text content for testing.", uri: params.uri, mimeType: "text/plain")])
+            return result([.text("This is static text content for testing.", uri: params.uri, mimeType: "text/plain")])
         case "test://static-binary":
             guard let imageData = Data(base64Encoded: testImageBase64) else {
-                return .init(contents: [.text("Failed to decode binary data", uri: params.uri)])
+                return result([.text("Failed to decode binary data", uri: params.uri)])
             }
-            return .init(contents: [.binary(imageData, uri: params.uri, mimeType: "application/octet-stream")])
+            return result([.binary(imageData, uri: params.uri, mimeType: "application/octet-stream")])
         case "test://watched":
             let content = await state.watchedResourceContent
-            return .init(contents: [.text(content, uri: params.uri)])
+            return result([.text(content, uri: params.uri)])
         default:
             if params.uri.hasPrefix("test://template/") {
                 let id = String(params.uri.dropFirst("test://template/".count))
-                return .init(contents: [.text("Template resource with id: \(id)", uri: params.uri)])
+                return result([.text("Template resource with id: \(id)", uri: params.uri)])
             }
-            return .init(contents: [.text("Resource not found: \(params.uri)", uri: params.uri)])
+            throw MCPError.remote(
+                code: -32602,
+                message: "Resource not found: \(params.uri)",
+                data: .object(["uri": .string(params.uri)])
+            )
         }
+    }
+
+    await server.withMethodHandler(ListResourceTemplates.self) { _ in
+        .init(
+            templates: [
+                .init(
+                    uriTemplate: "test://template/{id}",
+                    name: "Template Resource",
+                    description: "A resource template with URI parameters",
+                    mimeType: "text/plain"
+                )
+            ],
+            ttlMs: cachePolicy?.ttlMs,
+            cacheScope: cachePolicy?.cacheScope
+        )
     }
 
     await server.withMethodHandler(ResourceSubscribe.self) { params in
@@ -418,10 +752,12 @@ func createConformanceServer(state: ServerState, transport: StatefulHTTPServerTr
             Prompt(name: "test_prompt_with_arguments", description: "A prompt that accepts arguments", arguments: [Prompt.Argument(name: "arg1", description: "First test argument", required: true), Prompt.Argument(name: "arg2", description: "Second test argument", required: true)]),
             Prompt(name: "test_prompt_with_embedded_resource", description: "A prompt that includes embedded resources", arguments: [Prompt.Argument(name: "resourceUri", description: "URI of the resource to embed", required: true)]),
             Prompt(name: "test_prompt_with_image", description: "A prompt with image content"),
-        ])
+            Prompt(name: "test_input_required_result_prompt", description: "Returns an elicitation input request"),
+        ], ttlMs: cachePolicy?.ttlMs, cacheScope: cachePolicy?.cacheScope)
     }
 
-    await server.withMethodHandler(GetPrompt.self) { params in
+    let standardPromptHandler: @Sendable (GetPrompt.Parameters) async throws -> GetPrompt.Result = {
+        params in
         switch params.name {
         case "test_simple_prompt":
             return .init(description: "Simple prompt response", messages: [.user(.text(text: "This is a simple prompt for testing."))])
@@ -443,6 +779,12 @@ func createConformanceServer(state: ServerState, transport: StatefulHTTPServerTr
         default:
             throw MCPError.invalidRequest("Unknown prompt: \(params.name)")
         }
+    }
+    await server.withMultiRoundTripHandler(GetPrompt.self) { parameters in
+        if let result = conformanceMultiRoundTripPrompt(parameters) {
+            return result
+        }
+        return .complete(try await standardPromptHandler(parameters))
     }
 
     await server.withMethodHandler(SetLoggingLevel.self) { _ in
@@ -502,10 +844,43 @@ struct MCPHTTPServer {
             ]),
             serverFactory: { sessionID, transport in
                 logger.debug("Creating server for session", metadata: ["sessionID": "\(sessionID)"])
-                return await createConformanceServer(state: state, transport: transport)
+                return await createConformanceServer(
+                    state: state,
+                    initializationTransport: transport,
+                    protocolMode: .initializationOnly
+                )
             },
             logger: logger
         )
+
+        let perRequestMetadataTransport = StreamableHTTPServerTransport(
+            validationPipeline: StandardValidationPipeline(validators: [
+                OriginValidator.localhost(port: port),
+                AcceptHeaderValidator(mode: .sseRequired),
+                ContentTypeValidator(),
+            ]),
+            logger: logger
+        )
+        let perRequestMetadataServer = await createConformanceServer(
+            state: state,
+            protocolMode: .perRequestMetadataOnly
+        )
+        try await perRequestMetadataServer.start(transport: perRequestMetadataTransport)
+
+        let lifecycleRouter = LifecycleHTTPServerRouter(
+            protocolMode: .initializationAndPerRequestMetadata,
+            perRequestMetadataTransport: perRequestMetadataTransport,
+            initializationBasedRequestHandler: { [weak app] request in
+                guard let app else {
+                    return .error(
+                        statusCode: 503,
+                        .internalError("Conformance server is unavailable")
+                    )
+                }
+                return await app.handleInitializationBasedHTTPRequest(request)
+            }
+        )
+        await app.installLifecycleRouter(lifecycleRouter)
 
         try await app.start()
     }
