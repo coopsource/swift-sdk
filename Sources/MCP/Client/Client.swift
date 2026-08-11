@@ -126,6 +126,8 @@ public actor Client {
         public var elicitation: Elicitation?
         /// Experimental features supported by the client
         public var experimental: [String: String]?
+        /// MCP extensions supported by the client and their settings.
+        public var extensions: [String: Value]?
         /// Whether the client supports roots
         public var roots: Capabilities.Roots?
 
@@ -133,12 +135,14 @@ public actor Client {
             sampling: Sampling? = nil,
             elicitation: Elicitation? = nil,
             experimental: [String: String]? = nil,
-            roots: Capabilities.Roots? = nil
+            roots: Capabilities.Roots? = nil,
+            extensions: [String: Value]? = nil
         ) {
             self.sampling = sampling
             self.elicitation = elicitation
             self.experimental = experimental
             self.roots = roots
+            self.extensions = extensions
         }
     }
 

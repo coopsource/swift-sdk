@@ -137,7 +137,12 @@ public struct Prompt: Hashable, Codable, Sendable {
             /// Embedded resource content (EmbeddedResource from spec)
             case resource(resource: Resource.Content, annotations: Resource.Annotations? = nil, _meta: Metadata? = nil)
             /// Resource link
-            case resourceLink(uri: String, name: String, title: String? = nil, description: String? = nil, mimeType: String? = nil, annotations: Resource.Annotations? = nil)
+            case resourceLink(
+                uri: String, name: String, title: String? = nil,
+                description: String? = nil, mimeType: String? = nil,
+                annotations: Resource.Annotations? = nil, size: Int? = nil,
+                icons: [Icon]? = nil, _meta: Metadata? = nil
+            )
         }
     }
 
@@ -178,7 +183,7 @@ public struct Prompt: Hashable, Codable, Sendable {
 extension Prompt.Message.Content: Codable {
     private enum CodingKeys: String, CodingKey {
         case type, text, data, mimeType, resource, annotations, _meta
-        case uri, name, title, description
+        case uri, name, title, description, size, icons
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -201,7 +206,9 @@ extension Prompt.Message.Content: Codable {
             try container.encode(resourceContent, forKey: .resource)
             try container.encodeIfPresent(annotations, forKey: .annotations)
             try container.encodeIfPresent(_meta, forKey: ._meta)
-        case .resourceLink(let uri, let name, let title, let description, let mimeType, let annotations):
+        case .resourceLink(
+            let uri, let name, let title, let description, let mimeType, let annotations,
+            let size, let icons, let _meta):
             try container.encode("resource_link", forKey: .type)
             try container.encode(uri, forKey: .uri)
             try container.encode(name, forKey: .name)
@@ -209,6 +216,9 @@ extension Prompt.Message.Content: Codable {
             try container.encodeIfPresent(description, forKey: .description)
             try container.encodeIfPresent(mimeType, forKey: .mimeType)
             try container.encodeIfPresent(annotations, forKey: .annotations)
+            try container.encodeIfPresent(size, forKey: .size)
+            try container.encodeIfPresent(icons, forKey: .icons)
+            try container.encodeIfPresent(_meta, forKey: ._meta)
         }
     }
 
@@ -240,7 +250,13 @@ extension Prompt.Message.Content: Codable {
             let description = try container.decodeIfPresent(String.self, forKey: .description)
             let mimeType = try container.decodeIfPresent(String.self, forKey: .mimeType)
             let annotations = try container.decodeIfPresent(Resource.Annotations.self, forKey: .annotations)
-            self = .resourceLink(uri: uri, name: name, title: title, description: description, mimeType: mimeType, annotations: annotations)
+            let size = try container.decodeIfPresent(Int.self, forKey: .size)
+            let icons = try container.decodeIfPresent([Icon].self, forKey: .icons)
+            let _meta = try container.decodeIfPresent(Metadata.self, forKey: ._meta)
+            self = .resourceLink(
+                uri: uri, name: name, title: title, description: description,
+                mimeType: mimeType, annotations: annotations, size: size, icons: icons,
+                _meta: _meta)
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .type,

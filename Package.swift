@@ -55,7 +55,8 @@ let package = Package(
                 .product(
                     name: "EventSource", package: "eventsource",
                     condition: .when(platforms: [.macOS, .iOS, .tvOS, .visionOS, .watchOS, .macCatalyst])),
-            ]
+            ],
+            exclude: ["Fixtures"]
         ),
         .executableTarget(
             name: "MCPConformanceServer",

@@ -319,7 +319,8 @@ struct ToolTests {
 
         let decoded = try decoder.decode(Tool.Content.self, from: data)
         if case .resourceLink(
-            let uri, let name, let title, let description, let mimeType, let annotations
+            let uri, let name, let title, let description, let mimeType, let annotations,
+            let size, let icons, let metadata
         ) = decoded {
             #expect(uri == "file://resource.txt")
             #expect(name == "resource_name")
@@ -327,6 +328,9 @@ struct ToolTests {
             #expect(description == "Resource description")
             #expect(mimeType == "text/plain")
             #expect(annotations == nil)
+            #expect(size == nil)
+            #expect(icons == nil)
+            #expect(metadata == nil)
         } else {
             #expect(Bool(false), "Expected resourceLink content")
         }

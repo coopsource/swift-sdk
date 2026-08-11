@@ -44,6 +44,7 @@ let package = Package(
             dependencies: targetDependencies),
         .testTarget(
             name: "MCPTests",
-            dependencies: ["MCP"] + targetDependencies),
+            dependencies: ["MCP"] + targetDependencies,
+            exclude: ["Fixtures"]),
     ]
 )

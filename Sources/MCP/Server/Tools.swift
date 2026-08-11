@@ -125,7 +125,10 @@ public struct Tool: Hashable, Codable, Sendable {
         case resourceLink(
             uri: String, name: String, title: String? = nil, description: String? = nil,
             mimeType: String? = nil,
-            annotations: Resource.Annotations? = nil
+            annotations: Resource.Annotations? = nil,
+            size: Int? = nil,
+            icons: [Icon]? = nil,
+            _meta: Metadata? = nil
         )
 
         /// Deprecated compatibility factory for older call sites that used `.text("...")` and `.text("...", metadata: ...)`.
@@ -178,6 +181,8 @@ public struct Tool: Hashable, Codable, Sendable {
             case annotations
             case mimeType
             case data
+            case size
+            case icons
             case _meta
         }
 
@@ -216,9 +221,13 @@ public struct Tool: Hashable, Codable, Sendable {
                 let mimeType = try container.decodeIfPresent(String.self, forKey: .mimeType)
                 let annotations = try container.decodeIfPresent(
                     Resource.Annotations.self, forKey: .annotations)
+                let size = try container.decodeIfPresent(Int.self, forKey: .size)
+                let icons = try container.decodeIfPresent([Icon].self, forKey: .icons)
+                let _meta = try container.decodeIfPresent(Metadata.self, forKey: ._meta)
                 self = .resourceLink(
                     uri: uri, name: name, title: title, description: description,
-                    mimeType: mimeType, annotations: annotations)
+                    mimeType: mimeType, annotations: annotations, size: size, icons: icons,
+                    _meta: _meta)
             default:
                 throw DecodingError.dataCorruptedError(
                     forKey: .type, in: container, debugDescription: "Unknown tool content type")
@@ -252,7 +261,8 @@ public struct Tool: Hashable, Codable, Sendable {
                 try container.encodeIfPresent(annotations, forKey: .annotations)
                 try container.encodeIfPresent(_meta, forKey: ._meta)
             case .resourceLink(
-                let uri, let name, let title, let description, let mimeType, let annotations):
+                let uri, let name, let title, let description, let mimeType, let annotations,
+                let size, let icons, let _meta):
                 try container.encode("resource_link", forKey: .type)
                 try container.encode(uri, forKey: .uri)
                 try container.encode(name, forKey: .name)
@@ -260,6 +270,9 @@ public struct Tool: Hashable, Codable, Sendable {
                 try container.encodeIfPresent(description, forKey: .description)
                 try container.encodeIfPresent(mimeType, forKey: .mimeType)
                 try container.encodeIfPresent(annotations, forKey: .annotations)
+                try container.encodeIfPresent(size, forKey: .size)
+                try container.encodeIfPresent(icons, forKey: .icons)
+                try container.encodeIfPresent(_meta, forKey: ._meta)
             }
         }
     }

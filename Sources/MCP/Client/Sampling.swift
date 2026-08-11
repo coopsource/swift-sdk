@@ -212,7 +212,11 @@ public enum Sampling {
             /// Embedded resource content
             case resource(resource: Resource.Content, annotations: Resource.Annotations?, _meta: Metadata?)
             /// Resource link
-            case resourceLink(uri: String, name: String, title: String?, description: String?, mimeType: String?, annotations: Resource.Annotations?)
+            case resourceLink(
+                uri: String, name: String, title: String?, description: String?,
+                mimeType: String?, annotations: Resource.Annotations?, size: Int? = nil,
+                icons: [Icon]? = nil, _meta: Metadata? = nil
+            )
         }
 
         public init(
@@ -381,7 +385,7 @@ extension Sampling.Message.Content: ExpressibleByStringInterpolation {
 extension Sampling.ToolResultContent.ContentBlock: Codable {
     private enum CodingKeys: String, CodingKey {
         case type, text, data, mimeType, resource, annotations, _meta
-        case uri, name, title, description
+        case uri, name, title, description, size, icons
     }
 
     public init(from decoder: Decoder) throws {
@@ -412,9 +416,13 @@ extension Sampling.ToolResultContent.ContentBlock: Codable {
             let description = try container.decodeIfPresent(String.self, forKey: .description)
             let mimeType = try container.decodeIfPresent(String.self, forKey: .mimeType)
             let annotations = try container.decodeIfPresent(Resource.Annotations.self, forKey: .annotations)
+            let size = try container.decodeIfPresent(Int.self, forKey: .size)
+            let icons = try container.decodeIfPresent([Icon].self, forKey: .icons)
+            let _meta = try container.decodeIfPresent(Metadata.self, forKey: ._meta)
             self = .resourceLink(
                 uri: uri, name: name, title: title, description: description,
-                mimeType: mimeType, annotations: annotations)
+                mimeType: mimeType, annotations: annotations, size: size, icons: icons,
+                _meta: _meta)
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .type, in: container,
@@ -442,7 +450,9 @@ extension Sampling.ToolResultContent.ContentBlock: Codable {
             try container.encode(resourceContent, forKey: .resource)
             try container.encodeIfPresent(annotations, forKey: .annotations)
             try container.encodeIfPresent(_meta, forKey: ._meta)
-        case .resourceLink(let uri, let name, let title, let description, let mimeType, let annotations):
+        case .resourceLink(
+            let uri, let name, let title, let description, let mimeType, let annotations,
+            let size, let icons, let _meta):
             try container.encode("resource_link", forKey: .type)
             try container.encode(uri, forKey: .uri)
             try container.encode(name, forKey: .name)
@@ -450,6 +460,9 @@ extension Sampling.ToolResultContent.ContentBlock: Codable {
             try container.encodeIfPresent(description, forKey: .description)
             try container.encodeIfPresent(mimeType, forKey: .mimeType)
             try container.encodeIfPresent(annotations, forKey: .annotations)
+            try container.encodeIfPresent(size, forKey: .size)
+            try container.encodeIfPresent(icons, forKey: .icons)
+            try container.encodeIfPresent(_meta, forKey: ._meta)
         }
     }
 }

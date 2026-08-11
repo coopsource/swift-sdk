@@ -37,6 +37,9 @@ public enum MCPError: Swift.Error, Sendable {
     // Server errors (-32000 to -32099)
     case serverError(code: Int, message: String)
 
+    /// A remote JSON-RPC error whose structured data must be preserved.
+    case remote(code: Int, message: String, data: Value?)
+
     // MCP specific errors
     case urlElicitationRequired(message: String, elicitations: [URLElicitationInfo])  // -32042
 
@@ -53,6 +56,7 @@ public enum MCPError: Swift.Error, Sendable {
         case .invalidParams: return -32602
         case .internalError: return -32603
         case .serverError(let code, _): return code
+        case .remote(let code, _, _): return code
         case .urlElicitationRequired: return -32042
         case .connectionClosed: return -32000
         case .transportError: return -32001
@@ -91,6 +95,8 @@ extension MCPError: LocalizedError {
             return "Internal error" + (detail.map { ": \($0)" } ?? "")
         case .serverError(_, let message):
             return "Server error: \(message)"
+        case .remote(_, let message, _):
+            return message
         case .urlElicitationRequired(let message, _):
             return "URL elicitation required: \(message)"
         case .connectionClosed:
@@ -114,6 +120,8 @@ extension MCPError: LocalizedError {
             return "Internal JSON-RPC error"
         case .serverError:
             return "Server-defined error occurred"
+        case .remote:
+            return "The remote endpoint returned a protocol error"
         case .urlElicitationRequired:
             return "The server requires user authentication or input via external URL"
         case .connectionClosed:
@@ -187,6 +195,9 @@ extension MCPError: Codable {
             // No additional data for server errors
             try container.encode(errorDescription ?? "Unknown error", forKey: .message)
             break
+        case .remote(_, let message, let data):
+            try container.encode(message, forKey: .message)
+            try container.encodeIfPresent(data, forKey: .data)
         case .urlElicitationRequired(let message, let elicitations):
             // Encode the raw message so decode can round-trip without prefix doubling
             try container.encode(message, forKey: .message)
@@ -218,11 +229,12 @@ extension MCPError: Codable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let code = try container.decode(Int.self, forKey: .code)
         let message = try container.decode(String.self, forKey: .message)
-        let data = try container.decodeIfPresent([String: Value].self, forKey: .data)
+        let data = try container.decodeIfPresent(Value.self, forKey: .data)
+        let dataObject = data?.objectValue
 
         // Helper to extract detail from data, falling back to message if needed
         let unwrapDetail: (String?) -> String? = { fallback in
-            guard let detailValue = data?["detail"] else { return fallback }
+            guard let detailValue = dataObject?["detail"] else { return fallback }
             if case .string(let str) = detailValue { return str }
             return fallback
         }
@@ -241,7 +253,7 @@ extension MCPError: Codable {
         case -32042:
             // Extract elicitations array from data
             var elicitations: [URLElicitationInfo] = []
-            if case .array(let items) = data?["elicitations"] {
+            if case .array(let items) = dataObject?["elicitations"] {
                 for item in items {
                     if case .object(let dict) = item,
                        case .string(let mode) = dict["mode"],
@@ -262,7 +274,7 @@ extension MCPError: Codable {
         case -32001:
             // Extract underlying error string if present
             let underlyingErrorString =
-                data?["error"].flatMap { val -> String? in
+                dataObject?["error"].flatMap { val -> String? in
                     if case .string(let str) = val { return str }
                     return nil
                 } ?? message
@@ -273,8 +285,16 @@ extension MCPError: Codable {
                     userInfo: [NSLocalizedDescriptionKey: underlyingErrorString]
                 )
             )
+        case ProtocolErrorCode.headerMismatch,
+            ProtocolErrorCode.missingRequiredClientCapability,
+            ProtocolErrorCode.unsupportedProtocolVersion:
+            self = .remote(code: code, message: message, data: data)
         default:
-            self = .serverError(code: code, message: message)
+            if data != nil {
+                self = .remote(code: code, message: message, data: data)
+            } else {
+                self = .serverError(code: code, message: message)
+            }
         }
     }
 }
@@ -291,6 +311,8 @@ extension MCPError: Equatable {
         case (.internalError(let a), .internalError(let b)): return a == b
         case (.serverError(let c1, let m1), .serverError(let c2, let m2)):
             return c1 == c2 && m1 == m2
+        case (.remote(let c1, let m1, let d1), .remote(let c2, let m2, let d2)):
+            return c1 == c2 && m1 == m2 && d1 == d2
         case (.urlElicitationRequired(let m1, let e1), .urlElicitationRequired(let m2, let e2)):
             return m1 == m2 && e1 == e2
         case (.connectionClosed, .connectionClosed): return true
@@ -319,6 +341,9 @@ extension MCPError: Hashable {
             hasher.combine(detail)
         case .serverError(_, let message):
             hasher.combine(message)
+        case .remote(_, let message, let data):
+            hasher.combine(message)
+            hasher.combine(data)
         case .urlElicitationRequired(let message, let elicitations):
             hasher.combine(message)
             hasher.combine(elicitations)
