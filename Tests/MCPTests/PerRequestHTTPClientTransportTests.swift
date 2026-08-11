@@ -954,6 +954,112 @@ import Testing
             await transport.disconnect()
         }
 
+        @Test("Response cache authorization follows the final HTTP attempt")
+        func responseCacheAttemptAuthorization() async throws {
+            let authorizer = SingleRetryAuthorizer()
+            let transport = makeTransport(authorizer: authorizer)
+            await transport.updateProtocolLifecycle(
+                .perRequestMetadata,
+                protocolVersion: Version.perRequestMetadataVersion
+            )
+            try await transport.connect()
+            await PerRequestHTTPURLProtocol.setHandler { [endpoint] request in
+                if request.value(forHTTPHeaderField: HTTPHeaderName.authorization)
+                    == "Bearer stale-token"
+                {
+                    return (
+                        HTTPURLResponse(
+                            url: endpoint,
+                            statusCode: 401,
+                            httpVersion: "HTTP/1.1",
+                            headerFields: ["WWW-Authenticate": "Bearer"]
+                        )!,
+                        Data()
+                    )
+                }
+                return (
+                    HTTPURLResponse(
+                        url: endpoint,
+                        statusCode: 200,
+                        httpVersion: "HTTP/1.1",
+                        headerFields: ["Content-Type": ContentType.json]
+                    )!,
+                    Data(#"{"jsonrpc":"2.0","id":18,"result":{}}"#.utf8)
+                )
+            }
+
+            try await transport.send(makePerRequestData(id: 18))
+            #expect(
+                await transport.takeResponseCacheAuthorizationContext(for: .number(18))
+                    == .known("Bearer fresh-token")
+            )
+            await transport.disconnect()
+
+            let modified = makeTransport { request in
+                var request = request
+                request.setValue(
+                    "Bearer injected-token",
+                    forHTTPHeaderField: HTTPHeaderName.authorization
+                )
+                return request
+            }
+            await modified.updateProtocolLifecycle(
+                .perRequestMetadata,
+                protocolVersion: Version.perRequestMetadataVersion
+            )
+            try await modified.connect()
+            await PerRequestHTTPURLProtocol.setHandler { [endpoint] _ in
+                (
+                    HTTPURLResponse(
+                        url: endpoint,
+                        statusCode: 200,
+                        httpVersion: "HTTP/1.1",
+                        headerFields: ["Content-Type": ContentType.json]
+                    )!,
+                    Data(#"{"jsonrpc":"2.0","id":19,"result":{}}"#.utf8)
+                )
+            }
+            try await modified.send(makePerRequestData(id: 19))
+            #expect(
+                await modified.takeResponseCacheAuthorizationContext(for: .number(19))
+                    == .unavailable
+            )
+            await modified.disconnect()
+
+            let cancelled = makeTransport(authorizer: SingleRetryAuthorizer())
+            await cancelled.updateProtocolLifecycle(
+                .perRequestMetadata,
+                protocolVersion: Version.perRequestMetadataVersion
+            )
+            try await cancelled.connect()
+            await PerRequestHTTPURLProtocol.storage.reset()
+            await PerRequestHTTPURLProtocol.storage.setHandler { [endpoint] _ in
+                try await Task.sleep(for: .milliseconds(200))
+                return StreamingHTTPScript(
+                    response: HTTPURLResponse(
+                        url: endpoint,
+                        statusCode: 200,
+                        httpVersion: "HTTP/1.1",
+                        headerFields: ["Content-Type": ContentType.json]
+                    )!,
+                    events: [.finish(delayMilliseconds: 0)]
+                )
+            }
+            let send = Task { try await cancelled.send(makePerRequestData(id: 20)) }
+            while await PerRequestHTTPURLProtocol.storage.requestCount == 0 {
+                await Task.yield()
+            }
+            send.cancel()
+            await #expect(throws: CancellationError.self) {
+                try await send.value
+            }
+            #expect(
+                await cancelled.takeResponseCacheAuthorizationContext(for: .number(20))
+                    == .unavailable
+            )
+            await cancelled.disconnect()
+        }
+
         @Test("Automatic mode selects per-request metadata without opening a GET")
         func automaticSelection() async throws {
             await PerRequestHTTPURLProtocol.setHandler { [endpoint] request in

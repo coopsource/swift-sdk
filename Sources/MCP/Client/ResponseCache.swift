@@ -1,3 +1,6 @@
+import struct Foundation.Data
+import class Foundation.JSONDecoder
+
 package protocol ResponseCacheClock: Sendable {
     func now() async -> Duration
 }
@@ -19,6 +22,26 @@ package struct ResponseCacheRequestKey: Hashable, Sendable {
     let connectionGeneration: Int
     let method: String
     let parameters: Value
+
+    package init(
+        data: Data,
+        method: String,
+        connectionGeneration: Int
+    ) throws {
+        guard case .object(let envelope) = try JSONDecoder().decode(Value.self, from: data) else {
+            throw MCPError.invalidRequest("Request must encode as a JSON object")
+        }
+        var parameters = envelope["params"]?.objectValue ?? [:]
+        if var metadata = parameters["_meta"]?.objectValue {
+            metadata.removeValue(forKey: ProtocolMetadataKey.clientInfo)
+            metadata.removeValue(forKey: ProtocolMetadataKey.logLevel)
+            metadata.removeValue(forKey: "progressToken")
+            parameters["_meta"] = .object(metadata)
+        }
+        self.connectionGeneration = connectionGeneration
+        self.method = method
+        self.parameters = .object(parameters)
+    }
 }
 
 private enum ResponseCachePartition: Hashable {

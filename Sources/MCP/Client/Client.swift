@@ -1200,7 +1200,10 @@ public actor Client {
         var usedRequestIDs: Set<ID> = [attemptID]
         var round = 0
         var correctedToolHeaders = false
-        let responseCacheKey = try makeResponseCacheKey(for: request)
+        let responseCacheKey = try makeResponseCacheKey(
+            from: attemptData,
+            method: M.name
+        )
 
         defer {
             logicalRequestAttempts.removeValue(forKey: logicalRequestID)
@@ -1233,10 +1236,19 @@ public actor Client {
 
             logicalRequestAttempts[logicalRequestID] = attemptID
             let value: Value
+            let responseAuthorizationContext: ResponseCacheAuthorizationContext
             do {
                 value = try await sendRawRequest(
                     data: attemptData, id: attemptID, connection: connection)
+                responseAuthorizationContext = await takeResponseCacheAuthorizationContext(
+                    for: attemptID,
+                    from: connection
+                )
             } catch let error as MCPError {
+                _ = await takeResponseCacheAuthorizationContext(
+                    for: attemptID,
+                    from: connection
+                )
                 if !correctedToolHeaders,
                     await refreshToolHeadersIfNeeded(
                         after: error,
@@ -1262,6 +1274,12 @@ public actor Client {
                     )
                 }
                 throw error
+            } catch {
+                _ = await takeResponseCacheAuthorizationContext(
+                    for: attemptID,
+                    from: connection
+                )
+                throw error
             }
             guard let result = value.objectValue else {
                 throw MCPError.invalidRequest("Response result must be a JSON object")
@@ -1285,13 +1303,11 @@ public actor Client {
                     resultType: resultType
                 )
                 if let responseCacheKey, let policy {
-                    let authorizationContext = await responseCacheAuthorizationContext(
-                        for: connection)
                     try responseCache.validateListScope(
                         policy.cacheScope,
                         request: responseCacheKey,
                         result: value,
-                        authorizationContext: authorizationContext
+                        authorizationContext: responseAuthorizationContext
                     )
                     if cachePolicy != .bypass,
                         logLevel == nil,
@@ -1303,7 +1319,7 @@ public actor Client {
                             value,
                             policy: policy,
                             for: responseCacheKey,
-                            authorizationContext: authorizationContext,
+                            authorizationContext: responseAuthorizationContext,
                             now: now,
                             maximumEntries: maximumEntries
                         )
@@ -1991,26 +2007,22 @@ public actor Client {
         }
     }
 
-    private func makeResponseCacheKey<M: Method>(
-        for request: Request<M>
+    private func makeResponseCacheKey(
+        from data: Data,
+        method: String
     ) throws -> ResponseCacheRequestKey? {
-        guard Self.cacheableMethods.contains(M.name) else { return nil }
-        guard case .object(let envelope) = try decoder.decode(
-            Value.self,
-            from: encoder.encode(request)
-        ) else {
-            throw MCPError.invalidRequest("Request must encode as a JSON object")
-        }
-        var parameters = envelope["params"]?.objectValue ?? [:]
-        guard parameters["inputResponses"] == nil, parameters["requestState"] == nil else {
+        guard Self.cacheableMethods.contains(method) else { return nil }
+        let key = try ResponseCacheRequestKey(
+            data: data,
+            method: method,
+            connectionGeneration: connectionGeneration
+        )
+        guard key.parameters.objectValue?["inputResponses"] == nil,
+            key.parameters.objectValue?["requestState"] == nil
+        else {
             return nil
         }
-        parameters.removeValue(forKey: "_meta")
-        return ResponseCacheRequestKey(
-            connectionGeneration: connectionGeneration,
-            method: M.name,
-            parameters: .object(parameters)
-        )
+        return key
     }
 
     private func responseCachePolicy(
@@ -2039,7 +2051,11 @@ public actor Client {
             throw MCPError.invalidRequest(
                 "A complete \(method) result requires a valid cacheScope")
         }
-        return CachePolicy(ttlMs: max(0, ttlMs), cacheScope: cacheScope)
+        guard ttlMs >= 0 else {
+            throw MCPError.invalidRequest(
+                "A complete \(method) result requires ttlMs greater than or equal to zero")
+        }
+        return CachePolicy(ttlMs: ttlMs, cacheScope: cacheScope)
     }
 
     private func responseCacheAuthorizationContext(
@@ -2048,7 +2064,20 @@ public actor Client {
         if let provider = connection as? any ResponseCacheAuthorizationContextProviding {
             return await provider.responseCacheAuthorizationContext()
         }
-        return .known("")
+        return .unavailable
+    }
+
+    private func takeResponseCacheAuthorizationContext(
+        for requestID: ID,
+        from connection: any Transport
+    ) async -> ResponseCacheAuthorizationContext {
+        guard
+            let provider = connection
+                as? any ResponseCacheRequestAuthorizationContextProviding
+        else {
+            return .unavailable
+        }
+        return await provider.takeResponseCacheAuthorizationContext(for: requestID)
     }
 
     private static let cacheableMethods: Set<String> = [

@@ -66,12 +66,43 @@ private actor ResponseCacheTestState {
     }
 }
 
+private actor ResponseCacheResponseGate {
+    private var entered = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        entered = true
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func waitUntilEntered() async {
+        while !entered { await Task.yield() }
+    }
+
+    func open() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+private enum MetadataListTools: MCP.Method {
+    static let name = ListTools.name
+
+    struct Parameters: Hashable, Codable, Sendable {
+        var _meta: Metadata
+    }
+
+    typealias Result = ListTools.Result
+}
+
 private actor AuthorizationContextTransport: Transport,
-    ResponseCacheAuthorizationContextProviding
+    ResponseCacheAuthorizationContextProviding,
+    ResponseCacheRequestAuthorizationContextProviding
 {
     nonisolated let logger = Logger(label: "mcp.test.response-cache-authorization")
     private let base: InMemoryTransport
     private var context: ResponseCacheAuthorizationContext
+    private var requestContexts: [ID: ResponseCacheAuthorizationContext] = [:]
 
     init(base: InMemoryTransport, context: ResponseCacheAuthorizationContext) {
         self.base = base
@@ -83,10 +114,14 @@ private actor AuthorizationContextTransport: Transport,
     }
 
     func disconnect() async {
+        requestContexts.removeAll()
         await base.disconnect()
     }
 
     func send(_ data: Data) async throws {
+        if let request = try? JSONDecoder().decode(AnyRequest.self, from: data) {
+            requestContexts[request.id] = context
+        }
         try await base.send(data)
     }
 
@@ -114,6 +149,12 @@ private actor AuthorizationContextTransport: Transport,
 
     func setContext(_ context: ResponseCacheAuthorizationContext) {
         self.context = context
+    }
+
+    func takeResponseCacheAuthorizationContext(
+        for requestID: ID
+    ) -> ResponseCacheAuthorizationContext {
+        requestContexts.removeValue(forKey: requestID) ?? .unavailable
     }
 }
 
@@ -281,9 +322,121 @@ struct ResponseCacheTests {
         await server.stop()
     }
 
+    @Test("Private storage uses the authorization context of the completed attempt")
+    func exactAttemptAuthorization() async throws {
+        let pair = await InMemoryTransport.createConnectedPair()
+        let transport = AuthorizationContextTransport(
+            base: pair.client,
+            context: .known("token-a")
+        )
+        let gate = ResponseCacheResponseGate()
+        let state = ResponseCacheTestState()
+        let server = makeServer(capabilities: .init(tools: .init()))
+        await server.withMethodHandler(ListTools.self) { _ in
+            let call = await state.record(ListTools.name)
+            if call == 1 { await gate.wait() }
+            return .init(
+                tools: [Self.tool(named: "tool-\(call)")],
+                ttlMs: 10_000,
+                cacheScope: .private
+            )
+        }
+        try await server.start(transport: pair.server)
+        let client = makeClient()
+        _ = try await client.connectWithInfo(transport: transport)
+
+        let request = Task { try await client.listTools() }
+        await gate.waitUntilEntered()
+        await transport.setContext(.known("token-b"))
+        await gate.open()
+        #expect(try await request.value.tools.map(\.name) == ["tool-1"])
+
+        await transport.setContext(.known("token-a"))
+        #expect(try await client.listTools().tools.map(\.name) == ["tool-1"])
+        #expect(await state.count(ListTools.name) == 1)
+
+        await client.disconnect()
+        await server.stop()
+    }
+
+    @Test("Cache keys retain caller metadata and capabilities")
+    func metadataAndCapabilityKeys() async throws {
+        let pair = await InMemoryTransport.createConnectedPair()
+        let state = ResponseCacheTestState()
+        let server = makeServer(capabilities: .init(tools: .init()))
+        await server.withMethodHandler(ListTools.self) { _ in
+            let call = await state.record(ListTools.name)
+            return .init(
+                tools: [Self.tool(named: "tool-\(call)")],
+                ttlMs: 10_000,
+                cacheScope: .public
+            )
+        }
+        try await server.start(transport: pair.server)
+        let client = makeClient()
+        _ = try await client.connectWithInfo(transport: pair.client)
+
+        func request(tenant: String, progressToken: String) -> Request<MetadataListTools> {
+            MetadataListTools.request(.init(_meta: Metadata(additionalFields: [
+                "tenant": .string(tenant),
+                "progressToken": .string(progressToken),
+            ])))
+        }
+
+        _ = try await client.sendAndAwait(request(tenant: "a", progressToken: "one"))
+        _ = try await client.sendAndAwait(request(tenant: "a", progressToken: "two"))
+        #expect(await state.count(ListTools.name) == 1)
+
+        _ = try await client.sendAndAwait(request(tenant: "b", progressToken: "two"))
+        #expect(await state.count(ListTools.name) == 2)
+
+        let firstKey = try ResponseCacheRequestKey(
+            data: PerRequestMetadataWire.encodeRequest(
+                request(tenant: "b", progressToken: "three"),
+                protocolVersion: Version.perRequestMetadataVersion,
+                clientInfo: .init(name: "Client", version: "1.0"),
+                clientCapabilities: .init(),
+                using: JSONEncoder()
+            ),
+            method: ListTools.name,
+            connectionGeneration: 1
+        )
+        let normalizedKey = try ResponseCacheRequestKey(
+            data: PerRequestMetadataWire.encodeRequest(
+                request(tenant: "b", progressToken: "four"),
+                protocolVersion: Version.perRequestMetadataVersion,
+                clientInfo: .init(name: "Other name", version: "2.0"),
+                clientCapabilities: .init(),
+                using: JSONEncoder()
+            ),
+            method: ListTools.name,
+            connectionGeneration: 1
+        )
+        let secondKey = try ResponseCacheRequestKey(
+            data: PerRequestMetadataWire.encodeRequest(
+                request(tenant: "b", progressToken: "five"),
+                protocolVersion: Version.perRequestMetadataVersion,
+                clientInfo: .init(name: "Other name", version: "2.0"),
+                clientCapabilities: .init(sampling: .init()),
+                using: JSONEncoder()
+            ),
+            method: ListTools.name,
+            connectionGeneration: 1
+        )
+        #expect(firstKey == normalizedKey)
+        #expect(firstKey != secondKey)
+
+        await client.disconnect()
+        await server.stop()
+    }
+
     @Test("Resource notifications invalidate only the selected URI")
     func resourceNotificationInvalidation() async throws {
         let pair = await InMemoryTransport.createConnectedPair()
+        let clientTransport = AuthorizationContextTransport(
+            base: pair.client,
+            context: .known("resource-user")
+        )
         let state = ResponseCacheTestState()
         let server = makeServer(capabilities: .init(
             resources: .init(subscribe: true)
@@ -299,7 +452,7 @@ struct ResponseCacheTests {
         try await server.start(transport: pair.server)
 
         let client = makeClient()
-        _ = try await client.connectWithInfo(transport: pair.client)
+        _ = try await client.connectWithInfo(transport: clientTransport)
         let firstURI = "file:///first"
         let secondURI = "file:///second"
         let subscription = try await client.listen(notifications: .init(
@@ -356,6 +509,10 @@ struct ResponseCacheTests {
     @Test("Bounded storage evicts the least recently used response")
     func boundedStorage() async throws {
         let pair = await InMemoryTransport.createConnectedPair()
+        let clientTransport = AuthorizationContextTransport(
+            base: pair.client,
+            context: .known("bounded-user")
+        )
         let state = ResponseCacheTestState()
         let server = makeServer(capabilities: .init(resources: .init()))
         await server.withMethodHandler(ReadResource.self) { parameters in
@@ -369,7 +526,7 @@ struct ResponseCacheTests {
         try await server.start(transport: pair.server)
 
         let client = makeClient(responseCacheMode: .enabled(maxEntries: 2))
-        _ = try await client.connectWithInfo(transport: pair.client)
+        _ = try await client.connectWithInfo(transport: clientTransport)
         _ = try await client.readResource(uri: "file:///one")
         _ = try await client.readResource(uri: "file:///two")
         _ = try await client.readResource(uri: "file:///three")
@@ -381,7 +538,7 @@ struct ResponseCacheTests {
         await server.stop()
     }
 
-    @Test("Invalid cache configuration and server policies are rejected")
+    @Test("Existing handlers get conservative defaults and invalid policies are rejected")
     func invalidPolicies() async throws {
         for maximumEntries in [0, 513] {
             let pair = await InMemoryTransport.createConnectedPair()
@@ -394,13 +551,25 @@ struct ResponseCacheTests {
         }
 
         let pair = await InMemoryTransport.createConnectedPair()
+        let state = ResponseCacheTestState()
         let server = makeServer(capabilities: .init(tools: .init()))
         await server.withMethodHandler(ListTools.self) { _ in
-            .init(tools: [])
+            _ = await state.record(ListTools.name)
+            return .init(tools: [])
         }
         try await server.start(transport: pair.server)
         let client = makeClient()
         _ = try await client.connectWithInfo(transport: pair.client)
+        let first = try await client.sendAndAwait(ListTools.request(.init()))
+        _ = try await client.sendAndAwait(ListTools.request(.init()))
+        #expect(first.ttlMs == 0)
+        #expect(first.cacheScope == .private)
+        #expect(await state.count(ListTools.name) == 2)
+        #expect(await client.responseCacheEntryCount == 0)
+
+        await server.withMethodHandler(ListTools.self) { _ in
+            .init(tools: [], ttlMs: 10)
+        }
         await #expect(throws: MCPError.self) {
             _ = try await client.listTools(cachePolicy: .bypass)
         }
@@ -416,7 +585,43 @@ struct ResponseCacheTests {
         await server.stop()
     }
 
-    @Test("Malformed peer fields fail while a negative TTL is immediately stale")
+    @Test("Existing cacheable handlers remain valid without cache fields")
+    func existingHandlerDefaults() async throws {
+        let pair = await InMemoryTransport.createConnectedPair()
+        let server = makeServer(capabilities: .init(
+            prompts: .init(),
+            resources: .init(),
+            tools: .init()
+        ))
+        await server.withMethodHandler(ListTools.self) { _ in .init(tools: []) }
+        await server.withMethodHandler(ListPrompts.self) { _ in .init(prompts: []) }
+        await server.withMethodHandler(ListResources.self) { _ in .init(resources: []) }
+        await server.withMethodHandler(ListResourceTemplates.self) { _ in .init(templates: []) }
+        await server.withMethodHandler(ReadResource.self) { _ in .init(contents: []) }
+        try await server.start(transport: pair.server)
+        let client = makeClient()
+        _ = try await client.connectWithInfo(transport: pair.client)
+
+        let tools = try await client.sendAndAwait(ListTools.request(.init()))
+        let prompts = try await client.sendAndAwait(ListPrompts.request(.init()))
+        let resources = try await client.sendAndAwait(ListResources.request(.init()))
+        let templates = try await client.sendAndAwait(ListResourceTemplates.request(.init()))
+        let read = try await client.sendAndAwait(
+            ReadResource.request(.init(uri: "file:///default"))
+        )
+
+        #expect(tools.ttlMs == 0 && tools.cacheScope == .private)
+        #expect(prompts.ttlMs == 0 && prompts.cacheScope == .private)
+        #expect(resources.ttlMs == 0 && resources.cacheScope == .private)
+        #expect(templates.ttlMs == 0 && templates.cacheScope == .private)
+        #expect(read.ttlMs == 0 && read.cacheScope == .private)
+        #expect(await client.responseCacheEntryCount == 0)
+
+        await client.disconnect()
+        await server.stop()
+    }
+
+    @Test("Malformed peer cache fields fail while a zero TTL is immediately stale")
     func malformedPeerFields() async throws {
         let transport = MockTransport()
         let client = makeClient()
@@ -470,7 +675,9 @@ struct ResponseCacheTests {
                 "cacheScope": "public",
             ])
         ))
-        _ = try await negativeTTL.value
+        await #expect(throws: MCPError.self) {
+            _ = try await negativeTTL.value
+        }
         #expect(await client.responseCacheEntryCount == 0)
 
         let immediatelyStale = Task { try await client.listTools() }
