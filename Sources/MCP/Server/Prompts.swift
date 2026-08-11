@@ -339,16 +339,25 @@ public enum ListPrompts: Method {
 /// To retrieve a specific prompt, clients send a `prompts/get` request.
 /// Arguments may be auto-completed through the completion API.
 /// - SeeAlso: https://modelcontextprotocol.io/specification/2025-11-25/server/prompts/#getting-a-prompt
-public enum GetPrompt: Method {
+public enum GetPrompt: MultiRoundTripMethod {
     public static let name: String = "prompts/get"
 
     public struct Parameters: Hashable, Codable, Sendable {
         public let name: String
         public let arguments: [String: String]?
+        public let inputResponses: [String: Value]?
+        public let requestState: String?
 
-        public init(name: String, arguments: [String: String]? = nil) {
+        public init(
+            name: String,
+            arguments: [String: String]? = nil,
+            inputResponses: [String: Value]? = nil,
+            requestState: String? = nil
+        ) {
             self.name = name
             self.arguments = arguments
+            self.inputResponses = inputResponses
+            self.requestState = requestState
         }
     }
 

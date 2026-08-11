@@ -29,6 +29,9 @@ public protocol Method: Sendable {
     static var name: String { get }
 }
 
+/// A client-to-server method that may complete through multiple round trips.
+public protocol MultiRoundTripMethod: Method {}
+
 /// Type-erased method for request/response handling
 struct AnyMethod: Method, Sendable {
     static var name: String { "" }
@@ -199,6 +202,43 @@ final class TypedRequestHandler<M: Method>: RequestHandlerBox, @unchecked Sendab
             return Response(id: response.id, result: resultValue)
         case .failure(let error):
             return Response(id: response.id, error: error)
+        }
+    }
+}
+
+/// Type-erases a handler whose successful response may require another client attempt.
+final class MultiRoundTripRequestHandler<M: MultiRoundTripMethod>: RequestHandlerBox,
+    @unchecked Sendable
+{
+    private let _handle: @Sendable (Request<M>) async throws -> MultiRoundTripResult<M.Result>
+
+    init(
+        _ handler: @escaping @Sendable (Request<M>) async throws -> MultiRoundTripResult<M.Result>
+    ) {
+        self._handle = handler
+        super.init()
+    }
+
+    override func callAsFunction(_ request: AnyRequest) async throws -> AnyResponse {
+        let encoder = JSONEncoder()
+        let decoder = JSONDecoder()
+        let data = try encoder.encode(request)
+        let typedRequest = try decoder.decode(Request<M>.self, from: data)
+
+        switch try await _handle(typedRequest) {
+        case .complete(let result):
+            return try AnyResponse(Response<M>(id: request.id, result: result))
+        case .inputRequired(let result):
+            guard Server.currentHandlerContext?.protocolLifecycle == .perRequestMetadata else {
+                throw MCPError.invalidRequest(
+                    "input_required results require the per-request metadata lifecycle")
+            }
+            try result.validate(
+                clientCapabilities: Server.currentHandlerContext?.clientCapabilities)
+            return try AnyResponse(Response<AnyMethod>(
+                id: request.id,
+                result: Value(result)
+            ))
         }
     }
 }

@@ -372,7 +372,7 @@ public enum ListTools: Method {
 
 /// To call a tool, clients send a `tools/call` request.
 /// - SeeAlso: https://modelcontextprotocol.io/specification/2025-11-25/server/tools/#calling-tools
-public enum CallTool: Method {
+public enum CallTool: MultiRoundTripMethod {
     public static let name = "tools/call"
 
     public struct Parameters: Hashable, Codable, Sendable {
@@ -388,16 +388,32 @@ public enum CallTool: Method {
         /// Arguments to use for the tool call.
         public let arguments: [String: Value]?
 
-        public init(name: String, arguments: [String: Value]? = nil, meta: Metadata? = nil) {
+        /// Results of embedded input requests from the preceding attempt.
+        public let inputResponses: [String: Value]?
+
+        /// Opaque server state copied unchanged from the preceding attempt.
+        public let requestState: String?
+
+        public init(
+            name: String,
+            arguments: [String: Value]? = nil,
+            meta: Metadata? = nil,
+            inputResponses: [String: Value]? = nil,
+            requestState: String? = nil
+        ) {
             self._meta = meta
             self.name = name
             self.arguments = arguments
+            self.inputResponses = inputResponses
+            self.requestState = requestState
         }
 
         private enum CodingKeys: String, CodingKey {
             case _meta
             case name
             case arguments
+            case inputResponses
+            case requestState
         }
 
         public init(from decoder: Decoder) throws {
@@ -405,6 +421,9 @@ public enum CallTool: Method {
             _meta = try container.decodeIfPresent(Metadata.self, forKey: ._meta)
             name = try container.decode(String.self, forKey: .name)
             arguments = try container.decodeIfPresent([String: Value].self, forKey: .arguments)
+            inputResponses = try container.decodeIfPresent(
+                [String: Value].self, forKey: .inputResponses)
+            requestState = try container.decodeIfPresent(String.self, forKey: .requestState)
         }
 
         public func encode(to encoder: Encoder) throws {
@@ -412,6 +431,8 @@ public enum CallTool: Method {
             try container.encodeIfPresent(_meta, forKey: ._meta)
             try container.encode(name, forKey: .name)
             try container.encodeIfPresent(arguments, forKey: .arguments)
+            try container.encodeIfPresent(inputResponses, forKey: .inputResponses)
+            try container.encodeIfPresent(requestState, forKey: .requestState)
         }
     }
 

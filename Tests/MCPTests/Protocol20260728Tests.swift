@@ -235,6 +235,25 @@ struct Protocol20260728Tests {
         #expect(metadata == nil)
     }
 
+    @Test("Official multi-round-trip fixtures decode")
+    func multiRoundTripFixtures() throws {
+        let combined = try JSONDecoder().decode(
+            InputRequiredResult.self,
+            from: try fixture(
+                named: "input-required-result-with-elicitation-and-sampling-and-request-state")
+        )
+        #expect(combined.resultType == .inputRequired)
+        #expect(combined.inputRequests?.keys.sorted() == ["capital_of_france", "github_login"])
+        #expect(combined.requestState == "eyJsb2NhdGlvbiI6Ik5ldyBZb3JrIn0")
+
+        let stateOnly = try JSONDecoder().decode(
+            InputRequiredResult.self,
+            from: try fixture(named: "input-required-result-with-request-state-only")
+        )
+        #expect(stateOnly.inputRequests == nil)
+        #expect(stateOnly.requestState != nil)
+    }
+
     private func fixture(named name: String) throws -> Data {
         let testDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
         return try Data(

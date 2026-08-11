@@ -525,6 +525,19 @@ public actor Server {
         return self
     }
 
+    /// Registers a handler that may request embedded client input before completing.
+    @discardableResult
+    public func withMultiRoundTripHandler<M: MultiRoundTripMethod>(
+        _ type: M.Type,
+        handler: @escaping @Sendable (M.Parameters) async throws -> MultiRoundTripResult<M.Result>
+    ) -> Self {
+        methodHandlers[M.name] = MultiRoundTripRequestHandler {
+            (request: Request<M>) -> MultiRoundTripResult<M.Result> in
+            try await handler(request.params)
+        }
+        return self
+    }
+
     /// Register a notification handler
     @discardableResult
     public func onNotification<N: Notification>(
