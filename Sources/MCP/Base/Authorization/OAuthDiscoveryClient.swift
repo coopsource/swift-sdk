@@ -71,18 +71,13 @@ struct OAuthDiscoveryClient: Sendable {
         throw OAuthAuthorizationError.metadataDiscoveryFailed
     }
 
-    /// Fetches Authorization Server Metadata from candidates, preferring a response whose
-    /// `issuer` matches the candidate URL (RFC 8414 §3). If no candidate produces a matching
-    /// issuer, the first valid response is accepted and its own `issuer` is used as the
-    /// server identity — accommodating servers that serve metadata at one host but advertise
-    /// a different issuer.
+    /// Fetches Authorization Server Metadata whose `issuer` exactly matches its candidate URL,
+    /// as required by RFC 8414 §3.
     func fetchAuthorizationServerMetadata(
         candidates: [URL],
         session: URLSession
     ) async throws -> (server: URL, metadata: OAuthAuthorizationServerMetadata) {
         let decoder = JSONDecoder()
-        var firstValid: (server: URL, metadata: OAuthAuthorizationServerMetadata)?
-
         for candidateServer in candidates {
             guard (try? urlValidator.validateAuthorizationServer(
                 candidateServer, context: "Authorization server issuer")) != nil
@@ -113,18 +108,8 @@ struct OAuthDiscoveryClient: Sendable {
                     let asMetadata = try decoder.decode(
                         OAuthAuthorizationServerMetadata.self, from: data)
 
-                    // Prefer metadata whose issuer matches the candidate URL (RFC 8414 §3).
-                    let issuerMatches =
-                        asMetadata.issuer == nil
-                        || asMetadata.issuer?.absoluteString.lowercased()
-                            == candidateServer.absoluteString.lowercased()
-                    if issuerMatches {
+                    if asMetadata.issuerIdentifier == candidateServer.absoluteString {
                         return (server: candidateServer, metadata: asMetadata)
-                    }
-                    // Keep as fallback in case no issuer-matching candidate is found.
-                    if firstValid == nil {
-                        let server = asMetadata.issuer ?? candidateServer
-                        firstValid = (server: server, metadata: asMetadata)
                     }
                 } catch {
                     continue
@@ -132,9 +117,6 @@ struct OAuthDiscoveryClient: Sendable {
             }
         }
 
-        if let firstValid {
-            return firstValid
-        }
         throw OAuthAuthorizationError.authorizationServerMetadataDiscoveryFailed
     }
 }

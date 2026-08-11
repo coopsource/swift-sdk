@@ -19,7 +19,7 @@ protocol OAuthClientRegistering: Sendable {
 /// Stateless OAuth dynamic client registration logic.
 ///
 /// Handles Client ID Metadata Document (CIMD) detection and RFC 7591 dynamic registration.
-/// State tracking (`clientRegistrationAttempted`, `clientSecretExpiresAt`) is the caller's responsibility.
+/// Registration-attempt and credential-expiry state remain the caller's responsibility.
 struct OAuthClientRegistrar: Sendable {
     let urlValidator: OAuthURLValidator
 

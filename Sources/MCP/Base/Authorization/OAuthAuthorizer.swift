@@ -112,6 +112,13 @@ extension HTTPClientAuthorizer {
 ///   doing so would violate the isolation contract and risk concurrent mutation.
 public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
 
+    private enum ClientCredentialProvenance: Equatable {
+        case unregistered
+        case configured
+        case metadataDocument
+        case dynamicallyRegistered(issuer: String)
+    }
+
     // MARK: - Mutable State
 
     private var configuration: OAuthConfiguration
@@ -123,10 +130,10 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
     private var authorizationServerMetadata: OAuthAuthorizationServerMetadata?
     private var cachedProtectedResourceMetadataURL: URL?
     private var stepUpAttempts: [String: Int] = [:]
-    private var clientRegistrationAttempted = false
-    private var clientRegistrationWasDynamic = false
+    private var registrationAttemptedIssuer: String?
     private var clientSecretExpiresAt: Date?
     private var clientCredentialIssuer: String?
+    private var clientCredentialProvenance: ClientCredentialProvenance
 
     // MARK: - Composable Dependencies
 
@@ -194,6 +201,9 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
         self.configuredAuthentication = configuration.authentication
         self.tokenStorage = tokenStorage
         self.clientCredentialIssuer = configuration.clientCredentialIssuer
+        self.clientCredentialProvenance = configuration.authentication.clientID.isEmpty
+            ? .unregistered
+            : .configured
         self.scopeSelector = scopeSelector
         self.challengeParser = challengeParser
         self.urlValidator = urlValidator
@@ -215,19 +225,21 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
 
     public func authorizationHeader(for endpoint: URL) -> String? {
         guard let accessToken = tokenStorage.load() else { return nil }
-        if let tokenIssuer = accessToken.authorizationServerIssuer,
-            let selectedAuthorizationServerIssuer,
-            tokenIssuer != selectedAuthorizationServerIssuer
-        {
-            tokenStorage.clear()
-            return nil
-        }
-        if accessToken.authorizationServerIssuer == nil,
-            let tokenAuthorizationServer = accessToken.authorizationServer,
-            let selectedAuthorizationServer,
-            !authorizationServersMatch(tokenAuthorizationServer, selectedAuthorizationServer)
-        {
-            tokenStorage.clear()
+        let knownIssuer = selectedAuthorizationServerIssuer ?? clientCredentialIssuer
+        if let tokenIssuer = accessToken.authorizationServerIssuer {
+            guard let knownIssuer else { return nil }
+            guard tokenIssuer == knownIssuer else {
+                tokenStorage.clear()
+                return nil
+            }
+        } else if let tokenAuthorizationServer = accessToken.authorizationServer {
+            let knownServer = selectedAuthorizationServer ?? knownIssuer.flatMap(URL.init(string:))
+            guard let knownServer else { return nil }
+            guard authorizationServersMatch(tokenAuthorizationServer, knownServer) else {
+                tokenStorage.clear()
+                return nil
+            }
+        } else {
             return nil
         }
         if accessToken.isExpired() {
@@ -412,7 +424,8 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
     ) async throws -> OAuthProtectedResourceMetadata {
         if let protectedResourceMetadata {
             let incomingURL = challenge?.resourceMetadataURL
-            if let incomingURL, incomingURL != cachedProtectedResourceMetadataURL {
+            if incomingURL != nil {
+                // A challenge can report changed authorization servers at the same metadata URL.
                 self.protectedResourceMetadata = nil
                 self.authorizationServerMetadata = nil
                 self.selectedAuthorizationServer = nil
@@ -504,6 +517,15 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
         if let override = configuration.endpointOverrides.authorizationServerURL {
             try urlValidator.validateAuthorizationServer(
                 override, context: "Authorization server issuer")
+            if case .configured = clientCredentialProvenance,
+                let clientCredentialIssuer,
+                override.absoluteString != clientCredentialIssuer
+            {
+                throw OAuthAuthorizationError.clientCredentialIssuerMismatch(
+                    expected: clientCredentialIssuer,
+                    actual: override.absoluteString
+                )
+            }
             candidates = [override]
         } else if let selected = selectedAuthorizationServer {
             candidates = [selected]
@@ -511,11 +533,40 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
             guard !metadata.authorizationServers.isEmpty else {
                 throw OAuthAuthorizationError.missingAuthorizationServer
             }
-            candidates = metadata.authorizationServers
+            candidates = try authorizationServerCandidates(metadata.authorizationServers)
         }
 
-        let (server, asMetadata) = try await discoveryClient.fetchAuthorizationServerMetadata(
-            candidates: candidates, session: session)
+        let (server, asMetadata): (URL, OAuthAuthorizationServerMetadata)
+        if needsDynamicRegistrationSelection, candidates.count > 1 {
+            var selection: (URL, OAuthAuthorizationServerMetadata)?
+            var discoveredServerWithoutRegistration = false
+
+            for candidate in candidates {
+                do {
+                    let discovered = try await discoveryClient.fetchAuthorizationServerMetadata(
+                        candidates: [candidate], session: session)
+                    guard discovered.metadata.registrationEndpoint != nil else {
+                        discoveredServerWithoutRegistration = true
+                        continue
+                    }
+                    selection = discovered
+                    break
+                } catch {
+                    continue
+                }
+            }
+
+            guard let selection else {
+                if discoveredServerWithoutRegistration {
+                    throw OAuthAuthorizationError.registrationInformationRequired
+                }
+                throw OAuthAuthorizationError.authorizationServerMetadataDiscoveryFailed
+            }
+            (server, asMetadata) = selection
+        } else {
+            (server, asMetadata) = try await discoveryClient.fetchAuthorizationServerMetadata(
+                candidates: candidates, session: session)
+        }
         let issuer = asMetadata.issuerIdentifier ?? server.absoluteString
         try prepareClientCredentials(for: issuer, metadata: asMetadata)
         self.selectedAuthorizationServer = server
@@ -697,23 +748,27 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
     ) async throws {
         if let expiry = clientSecretExpiresAt, Date() >= expiry {
             clientSecretExpiresAt = nil
-            clientRegistrationAttempted = false
+            registrationAttemptedIssuer = nil
             configuration.authentication = .none(clientID: configuration.authentication.clientID)
         }
 
-        guard !clientRegistrationAttempted else { return }
+        guard let issuer = selectedAuthorizationServerIssuer else {
+            throw OAuthAuthorizationError.authorizationServerMetadataDiscoveryFailed
+        }
+        guard registrationAttemptedIssuer != issuer else { return }
         guard case .none = configuration.authentication else { return }
 
-        clientRegistrationAttempted = true
-
-        if let (registration, updatedAuth) = try await clientRegistrar.register(
+        let registration = try await clientRegistrar.register(
             configuration: configuration,
             asMetadata: asMetadata,
             session: session
-        ) {
+        )
+        registrationAttemptedIssuer = issuer
+
+        if let (registration, updatedAuth) = registration {
             configuration.authentication = updatedAuth
-            clientRegistrationWasDynamic = true
-            clientCredentialIssuer = selectedAuthorizationServerIssuer
+            clientCredentialProvenance = .dynamicallyRegistered(issuer: issuer)
+            clientCredentialIssuer = issuer
             if let expiresAt = registration.clientSecretExpiresAt, expiresAt > 0 {
                 clientSecretExpiresAt = Date(timeIntervalSince1970: Double(expiresAt))
             }
@@ -836,20 +891,21 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
         for issuer: String,
         metadata: OAuthAuthorizationServerMetadata
     ) throws {
-        if usesPortableClientIDMetadataDocument(with: metadata) {
-            return
-        }
-
-        if clientRegistrationWasDynamic,
-            let clientCredentialIssuer,
-            clientCredentialIssuer != issuer
-        {
+        if case .dynamicallyRegistered(let registeredIssuer) = clientCredentialProvenance {
+            guard registeredIssuer != issuer else { return }
             tokenStorage.clear()
             configuration.authentication = configuredAuthentication
-            clientRegistrationAttempted = false
-            clientRegistrationWasDynamic = false
+            registrationAttemptedIssuer = nil
             clientSecretExpiresAt = nil
             self.clientCredentialIssuer = configuration.clientCredentialIssuer
+            clientCredentialProvenance = configuredAuthentication.clientID.isEmpty
+                ? .unregistered
+                : .configured
+        }
+
+        if usesPortableClientIDMetadataDocument(with: metadata) {
+            clientCredentialProvenance = .metadataDocument
+            clientCredentialIssuer = nil
             return
         }
 
@@ -871,11 +927,26 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
         !configuration.authentication.clientID.isEmpty
     }
 
+    private var needsDynamicRegistrationSelection: Bool {
+        guard case .unregistered = clientCredentialProvenance,
+            case .none = configuration.authentication
+        else {
+            return false
+        }
+        return configuration.accessTokenProvider == nil
+    }
+
     private func usesPortableClientIDMetadataDocument(
         with metadata: OAuthAuthorizationServerMetadata
     ) -> Bool {
-        guard case .none(let clientID) = configuration.authentication,
-            metadata.clientIDMetadataDocumentSupported == true,
+        let clientID: String
+        switch configuration.authentication {
+        case .none(let value), .privateKeyJWT(let value, _):
+            clientID = value
+        default:
+            return false
+        }
+        guard metadata.clientIDMetadataDocumentSupported == true,
             let components = URLComponents(string: clientID)
         else {
             return false
@@ -883,6 +954,29 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
         return components.scheme?.lowercased() == OAuthURLScheme.https
             && !components.path.isEmpty
             && components.path != "/"
+    }
+
+    private func authorizationServerCandidates(_ candidates: [URL]) throws -> [URL] {
+        switch clientCredentialProvenance {
+        case .configured:
+            guard let clientCredentialIssuer else { return candidates }
+            guard let bound = candidates.first(where: {
+                $0.absoluteString == clientCredentialIssuer
+            }) else {
+                throw OAuthAuthorizationError.clientCredentialIssuerMismatch(
+                    expected: clientCredentialIssuer,
+                    actual: candidates.first?.absoluteString ?? "not advertised"
+                )
+            }
+            return [bound]
+        case .dynamicallyRegistered(let issuer):
+            guard let bound = candidates.first(where: { $0.absoluteString == issuer }) else {
+                return candidates
+            }
+            return [bound] + candidates.filter { $0 != bound }
+        case .unregistered, .metadataDocument:
+            return candidates
+        }
     }
 
     // MARK: - External Token Provider

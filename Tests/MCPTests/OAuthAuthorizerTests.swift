@@ -36,10 +36,13 @@ final class MockURLValidator: OAuthURLValidating, @unchecked Sendable {
 final class MockDiscoveryClient: OAuthDiscoveryFetching, @unchecked Sendable {
     var fetchProtectedResourceMetadataCallCount = 0
     var fetchAuthorizationServerMetadataCallCount = 0
+    var authorizationServerCandidateCalls: [[URL]] = []
     let metadataDiscovery: any OAuthMetadataDiscovering = DefaultOAuthMetadataDiscovery()
 
     var protectedResourceMetadataResult: OAuthProtectedResourceMetadata
     var authorizationServerMetadataResult: (server: URL, metadata: OAuthAuthorizationServerMetadata)
+    var authorizationServerMetadataByCandidate:
+        [URL: (server: URL, metadata: OAuthAuthorizationServerMetadata)] = [:]
 
     init(
         authorizationServer: URL = URL(string: "https://auth.example.com")!,
@@ -71,6 +74,12 @@ final class MockDiscoveryClient: OAuthDiscoveryFetching, @unchecked Sendable {
 
     func fetchAuthorizationServerMetadata(candidates: [URL], session: URLSession) async throws -> (server: URL, metadata: OAuthAuthorizationServerMetadata) {
         fetchAuthorizationServerMetadataCallCount += 1
+        authorizationServerCandidateCalls.append(candidates)
+        if candidates.count == 1,
+            let result = authorizationServerMetadataByCandidate[candidates[0]]
+        {
+            return result
+        }
         return authorizationServerMetadataResult
     }
 }
@@ -78,6 +87,8 @@ final class MockDiscoveryClient: OAuthDiscoveryFetching, @unchecked Sendable {
 final class MockTokenClient: OAuthTokenRequesting, @unchecked Sendable {
     var requestCallCount = 0
     var capturedParameters: [String: String]?
+    var invokePrivateKeyAssertion = false
+    var privateKeyAssertions: [String] = []
     var tokenResponse = OAuthTokenResponse(
         accessToken: "mock-access-token",
         tokenType: "Bearer",
@@ -94,6 +105,11 @@ final class MockTokenClient: OAuthTokenRequesting, @unchecked Sendable {
     ) async throws -> OAuthTokenResponse {
         requestCallCount += 1
         capturedParameters = parameters
+        if invokePrivateKeyAssertion,
+            case .privateKeyJWT(let clientID, let assertionFactory) = authentication
+        {
+            privateKeyAssertions.append(try await assertionFactory(endpoint, clientID))
+        }
         return tokenResponse
     }
 }
@@ -104,6 +120,7 @@ final class MockClientRegistrar: OAuthClientRegistering, @unchecked Sendable {
         response: OAuthClientRegistrationResponse,
         updatedAuthentication: OAuthConfiguration.TokenEndpointAuthentication
     )?
+    var errors: [any Error] = []
 
     func register(
         configuration: OAuthConfiguration,
@@ -114,6 +131,7 @@ final class MockClientRegistrar: OAuthClientRegistering, @unchecked Sendable {
         updatedAuthentication: OAuthConfiguration.TokenEndpointAuthentication
     )? {
         registerCallCount += 1
+        if !errors.isEmpty { throw errors.removeFirst() }
         return registrationResult
     }
 }
@@ -468,18 +486,124 @@ struct OAuthAuthorizerTests {
         #expect(actual == "https://auth.example.com")
     }
 
+    @Test("Persisted tokens require the configured credential issuer")
+    func persistedTokenIssuerBinding() {
+        let issuerA = URL(string: "https://a.example.com")!
+        let storage = InMemoryTokenStorage()
+        storage.save(OAuthAccessToken(
+            value: "token-a",
+            tokenType: "Bearer",
+            expiresAt: nil,
+            scopes: [],
+            authorizationServer: issuerA,
+            refreshToken: nil
+        ))
+        let authorizer = OAuthAuthorizer(
+            configuration: OAuthConfiguration(
+                authentication: .clientSecretBasic(clientID: "client", clientSecret: "secret"),
+                clientCredentialIssuer: "https://b.example.com"
+            ),
+            tokenStorage: storage
+        )
+
+        #expect(authorizer.authorizationHeader(for: endpoint) == nil)
+        #expect(storage.load() == nil)
+    }
+
+    @Test("Persisted tokens wait for issuer discovery")
+    func persistedTokenWaitsForDiscovery() {
+        let storage = InMemoryTokenStorage()
+        storage.save(OAuthAccessToken(
+            value: "token-a",
+            tokenType: "Bearer",
+            expiresAt: nil,
+            scopes: [],
+            authorizationServer: URL(string: "https://a.example.com"),
+            refreshToken: nil
+        ))
+        let authorizer = OAuthAuthorizer(
+            configuration: OAuthConfiguration(
+                authentication: .clientSecretBasic(clientID: "client", clientSecret: "secret")
+            ),
+            tokenStorage: storage
+        )
+
+        #expect(authorizer.authorizationHeader(for: endpoint) == nil)
+        #expect(storage.load()?.value == "token-a")
+    }
+
+    @Test("Preconfigured credentials select their advertised issuer")
+    func preconfiguredCredentialsSelectBoundIssuer() async throws {
+        let issuerA = URL(string: "https://a.example.com")!
+        let issuerB = URL(string: "https://b.example.com")!
+        let discovery = MockDiscoveryClient(authorizationServer: issuerB)
+        discovery.protectedResourceMetadataResult = .init(
+            resource: nil,
+            authorizationServers: [issuerA, issuerB],
+            scopesSupported: nil
+        )
+        let authorizer = OAuthAuthorizer(
+            configuration: OAuthConfiguration(
+                authentication: .clientSecretBasic(clientID: "client", clientSecret: "secret"),
+                clientCredentialIssuer: issuerB.absoluteString
+            ),
+            urlValidator: MockURLValidator(),
+            discoveryClient: discovery,
+            tokenEndpointClient: MockTokenClient(),
+            clientRegistrar: MockClientRegistrar(),
+            authCodeFlow: MockAuthCodeFlow()
+        )
+
+        _ = try await authorizer.handleChallenge(
+            statusCode: 401,
+            headers: headers401,
+            endpoint: endpoint,
+            operationKey: nil,
+            session: .shared
+        )
+
+        #expect(discovery.authorizationServerCandidateCalls == [[issuerB]])
+    }
+
+    @Test("Preconfigured credentials do not probe an unrelated issuer")
+    func preconfiguredCredentialsRequireAdvertisedIssuer() async {
+        let discovery = MockDiscoveryClient()
+        let authorizer = OAuthAuthorizer(
+            configuration: OAuthConfiguration(
+                authentication: .clientSecretBasic(clientID: "client", clientSecret: "secret"),
+                clientCredentialIssuer: "https://missing.example.com"
+            ),
+            urlValidator: MockURLValidator(),
+            discoveryClient: discovery,
+            tokenEndpointClient: MockTokenClient(),
+            clientRegistrar: MockClientRegistrar(),
+            authCodeFlow: MockAuthCodeFlow()
+        )
+
+        await #expect(throws: OAuthAuthorizationError.self) {
+            try await authorizer.handleChallenge(
+                statusCode: 401,
+                headers: headers401,
+                endpoint: endpoint,
+                operationKey: nil,
+                session: .shared
+            )
+        }
+        #expect(discovery.fetchAuthorizationServerMetadataCallCount == 0)
+    }
+
     @Test("Dynamic registration repeats when the issuer changes")
     func dynamicRegistrationFollowsIssuer() async throws {
         let discovery = MockDiscoveryClient()
         let registrar = MockClientRegistrar()
         registrar.registrationResult = (
             response: OAuthClientRegistrationResponse(
-                clientID: "assigned-client",
+                clientID: "https://client.example.com/metadata.json",
                 clientSecret: nil,
                 tokenEndpointAuthMethod: nil,
                 clientSecretExpiresAt: nil
             ),
-            updatedAuthentication: .none(clientID: "assigned-client")
+            updatedAuthentication: .none(clientID: "https://client.example.com/metadata.json")
         )
         let authorizer = OAuthAuthorizer(
             configuration: OAuthConfiguration(authentication: .none(clientID: "")),
@@ -519,15 +643,192 @@ struct OAuthAuthorizerTests {
 
         _ = try await authorizer.handleChallenge(
             statusCode: 401,
-            headers: [
-                "WWW-Authenticate":
-                    "Bearer resource_metadata=\"https://mcp.example.com/second-metadata\""
-            ],
+            headers: headers401,
+            endpoint: endpoint,
+            operationKey: nil,
+            session: .shared
+        )
+
+        #expect(discovery.fetchProtectedResourceMetadataCallCount == 2)
+        #expect(registrar.registerCallCount == 2)
+    }
+
+    @Test("Failed dynamic registration can be retried")
+    func dynamicRegistrationFailureCanRetry() async throws {
+        let registrar = MockClientRegistrar()
+        registrar.errors = [
+            OAuthAuthorizationError.tokenRequestFailed(statusCode: 500, oauthError: nil)
+        ]
+        registrar.registrationResult = (
+            response: OAuthClientRegistrationResponse(
+                clientID: "assigned-client",
+                clientSecret: nil,
+                tokenEndpointAuthMethod: nil,
+                clientSecretExpiresAt: nil
+            ),
+            updatedAuthentication: .none(clientID: "assigned-client")
+        )
+        let authorizer = OAuthAuthorizer(
+            configuration: OAuthConfiguration(authentication: .none(clientID: "")),
+            urlValidator: MockURLValidator(),
+            discoveryClient: MockDiscoveryClient(),
+            tokenEndpointClient: MockTokenClient(),
+            clientRegistrar: registrar,
+            authCodeFlow: MockAuthCodeFlow()
+        )
+
+        await #expect(throws: OAuthAuthorizationError.self) {
+            try await authorizer.handleChallenge(
+                statusCode: 401,
+                headers: headers401,
+                endpoint: endpoint,
+                operationKey: nil,
+                session: .shared
+            )
+        }
+        _ = try await authorizer.handleChallenge(
+            statusCode: 401,
+            headers: headers401,
             endpoint: endpoint,
             operationKey: nil,
             session: .shared
         )
 
         #expect(registrar.registerCallCount == 2)
+    }
+
+    @Test("Dynamic registration selects an advertised server that supports it")
+    func dynamicRegistrationSelectsCapableServer() async throws {
+        let firstIssuer = URL(string: "https://first-auth.example.com")!
+        let secondIssuer = URL(string: "https://second-auth.example.com")!
+        let discovery = MockDiscoveryClient(authorizationServer: firstIssuer)
+        discovery.protectedResourceMetadataResult = .init(
+            resource: nil,
+            authorizationServers: [firstIssuer, secondIssuer],
+            scopesSupported: nil
+        )
+        discovery.authorizationServerMetadataByCandidate[firstIssuer] = (
+            server: firstIssuer,
+            metadata: .init(
+                issuer: firstIssuer,
+                authorizationEndpoint: firstIssuer.appendingPathComponent("authorize"),
+                tokenEndpoint: firstIssuer.appendingPathComponent("token"),
+                registrationEndpoint: nil,
+                codeChallengeMethodsSupported: ["S256"],
+                tokenEndpointAuthMethodsSupported: nil,
+                clientIDMetadataDocumentSupported: nil
+            )
+        )
+        discovery.authorizationServerMetadataByCandidate[secondIssuer] = (
+            server: secondIssuer,
+            metadata: .init(
+                issuer: secondIssuer,
+                authorizationEndpoint: secondIssuer.appendingPathComponent("authorize"),
+                tokenEndpoint: secondIssuer.appendingPathComponent("token"),
+                registrationEndpoint: secondIssuer.appendingPathComponent("register"),
+                codeChallengeMethodsSupported: ["S256"],
+                tokenEndpointAuthMethodsSupported: nil,
+                clientIDMetadataDocumentSupported: nil
+            )
+        )
+        let registrar = MockClientRegistrar()
+        registrar.registrationResult = (
+            response: .init(
+                clientID: "assigned-client",
+                clientSecret: nil,
+                tokenEndpointAuthMethod: nil,
+                clientSecretExpiresAt: nil
+            ),
+            updatedAuthentication: .none(clientID: "assigned-client")
+        )
+        let authorizer = OAuthAuthorizer(
+            configuration: OAuthConfiguration(authentication: .none(clientID: "")),
+            urlValidator: MockURLValidator(),
+            discoveryClient: discovery,
+            tokenEndpointClient: MockTokenClient(),
+            clientRegistrar: registrar,
+            authCodeFlow: MockAuthCodeFlow()
+        )
+
+        _ = try await authorizer.handleChallenge(
+            statusCode: 401,
+            headers: headers401,
+            endpoint: endpoint,
+            operationKey: nil,
+            session: .shared
+        )
+
+        #expect(discovery.authorizationServerCandidateCalls == [[firstIssuer], [secondIssuer]])
+        #expect(registrar.registerCallCount == 1)
+    }
+
+    @Test("Private-key client metadata documents remain portable across issuers")
+    func privateKeyMetadataDocumentIsPortable() async throws {
+        let firstIssuer = URL(string: "https://auth.example.com")!
+        let discovery = MockDiscoveryClient(authorizationServer: firstIssuer)
+        discovery.authorizationServerMetadataResult.metadata = .init(
+            issuer: firstIssuer,
+            authorizationEndpoint: firstIssuer.appendingPathComponent("authorize"),
+            tokenEndpoint: firstIssuer.appendingPathComponent("token"),
+            registrationEndpoint: nil,
+            codeChallengeMethodsSupported: ["S256"],
+            tokenEndpointAuthMethodsSupported: ["private_key_jwt"],
+            clientIDMetadataDocumentSupported: true
+        )
+        let registrar = MockClientRegistrar()
+        let tokenClient = MockTokenClient()
+        tokenClient.invokePrivateKeyAssertion = true
+        let authorizer = OAuthAuthorizer(
+            configuration: OAuthConfiguration(
+                authentication: .privateKeyJWT(
+                    clientID: "https://client.example.com/metadata.json",
+                    assertionFactory: { _, _ in "assertion" }
+                )
+            ),
+            urlValidator: MockURLValidator(),
+            discoveryClient: discovery,
+            tokenEndpointClient: tokenClient,
+            clientRegistrar: registrar,
+            authCodeFlow: MockAuthCodeFlow()
+        )
+
+        _ = try await authorizer.handleChallenge(
+            statusCode: 401,
+            headers: headers401,
+            endpoint: endpoint,
+            operationKey: nil,
+            session: .shared
+        )
+
+        let secondIssuer = URL(string: "https://other-auth.example.com")!
+        discovery.protectedResourceMetadataResult = .init(
+            resource: nil,
+            authorizationServers: [secondIssuer],
+            scopesSupported: nil
+        )
+        discovery.authorizationServerMetadataResult = (
+            server: secondIssuer,
+            metadata: .init(
+                issuer: secondIssuer,
+                authorizationEndpoint: secondIssuer.appendingPathComponent("authorize"),
+                tokenEndpoint: secondIssuer.appendingPathComponent("token"),
+                registrationEndpoint: nil,
+                codeChallengeMethodsSupported: ["S256"],
+                tokenEndpointAuthMethodsSupported: ["private_key_jwt"],
+                clientIDMetadataDocumentSupported: true
+            )
+        )
+
+        _ = try await authorizer.handleChallenge(
+            statusCode: 401,
+            headers: headers401,
+            endpoint: endpoint,
+            operationKey: nil,
+            session: .shared
+        )
+
+        #expect(registrar.registerCallCount == 0)
+        #expect(tokenClient.privateKeyAssertions == ["assertion", "assertion"])
+        #expect(discovery.fetchProtectedResourceMetadataCallCount == 2)
     }
 }
