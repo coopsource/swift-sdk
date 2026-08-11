@@ -300,6 +300,15 @@ public actor Server {
     private var notificationHandlers: [String: [NotificationHandlerBox]] = [:]
     /// Pending request tasks (for cancellation support)
     private var pendingRequestTasks: [ID: Task<Response<AnyMethod>, Error>] = [:]
+    /// Requests whose dispatch has begun but whose handler task is not yet registered.
+    ///
+    /// A request is dispatched on its own task so the receive loop keeps reading, which leaves a
+    /// window in which the request is known but has nothing to cancel. Tracking it bounds
+    /// ``cancelledBeforeDispatchRequestIDs`` to requests this server actually received.
+    private var dispatchingRequestIDs: Set<ID> = []
+    /// Cancellations that arrived during that window, from either cancellation mechanism:
+    /// a `notifications/cancelled` message, or a request-scoped transport reporting a disconnect.
+    private var cancelledBeforeDispatchRequestIDs: Set<ID> = []
 
     /// Pending requests sent to the client, awaiting responses
     private var pendingRequests: [ID: AnyPendingRequest] = [:]
@@ -361,6 +370,11 @@ public actor Server {
         }
         registerDefaultHandlers(initializeHook: initializeHook)
         registerCancellationHandler()
+        if let transport = transport as? any RequestCancellationRegistering {
+            await transport.setRequestCancellationHandler { [weak self] id in
+                await self?.cancelRequestFromTransport(id)
+            }
+        }
         try await transport.connect()
 
         await logger?.debug(
@@ -383,7 +397,11 @@ public actor Server {
                         } else if let response = try? decoder.decode(AnyResponse.self, from: data) {
                             await handleResponse(response)
                         } else if let request = try? decoder.decode(AnyRequest.self, from: data) {
-                            // Handle request in a separate task to avoid blocking the receive loop
+                            // Handle request in a separate task to avoid blocking the receive loop.
+                            // Record the dispatch first: this runs without interleaving, so a
+                            // cancellation read by the next loop iteration cannot arrive before the
+                            // request is known.
+                            beginDispatch(request.id)
                             Task {
                                 _ = try? await self.handleRequest(request, sendResponse: true)
                             }
@@ -439,10 +457,15 @@ public actor Server {
         }
 
         if let connection = connection {
+            if let connection = connection as? any RequestCancellationRegistering {
+                await connection.setRequestCancellationHandler(nil)
+            }
             await connection.disconnect()
         }
         connection = nil
         transportSupportedProtocolVersions = nil
+        dispatchingRequestIDs.removeAll()
+        cancelledBeforeDispatchRequestIDs.removeAll()
     }
 
     public func waitUntilCompleted() async {
@@ -587,7 +610,14 @@ public actor Server {
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
 
         let notificationData = try encoder.encode(notification)
-        try await connection.send(notificationData)
+        if let context = Server.currentHandlerContext,
+            context.protocolLifecycle == .perRequestMetadata,
+            let connection = connection as? any RequestScopedSending
+        {
+            try await connection.send(notificationData, relatedTo: context.id)
+        } else {
+            try await connection.send(notificationData)
+        }
     }
 
     /// Send a request to the client and return a Task for the response
@@ -978,6 +1008,11 @@ public actor Server {
     private func handleRequest(_ request: Request<AnyMethod>, sendResponse: Bool = true)
         async throws -> Response<AnyMethod>?
     {
+        // Callers that do not go through the receive loop still need the request to be known
+        // before the first suspension point, so a cancellation cannot arrive with nothing to find.
+        dispatchingRequestIDs.insert(request.id)
+        defer { dispatchingRequestIDs.remove(request.id) }
+
         // Check if this is a pre-processed error request (empty method)
         if request.method.isEmpty && !sendResponse {
             // This is a placeholder for an invalid request that couldn't be parsed in batch mode
@@ -1016,6 +1051,13 @@ public actor Server {
             default:
                 try checkInitialized()
             }
+        }
+
+        // Cancellation can race dispatch: a `notifications/cancelled` message can be handled, or a
+        // request-scoped HTTP response closed, before this request registers its handler task. If
+        // that happened, do not start the work.
+        if cancelledBeforeDispatchRequestIDs.remove(request.id) != nil {
+            return nil
         }
 
         // Find handler for method name
@@ -1425,6 +1467,29 @@ public actor Server {
         pendingRequestTasks.removeValue(forKey: id)
     }
 
+    private func cancelRequestFromTransport(_ id: ID) {
+        if let task = pendingRequestTasks.removeValue(forKey: id) {
+            task.cancel()
+        } else {
+            cancelledBeforeDispatchRequestIDs.insert(id)
+        }
+    }
+
+    /// Records that a request has been received and is about to be dispatched.
+    private func beginDispatch(_ id: ID) {
+        dispatchingRequestIDs.insert(id)
+    }
+
+    /// Records a cancellation for a request that is dispatching but has not registered its task.
+    ///
+    /// - Returns: `true` when the cancellation was recorded, `false` when the request is unknown,
+    ///   in which case the specification allows the notification to be ignored.
+    private func recordCancellationBeforeDispatch(_ id: ID) -> Bool {
+        guard dispatchingRequestIDs.contains(id) else { return false }
+        cancelledBeforeDispatchRequestIDs.insert(id)
+        return true
+    }
+
     private func registerCancellationHandler() {
         onNotification(CancelledNotification.self) { [weak self] message in
             guard let self = self else { return }
@@ -1453,6 +1518,14 @@ public actor Server {
                 task.cancel()
                 await self.logger?.debug(
                     "Cancelled request",
+                    metadata: ["requestId": "\(requestId)"]
+                )
+            } else if await self.recordCancellationBeforeDispatch(requestId) {
+                // The request is dispatching but has not registered its handler task yet. On stdio
+                // this notification is the only cancellation mechanism the revision defines, so it
+                // must not be dropped: the dispatch consumes the record before starting work.
+                await self.logger?.debug(
+                    "Cancelled request before its handler started",
                     metadata: ["requestId": "\(requestId)"]
                 )
             } else {
