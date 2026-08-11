@@ -23,6 +23,8 @@ protocol OAuthAuthorizationCodeFlowing: Sendable {
         authorizationURL: URL,
         redirectURI: URL,
         state: String,
+        expectedIssuer: String?,
+        issuerParameterRequired: Bool,
         delegate: (any OAuthAuthorizationDelegate)?,
         session: URLSession
     ) async throws -> String
@@ -124,12 +126,35 @@ public struct OAuthAuthorizationCodeFlow: Sendable {
         delegate: (any OAuthAuthorizationDelegate)?,
         session: URLSession
     ) async throws -> String {
+        try await perform(
+            authorizationURL: authorizationURL,
+            redirectURI: redirectURI,
+            state: state,
+            expectedIssuer: nil,
+            issuerParameterRequired: false,
+            delegate: delegate,
+            session: session
+        )
+    }
+
+    /// Drives the authorization redirect and validates an RFC 9207 response issuer.
+    public func perform(
+        authorizationURL: URL,
+        redirectURI: URL,
+        state: String,
+        expectedIssuer: String?,
+        issuerParameterRequired: Bool,
+        delegate: (any OAuthAuthorizationDelegate)?,
+        session: URLSession
+    ) async throws -> String {
         if let delegate {
             let redirectURL = try await delegate.presentAuthorizationURL(authorizationURL)
             return try extractCode(
                 from: redirectURL,
                 expectedRedirectURI: redirectURI,
-                expectedState: state
+                expectedState: state,
+                expectedIssuer: expectedIssuer,
+                issuerParameterRequired: issuerParameterRequired
             )
         }
 
@@ -168,7 +193,9 @@ public struct OAuthAuthorizationCodeFlow: Sendable {
         return try extractCode(
             from: redirectURL,
             expectedRedirectURI: redirectURI,
-            expectedState: state
+            expectedState: state,
+            expectedIssuer: expectedIssuer,
+            issuerParameterRequired: issuerParameterRequired
         )
     }
 
@@ -183,6 +210,23 @@ public struct OAuthAuthorizationCodeFlow: Sendable {
         from redirectURL: URL,
         expectedRedirectURI: URL,
         expectedState: String
+    ) throws -> String {
+        try extractCode(
+            from: redirectURL,
+            expectedRedirectURI: expectedRedirectURI,
+            expectedState: expectedState,
+            expectedIssuer: nil,
+            issuerParameterRequired: false
+        )
+    }
+
+    /// Extracts an authorization code after validating redirect, issuer, and state.
+    public func extractCode(
+        from redirectURL: URL,
+        expectedRedirectURI: URL,
+        expectedState: String,
+        expectedIssuer: String?,
+        issuerParameterRequired: Bool
     ) throws -> String {
         guard
             let redirectComponents = URLComponents(url: redirectURL, resolvingAgainstBaseURL: false),
@@ -200,6 +244,20 @@ public struct OAuthAuthorizationCodeFlow: Sendable {
                 expected: expectedRedirectURI.absoluteString,
                 actual: redirectURL.absoluteString
             )
+        }
+
+        let responseIssuer = redirectComponents.queryItems?.first(where: {
+            $0.name == OAuthParameterName.issuer
+        })?.value
+        if let responseIssuer {
+            guard let expectedIssuer, responseIssuer == expectedIssuer else {
+                throw OAuthAuthorizationError.authorizationResponseIssuerMismatch(
+                    expected: expectedIssuer ?? "<missing>",
+                    actual: responseIssuer
+                )
+            }
+        } else if issuerParameterRequired {
+            throw OAuthAuthorizationError.authorizationResponseMissingIssuer
         }
 
         guard

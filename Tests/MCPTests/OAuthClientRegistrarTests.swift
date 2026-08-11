@@ -112,6 +112,67 @@ import Testing
             #expect(resultValue.updatedAuthentication == expected)
         }
 
+        @Test("Registration includes the configured application type")
+        func registrationIncludesApplicationType() async throws {
+            let body = try successRegistrationBody()
+            let (session, key) = makeIsolatedSession()
+            await IsolatedMockURLProtocol.setHandler(key: key) { request in
+                let requestBody = try #require(readRequestBody(request))
+                let payload = try #require(
+                    JSONSerialization.jsonObject(with: requestBody) as? [String: Any]
+                )
+                #expect(payload["application_type"] as? String == "native")
+                let response = HTTPURLResponse(
+                    url: self.registrationEndpoint,
+                    statusCode: 201,
+                    httpVersion: nil,
+                    headerFields: nil
+                )!
+                return (response, body)
+            }
+
+            let config = OAuthConfiguration(
+                authentication: .none(clientID: ""),
+                applicationType: .native
+            )
+            _ = try await registrar.register(
+                configuration: config,
+                asMetadata: makeASMetadata(registrationEndpoint: registrationEndpoint),
+                session: session
+            )
+        }
+
+        @Test("Application type defaults from the redirect URI")
+        func applicationTypeDefaults() {
+            let native = OAuthConfiguration(authentication: .none(clientID: "client"))
+            let web = OAuthConfiguration(
+                authentication: .none(clientID: "client"),
+                authorizationRedirectURI: URL(string: "https://app.example.com/callback")!
+            )
+
+            #expect(native.applicationType == .native)
+            #expect(web.applicationType == .web)
+        }
+
+        private func readRequestBody(_ request: URLRequest) -> Data? {
+            if let body = request.httpBody { return body }
+            guard let stream = request.httpBodyStream else { return nil }
+            stream.open()
+            defer { stream.close() }
+
+            let bufferSize = 4096
+            let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
+            defer { buffer.deallocate() }
+
+            var data = Data()
+            while stream.hasBytesAvailable {
+                let count = stream.read(buffer, maxLength: bufferSize)
+                guard count > 0 else { break }
+                data.append(buffer, count: count)
+            }
+            return data
+        }
+
         @Test("Throws on 4xx registration response")
         func testRegisterThrowsOn4xx() async throws {
             let errorBody = try JSONSerialization.data(

@@ -115,14 +115,18 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
     // MARK: - Mutable State
 
     private var configuration: OAuthConfiguration
+    private let configuredAuthentication: OAuthConfiguration.TokenEndpointAuthentication
     private let tokenStorage: TokenStorage
     private var selectedAuthorizationServer: URL?
+    private var selectedAuthorizationServerIssuer: String?
     private var protectedResourceMetadata: OAuthProtectedResourceMetadata?
     private var authorizationServerMetadata: OAuthAuthorizationServerMetadata?
     private var cachedProtectedResourceMetadataURL: URL?
     private var stepUpAttempts: [String: Int] = [:]
     private var clientRegistrationAttempted = false
+    private var clientRegistrationWasDynamic = false
     private var clientSecretExpiresAt: Date?
+    private var clientCredentialIssuer: String?
 
     // MARK: - Composable Dependencies
 
@@ -187,7 +191,9 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
         authCodeFlow: any OAuthAuthorizationCodeFlowing
     ) {
         self.configuration = configuration
+        self.configuredAuthentication = configuration.authentication
         self.tokenStorage = tokenStorage
+        self.clientCredentialIssuer = configuration.clientCredentialIssuer
         self.scopeSelector = scopeSelector
         self.challengeParser = challengeParser
         self.urlValidator = urlValidator
@@ -209,7 +215,15 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
 
     public func authorizationHeader(for endpoint: URL) -> String? {
         guard let accessToken = tokenStorage.load() else { return nil }
-        if let tokenAuthorizationServer = accessToken.authorizationServer,
+        if let tokenIssuer = accessToken.authorizationServerIssuer,
+            let selectedAuthorizationServerIssuer,
+            tokenIssuer != selectedAuthorizationServerIssuer
+        {
+            tokenStorage.clear()
+            return nil
+        }
+        if accessToken.authorizationServerIssuer == nil,
+            let tokenAuthorizationServer = accessToken.authorizationServer,
             let selectedAuthorizationServer,
             !authorizationServersMatch(tokenAuthorizationServer, selectedAuthorizationServer)
         {
@@ -402,6 +416,7 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
                 self.protectedResourceMetadata = nil
                 self.authorizationServerMetadata = nil
                 self.selectedAuthorizationServer = nil
+                self.selectedAuthorizationServerIssuer = nil
                 self.cachedProtectedResourceMetadataURL = nil
             } else {
                 return protectedResourceMetadata
@@ -501,7 +516,10 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
 
         let (server, asMetadata) = try await discoveryClient.fetchAuthorizationServerMetadata(
             candidates: candidates, session: session)
+        let issuer = asMetadata.issuerIdentifier ?? server.absoluteString
+        try prepareClientCredentials(for: issuer, metadata: asMetadata)
         self.selectedAuthorizationServer = server
+        self.selectedAuthorizationServerIssuer = issuer
         self.authorizationServerMetadata = asMetadata
         return asMetadata
     }
@@ -600,6 +618,9 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
             authorizationURL: authorizationURL,
             redirectURI: configuration.authorizationRedirectURI,
             state: state,
+            expectedIssuer: asMetadata.issuerIdentifier,
+            issuerParameterRequired:
+                asMetadata.authorizationResponseIssuerParameterSupported == true,
             delegate: configuration.authorizationDelegate,
             session: session
         )
@@ -691,6 +712,8 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
             session: session
         ) {
             configuration.authentication = updatedAuth
+            clientRegistrationWasDynamic = true
+            clientCredentialIssuer = selectedAuthorizationServerIssuer
             if let expiresAt = registration.clientSecretExpiresAt, expiresAt > 0 {
                 clientSecretExpiresAt = Date(timeIntervalSince1970: Double(expiresAt))
             }
@@ -717,7 +740,8 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
             scopes: scopeSet,
             authorizationServer: selectedAuthorizationServer,
             refreshToken: decoded.refreshToken,
-            clientID: nonEmptyClientID()
+            clientID: nonEmptyClientID(),
+            authorizationServerIssuer: selectedAuthorizationServerIssuer
         ))
     }
 
@@ -808,6 +832,59 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
         return components.url
     }
 
+    private func prepareClientCredentials(
+        for issuer: String,
+        metadata: OAuthAuthorizationServerMetadata
+    ) throws {
+        if usesPortableClientIDMetadataDocument(with: metadata) {
+            return
+        }
+
+        if clientRegistrationWasDynamic,
+            let clientCredentialIssuer,
+            clientCredentialIssuer != issuer
+        {
+            tokenStorage.clear()
+            configuration.authentication = configuredAuthentication
+            clientRegistrationAttempted = false
+            clientRegistrationWasDynamic = false
+            clientSecretExpiresAt = nil
+            self.clientCredentialIssuer = configuration.clientCredentialIssuer
+            return
+        }
+
+        guard hasConfiguredClientIdentifier else { return }
+        if let clientCredentialIssuer {
+            guard clientCredentialIssuer == issuer else {
+                tokenStorage.clear()
+                throw OAuthAuthorizationError.clientCredentialIssuerMismatch(
+                    expected: clientCredentialIssuer,
+                    actual: issuer
+                )
+            }
+        } else {
+            clientCredentialIssuer = issuer
+        }
+    }
+
+    private var hasConfiguredClientIdentifier: Bool {
+        !configuration.authentication.clientID.isEmpty
+    }
+
+    private func usesPortableClientIDMetadataDocument(
+        with metadata: OAuthAuthorizationServerMetadata
+    ) -> Bool {
+        guard case .none(let clientID) = configuration.authentication,
+            metadata.clientIDMetadataDocumentSupported == true,
+            let components = URLComponents(string: clientID)
+        else {
+            return false
+        }
+        return components.scheme?.lowercased() == OAuthURLScheme.https
+            && !components.path.isEmpty
+            && components.path != "/"
+    }
+
     // MARK: - External Token Provider
 
     private func fetchAccessTokenFromProvider(
@@ -831,7 +908,8 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
             scopes: requestedScopes ?? [],
             authorizationServer: authorizationServer,
             refreshToken: nil,
-            clientID: nonEmptyClientID()
+            clientID: nonEmptyClientID(),
+            authorizationServerIssuer: selectedAuthorizationServerIssuer
         ))
     }
 

@@ -175,4 +175,71 @@ struct OAuthAuthorizationCodeFlowTests {
         )
         #expect(code == "auth-code-123")
     }
+
+    @Test("extractCode accepts an exact response issuer")
+    func extractCodeAcceptsExactIssuer() throws {
+        let redirectURL = URL(string:
+            "https://app.example.com/callback?code=auth-code-123&state=my-state&iss=https%3A%2F%2Fauth.example.com")!
+        let code = try flow.extractCode(
+            from: redirectURL,
+            expectedRedirectURI: redirectURI,
+            expectedState: "my-state",
+            expectedIssuer: "https://auth.example.com",
+            issuerParameterRequired: true
+        )
+        #expect(code == "auth-code-123")
+    }
+
+    @Test("extractCode compares the response issuer without URL normalization")
+    func extractCodeRejectsNormalizedIssuerDifference() {
+        let redirectURL = URL(string:
+            "https://app.example.com/callback?code=auth-code-123&state=my-state&iss=https%3A%2F%2FAUTH.example.com")!
+        #expect(throws: OAuthAuthorizationError.self) {
+            try flow.extractCode(
+                from: redirectURL,
+                expectedRedirectURI: redirectURI,
+                expectedState: "my-state",
+                expectedIssuer: "https://auth.example.com",
+                issuerParameterRequired: false
+            )
+        }
+    }
+
+    @Test("extractCode rejects a missing advertised issuer")
+    func extractCodeRejectsMissingRequiredIssuer() {
+        let redirectURL = URL(string:
+            "https://app.example.com/callback?code=auth-code-123&state=my-state")!
+        let error = #expect(throws: OAuthAuthorizationError.self) {
+            try flow.extractCode(
+                from: redirectURL,
+                expectedRedirectURI: redirectURI,
+                expectedState: "my-state",
+                expectedIssuer: "https://auth.example.com",
+                issuerParameterRequired: true
+            )
+        }
+        guard case .authorizationResponseMissingIssuer = error else {
+            Issue.record("Expected a missing response issuer error")
+            return
+        }
+    }
+
+    @Test("Authorization metadata preserves the exact issuer identifier")
+    func metadataPreservesIssuerIdentifier() throws {
+        let data = Data(
+            """
+            {
+              "issuer": "https://AUTH.example.com/",
+              "authorization_response_iss_parameter_supported": true
+            }
+            """.utf8
+        )
+        let metadata = try JSONDecoder().decode(
+            OAuthAuthorizationServerMetadata.self,
+            from: data
+        )
+
+        #expect(metadata.issuerIdentifier == "https://AUTH.example.com/")
+        #expect(metadata.authorizationResponseIssuerParameterSupported == true)
+    }
 }

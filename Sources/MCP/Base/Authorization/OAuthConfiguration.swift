@@ -26,6 +26,12 @@ public struct OAuthConfiguration: Sendable {
         case clientCredentials
     }
 
+    /// OpenID Connect application type sent during Dynamic Client Registration.
+    public enum ApplicationType: String, Sendable {
+        case native
+        case web
+    }
+
     /// How the client authenticates to the OAuth token endpoint.
     public enum TokenEndpointAuthentication: Sendable, Equatable {
         /// `client_secret_basic` authentication using the Authorization header.
@@ -346,6 +352,14 @@ public struct OAuthConfiguration: Sendable {
     /// since tokens within the default skew window are already treated as expired.
     public let proactiveRefreshWindowSeconds: TimeInterval
 
+    /// Application type sent during Dynamic Client Registration.
+    public let applicationType: ApplicationType
+
+    /// Exact authorization-server issuer to which preconfigured credentials are bound.
+    ///
+    /// When omitted, the credentials are bound to the first validated issuer that uses them.
+    public let clientCredentialIssuer: String?
+
     /// Creates an OAuth configuration.
     ///
     /// - Parameters:
@@ -373,20 +387,33 @@ public struct OAuthConfiguration: Sendable {
         additionalTokenRequestParameters: [String: String] = [:],
         accessTokenProvider: AccessTokenProvider? = nil,
         authorizationDelegate: (any OAuthAuthorizationDelegate)? = nil,
-        proactiveRefreshWindowSeconds: TimeInterval = 60
+        proactiveRefreshWindowSeconds: TimeInterval = 60,
+        applicationType: ApplicationType? = nil,
+        clientCredentialIssuer: String? = nil
     ) {
         self.grantType = grantType
         self.authentication = authentication
         self.retryPolicy = retryPolicy
         self.endpointOverrides = endpointOverrides
         self.allowLoopbackHTTPAuthorizationServerEndpoints = false
-        self.authorizationRedirectURI =
+        let resolvedRedirectURI =
             authorizationRedirectURI ?? Self.defaultAuthorizationRedirectURI()
+        self.authorizationRedirectURI = resolvedRedirectURI
         self.clientName = clientName
         self.additionalTokenRequestParameters = additionalTokenRequestParameters
         self.accessTokenProvider = accessTokenProvider
         self.authorizationDelegate = authorizationDelegate
         self.proactiveRefreshWindowSeconds = proactiveRefreshWindowSeconds
+        self.applicationType =
+            applicationType ?? Self.defaultApplicationType(for: resolvedRedirectURI)
+        self.clientCredentialIssuer = clientCredentialIssuer
+    }
+
+    private static func defaultApplicationType(for redirectURI: URL) -> ApplicationType {
+        guard let host = redirectURI.host?.lowercased(), OAuthLoopbackHost.isLoopback(host) else {
+            return .web
+        }
+        return .native
     }
 }
 

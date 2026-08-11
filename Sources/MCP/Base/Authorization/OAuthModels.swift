@@ -71,12 +71,15 @@ struct OAuthProtectedResourceMetadata: Decodable, Sendable, Equatable {
 /// RFC8414/OIDC authorization server metadata.
 struct OAuthAuthorizationServerMetadata: Decodable, Sendable, Equatable {
     let issuer: URL?
+    /// The issuer exactly as it appeared in metadata, before URL normalization.
+    let issuerIdentifier: String?
     let authorizationEndpoint: URL?
     let tokenEndpoint: URL?
     let registrationEndpoint: URL?
     let codeChallengeMethodsSupported: [String]?
     let tokenEndpointAuthMethodsSupported: [String]?
     let clientIDMetadataDocumentSupported: Bool?
+    let authorizationResponseIssuerParameterSupported: Bool?
 
     enum CodingKeys: String, CodingKey {
         case issuer
@@ -86,6 +89,49 @@ struct OAuthAuthorizationServerMetadata: Decodable, Sendable, Equatable {
         case codeChallengeMethodsSupported = "code_challenge_methods_supported"
         case tokenEndpointAuthMethodsSupported = "token_endpoint_auth_methods_supported"
         case clientIDMetadataDocumentSupported = "client_id_metadata_document_supported"
+        case authorizationResponseIssuerParameterSupported =
+            "authorization_response_iss_parameter_supported"
+    }
+
+    init(
+        issuer: URL?,
+        authorizationEndpoint: URL?,
+        tokenEndpoint: URL?,
+        registrationEndpoint: URL?,
+        codeChallengeMethodsSupported: [String]?,
+        tokenEndpointAuthMethodsSupported: [String]?,
+        clientIDMetadataDocumentSupported: Bool?,
+        authorizationResponseIssuerParameterSupported: Bool? = nil,
+        issuerIdentifier: String? = nil
+    ) {
+        self.issuer = issuer
+        self.issuerIdentifier = issuerIdentifier ?? issuer?.absoluteString
+        self.authorizationEndpoint = authorizationEndpoint
+        self.tokenEndpoint = tokenEndpoint
+        self.registrationEndpoint = registrationEndpoint
+        self.codeChallengeMethodsSupported = codeChallengeMethodsSupported
+        self.tokenEndpointAuthMethodsSupported = tokenEndpointAuthMethodsSupported
+        self.clientIDMetadataDocumentSupported = clientIDMetadataDocumentSupported
+        self.authorizationResponseIssuerParameterSupported =
+            authorizationResponseIssuerParameterSupported
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        issuerIdentifier = try container.decodeIfPresent(String.self, forKey: .issuer)
+        issuer = issuerIdentifier.flatMap(URL.init(string:))
+        authorizationEndpoint = try container.decodeIfPresent(
+            URL.self, forKey: .authorizationEndpoint)
+        tokenEndpoint = try container.decodeIfPresent(URL.self, forKey: .tokenEndpoint)
+        registrationEndpoint = try container.decodeIfPresent(URL.self, forKey: .registrationEndpoint)
+        codeChallengeMethodsSupported = try container.decodeIfPresent(
+            [String].self, forKey: .codeChallengeMethodsSupported)
+        tokenEndpointAuthMethodsSupported = try container.decodeIfPresent(
+            [String].self, forKey: .tokenEndpointAuthMethodsSupported)
+        clientIDMetadataDocumentSupported = try container.decodeIfPresent(
+            Bool.self, forKey: .clientIDMetadataDocumentSupported)
+        authorizationResponseIssuerParameterSupported = try container.decodeIfPresent(
+            Bool.self, forKey: .authorizationResponseIssuerParameterSupported)
     }
 }
 
@@ -132,6 +178,9 @@ public struct OAuthAccessToken: Sendable, Codable {
     /// triggering a token invalidation.
     public let authorizationServer: URL?
 
+    /// Exact issuer identifier associated with the authorization server.
+    public let authorizationServerIssuer: String?
+
     /// The refresh token, if the authorization server issued one alongside the access token.
     public let refreshToken: String?
 
@@ -151,13 +200,16 @@ public struct OAuthAccessToken: Sendable, Codable {
         scopes: Set<String>,
         authorizationServer: URL?,
         refreshToken: String?,
-        clientID: String? = nil
+        clientID: String? = nil,
+        authorizationServerIssuer: String? = nil
     ) {
         self.value = value
         self.tokenType = tokenType
         self.expiresAt = expiresAt
         self.scopes = scopes
         self.authorizationServer = authorizationServer
+        self.authorizationServerIssuer =
+            authorizationServerIssuer ?? authorizationServer?.absoluteString
         self.refreshToken = refreshToken
         self.clientID = clientID
     }

@@ -1931,11 +1931,13 @@ import Testing
                     ),
                     asMetadataURL_A: MockResponses.asMetadata(
                         issuer: "https://localhost:8080/auth-a",
-                        tokenEndpoint: "https://localhost:8080/oauth/token-a"
+                        tokenEndpoint: "https://localhost:8080/oauth/token-a",
+                        clientIDMetadataDocumentSupported: true
                     ),
                     asMetadataURL_B: MockResponses.asMetadata(
                         issuer: "https://localhost:8080/auth-b",
-                        tokenEndpoint: "https://localhost:8080/oauth/token-b"
+                        tokenEndpoint: "https://localhost:8080/oauth/token-b",
+                        clientIDMetadataDocumentSupported: true
                     ),
                     tokenEndpointURL_A: MockResponses.tokenSuccess(accessToken: "token-a"),
                     tokenEndpointURL_B: MockResponses.tokenSuccess(accessToken: "token-b"),
@@ -1943,7 +1945,10 @@ import Testing
 
                 return OAuthScenarioContext(
                     testEndpoint: testEndpoint,
-                    oauthConfiguration: .init(authentication: .none(clientID: "test-client")),
+                    oauthConfiguration: .init(
+                        authentication: .none(
+                            clientID: "https://client.example.com/oauth/client-metadata.json")
+                    ),
                     messageData: #"{"jsonrpc":"2.0","method":"ping","id":71}"#.data(using: .utf8)!,
                     expectedResponseData: firstResponseData,
                     expectedCallCounts: [

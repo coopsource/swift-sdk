@@ -106,6 +106,12 @@ public enum OAuthAuthorizationError: LocalizedError {
     ///   - actual: The `state` value received in the authorization response.
     case authorizationResponseStateMismatch(expected: String, actual: String)
 
+    /// Metadata requires an RFC 9207 issuer parameter but the response omitted it.
+    case authorizationResponseMissingIssuer
+
+    /// The response issuer does not exactly match the issuer recorded before authorization.
+    case authorizationResponseIssuerMismatch(expected: String, actual: String)
+
     /// The authorization response redirect URL is missing the `code` parameter.
     case authorizationResponseMissingCode
 
@@ -130,6 +136,9 @@ public enum OAuthAuthorizationError: LocalizedError {
     ///   - expected: The issuer URL derived from the discovery candidate.
     ///   - actual: The `issuer` field value found in the metadata document.
     case authorizationServerIssuerMismatch(expected: String, actual: String)
+
+    /// Configured client credentials are bound to another authorization server.
+    case clientCredentialIssuerMismatch(expected: String, actual: String)
 
     public var errorDescription: String? {
         switch self {
@@ -183,6 +192,10 @@ public enum OAuthAuthorizationError: LocalizedError {
             return "Authorization response is missing state"
         case .authorizationResponseStateMismatch(let expected, let actual):
             return "Authorization response state mismatch. Expected \(expected), got \(actual)"
+        case .authorizationResponseMissingIssuer:
+            return "Authorization response is missing the required issuer"
+        case .authorizationResponseIssuerMismatch(let expected, let actual):
+            return "Authorization response issuer mismatch. Expected \(expected), got \(actual)"
         case .authorizationResponseMissingCode:
             return "Authorization response is missing the authorization code"
         case .pkceCodeChallengeMethodsMissing:
@@ -198,6 +211,9 @@ public enum OAuthAuthorizationError: LocalizedError {
         case .authorizationServerIssuerMismatch(let expected, let actual):
             return
                 "Authorization server issuer mismatch. Expected \(expected), got \(actual)"
+        case .clientCredentialIssuerMismatch(let expected, let actual):
+            return
+                "Client credentials are bound to authorization server \(expected), not \(actual)"
         }
     }
 }

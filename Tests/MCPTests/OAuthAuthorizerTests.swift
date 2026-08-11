@@ -122,6 +122,8 @@ final class MockAuthCodeFlow: OAuthAuthorizationCodeFlowing, @unchecked Sendable
     var buildURLCallCount = 0
     var performCallCount = 0
     var authorizationCode = "mock-auth-code"
+    var capturedExpectedIssuer: String?
+    var capturedIssuerParameterRequired = false
 
     func buildURL(
         authorizationEndpoint: URL,
@@ -141,10 +143,14 @@ final class MockAuthCodeFlow: OAuthAuthorizationCodeFlowing, @unchecked Sendable
         authorizationURL: URL,
         redirectURI: URL,
         state: String,
+        expectedIssuer: String?,
+        issuerParameterRequired: Bool,
         delegate: (any OAuthAuthorizationDelegate)?,
         session: URLSession
     ) async throws -> String {
         performCallCount += 1
+        capturedExpectedIssuer = expectedIssuer
+        capturedIssuerParameterRequired = issuerParameterRequired
         return authorizationCode
     }
 }
@@ -296,6 +302,8 @@ struct OAuthAuthorizerTests {
 
         #expect(authCodeFlow.buildURLCallCount == 1)
         #expect(authCodeFlow.performCallCount == 1)
+        #expect(authCodeFlow.capturedExpectedIssuer == "https://auth.example.com")
+        #expect(authCodeFlow.capturedIssuerParameterRequired == false)
         #expect(tokenClient.capturedParameters?["grant_type"] == "authorization_code")
         #expect(tokenClient.capturedParameters?["code"] == "mock-auth-code")
     }
@@ -425,5 +433,101 @@ struct OAuthAuthorizerTests {
         #expect(handled == true)
         #expect(registrar.registerCallCount == 1)
         #expect(tokenStorage.load()?.clientID == assignedClientID)
+        #expect(tokenStorage.load()?.authorizationServerIssuer == "https://auth.example.com")
+    }
+
+    @Test("Preconfigured credentials reject a different issuer")
+    func preconfiguredCredentialIssuerMismatch() async {
+        let config = OAuthConfiguration(
+            authentication: .clientSecretBasic(clientID: "client", clientSecret: "secret"),
+            clientCredentialIssuer: "https://expected.example.com"
+        )
+        let authorizer = OAuthAuthorizer(
+            configuration: config,
+            urlValidator: MockURLValidator(),
+            discoveryClient: MockDiscoveryClient(),
+            tokenEndpointClient: MockTokenClient(),
+            clientRegistrar: MockClientRegistrar(),
+            authCodeFlow: MockAuthCodeFlow()
+        )
+
+        let error = await #expect(throws: OAuthAuthorizationError.self) {
+            try await authorizer.handleChallenge(
+                statusCode: 401,
+                headers: headers401,
+                endpoint: endpoint,
+                operationKey: nil,
+                session: .shared
+            )
+        }
+        guard case .clientCredentialIssuerMismatch(let expected, let actual) = error else {
+            Issue.record("Expected a client credential issuer mismatch")
+            return
+        }
+        #expect(expected == "https://expected.example.com")
+        #expect(actual == "https://auth.example.com")
+    }
+
+    @Test("Dynamic registration repeats when the issuer changes")
+    func dynamicRegistrationFollowsIssuer() async throws {
+        let discovery = MockDiscoveryClient()
+        let registrar = MockClientRegistrar()
+        registrar.registrationResult = (
+            response: OAuthClientRegistrationResponse(
+                clientID: "assigned-client",
+                clientSecret: nil,
+                tokenEndpointAuthMethod: nil,
+                clientSecretExpiresAt: nil
+            ),
+            updatedAuthentication: .none(clientID: "assigned-client")
+        )
+        let authorizer = OAuthAuthorizer(
+            configuration: OAuthConfiguration(authentication: .none(clientID: "")),
+            urlValidator: MockURLValidator(),
+            discoveryClient: discovery,
+            tokenEndpointClient: MockTokenClient(),
+            clientRegistrar: registrar,
+            authCodeFlow: MockAuthCodeFlow()
+        )
+
+        _ = try await authorizer.handleChallenge(
+            statusCode: 401,
+            headers: headers401,
+            endpoint: endpoint,
+            operationKey: nil,
+            session: .shared
+        )
+
+        let secondIssuer = URL(string: "https://other-auth.example.com")!
+        discovery.protectedResourceMetadataResult = OAuthProtectedResourceMetadata(
+            resource: nil,
+            authorizationServers: [secondIssuer],
+            scopesSupported: nil
+        )
+        discovery.authorizationServerMetadataResult = (
+            server: secondIssuer,
+            metadata: OAuthAuthorizationServerMetadata(
+                issuer: secondIssuer,
+                authorizationEndpoint: secondIssuer.appendingPathComponent("authorize"),
+                tokenEndpoint: secondIssuer.appendingPathComponent("token"),
+                registrationEndpoint: secondIssuer.appendingPathComponent("register"),
+                codeChallengeMethodsSupported: ["S256"],
+                tokenEndpointAuthMethodsSupported: nil,
+                clientIDMetadataDocumentSupported: nil
+            )
+        )
+
+        _ = try await authorizer.handleChallenge(
+            statusCode: 401,
+            headers: [
+                "WWW-Authenticate":
+                    "Bearer resource_metadata=\"https://mcp.example.com/second-metadata\""
+            ],
+            endpoint: endpoint,
+            operationKey: nil,
+            session: .shared
+        )
+
+        #expect(registrar.registerCallCount == 2)
     }
 }
