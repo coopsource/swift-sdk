@@ -377,6 +377,11 @@ public struct OAuthConfiguration: Sendable {
     ///     user for interactive `authorization_code` flows.
     ///   - proactiveRefreshWindowSeconds: Seconds before expiry at which a token is proactively
     ///     refreshed. Defaults to 60. Set to 0 to disable proactive refresh.
+    ///   - applicationType: Application type sent during Dynamic Client Registration. When
+    ///     omitted, it is inferred from `authorizationRedirectURI`.
+    ///   - clientCredentialIssuer: Exact authorization-server issuer for preconfigured
+    ///     credentials. When omitted, the credentials bind to the first validated issuer that
+    ///     uses them.
     public init(
         grantType: GrantType = .clientCredentials,
         authentication: TokenEndpointAuthentication,
