@@ -161,6 +161,19 @@ struct Protocol20260728Tests {
         }
     }
 
+    @Test("Tool results preserve explicit null structured content")
+    func callToolResultNullStructuredContent() throws {
+        let result = try JSONDecoder().decode(
+            CallTool.Result.self,
+            from: Data(#"{"content":[],"structuredContent":null}"#.utf8)
+        )
+
+        #expect(result.structuredContent == .null)
+        let encoded = try JSONEncoder().encode(result)
+        let object = try JSONDecoder().decode([String: Value].self, from: encoded)
+        #expect(object["structuredContent"] == .null)
+    }
+
     @Test("Official resource-link fixture remains compatible")
     func resourceLinkFixture() throws {
         let content = try JSONDecoder().decode(

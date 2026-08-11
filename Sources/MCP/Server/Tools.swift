@@ -464,8 +464,9 @@ public enum CallTool: Method {
         public init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             content = try container.decode([Tool.Content].self, forKey: .content)
-            structuredContent = try container.decodeIfPresent(
-                Value.self, forKey: .structuredContent)
+            structuredContent = try container.contains(.structuredContent)
+                ? container.decode(Value.self, forKey: .structuredContent)
+                : nil
             isError = try container.decodeIfPresent(Bool.self, forKey: .isError)
             _meta = try container.decodeIfPresent(Metadata.self, forKey: ._meta)
         }
