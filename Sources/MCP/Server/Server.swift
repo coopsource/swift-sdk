@@ -302,8 +302,22 @@ public actor Server {
     /// Pending requests sent to the client, awaiting responses
     private var pendingRequests: [ID: AnyPendingRequest] = [:]
 
-    /// Whether the server is initialized
-    private var isInitialized = false
+    private enum InitializationPhase {
+        case notStarted
+        case handling
+        case responseSending
+        case responseSent
+        case ready
+    }
+
+    private var initializationPhase = InitializationPhase.notStarted
+    private var isInitialized: Bool {
+        switch initializationPhase {
+        case .responseSent, .ready: true
+        case .notStarted, .handling, .responseSending: false
+        }
+    }
+    private var pendingInitializedNotification: AnyMessage?
     /// The client information
     private var clientInfo: Client.Info?
     /// The client capabilities
@@ -856,6 +870,7 @@ public actor Server {
 
         // Process each item in the batch and collect responses
         var responses: [Response<AnyMethod>] = []
+        var includesInitializationResponse = false
 
         for item in batch.items {
             do {
@@ -864,6 +879,11 @@ public actor Server {
                     // For batched requests, collect responses instead of sending immediately
                     if let response = try await handleRequest(request, sendResponse: false) {
                         responses.append(response)
+                        if request.method == Initialize.name,
+                            case .success = response.result
+                        {
+                            includesInitializationResponse = true
+                        }
                     }
 
                 case .notification(let notification):
@@ -890,7 +910,18 @@ public actor Server {
                 throw MCPError.internalError("Server connection not initialized")
             }
 
-            try await connection.send(responseData)
+            if includesInitializationResponse {
+                beginInitializationResponseSend()
+            }
+            do {
+                try await connection.send(responseData)
+            } catch {
+                if includesInitializationResponse { resetInitialization() }
+                throw error
+            }
+            if includesInitializationResponse {
+                try await finishInitializationResponseSend()
+            }
         }
     }
 
@@ -998,8 +1029,19 @@ public actor Server {
             let response = try await handlerTask.value
 
             if sendResponse {
-                try await send(
-                    response, protocolLifecycle: handlerContext.protocolLifecycle)
+                if request.method == Initialize.name {
+                    beginInitializationResponseSend()
+                }
+                do {
+                    try await send(
+                        response, protocolLifecycle: handlerContext.protocolLifecycle)
+                } catch {
+                    if request.method == Initialize.name { resetInitialization() }
+                    throw error
+                }
+                if request.method == Initialize.name {
+                    try await finishInitializationResponseSend()
+                }
                 return nil
             }
 
@@ -1009,6 +1051,9 @@ public actor Server {
             return nil
         } catch {
             // This should not happen as errors are caught in the task
+            if request.method == Initialize.name {
+                resetInitialization()
+            }
             let mcpError = error as? MCPError ?? MCPError.internalError(error.localizedDescription)
             let response = AnyMethod.response(id: request.id, error: mcpError)
 
@@ -1061,7 +1106,7 @@ public actor Server {
                         "initialize is not supported; supported protocol versions: "
                             + supportedProtocolVersions.joined(separator: ", "))
                 }
-                throw MCPError.invalidRequest(
+                throw MCPError.invalidParams(
                     "Request is missing required per-request protocol metadata")
             }
         }
@@ -1112,9 +1157,31 @@ public actor Server {
             "Processing notification",
             metadata: ["method": "\(message.method)"])
 
-        if configuration.strict && configuration.protocolMode == .initializationOnly {
-            // Check initialization state unless this is an initialized notification
-            if message.method != InitializedNotification.name {
+        if message.method == InitializedNotification.name {
+            guard configuration.protocolMode != .perRequestMetadataOnly else {
+                throw MCPError.invalidRequest(
+                    "notifications/initialized is not defined for per-request metadata")
+            }
+            if initializationPhase == .responseSending {
+                pendingInitializedNotification = message
+                return
+            }
+            if configuration.strict {
+                guard initializationPhase == .responseSent else {
+                    throw MCPError.invalidRequest(
+                        "notifications/initialized must follow the initialize response")
+                }
+            }
+            if initializationPhase == .responseSent {
+                initializationPhase = .ready
+            }
+        } else if configuration.strict {
+            let isRelatedPerRequestCancellation =
+                configuration.protocolMode == .initializationAndPerRequestMetadata
+                && correlatedCancellationRequestID(in: message).map {
+                    pendingRequestTasks[$0] != nil
+                } == true
+            if !isRelatedPerRequestCancellation {
                 try checkInitialized()
             }
         }
@@ -1159,6 +1226,17 @@ public actor Server {
         }
     }
 
+    private func correlatedCancellationRequestID(in message: AnyMessage) -> ID? {
+        guard message.method == CancelledNotification.name,
+            let value = message.params.objectValue?["requestId"]
+        else {
+            return nil
+        }
+        if let string = value.stringValue { return .string(string) }
+        if let number = value.intValue { return .number(number) }
+        return nil
+    }
+
     /// Validate the client capabilities.
     /// Throws an error if the server is configured to be strict and the capability is not supported.
     private func validateClientCapability<T>(
@@ -1186,33 +1264,38 @@ public actor Server {
                 throw MCPError.internalError("Server was deallocated")
             }
 
-            guard await !self.isInitialized else {
+            guard await self.beginInitialization() else {
                 throw MCPError.invalidRequest("Server is already initialized")
             }
 
-            // Call initialization hook if registered
-            if let hook = initializeHook {
-                try await hook(params.clientInfo, params.capabilities)
+            do {
+                // Call initialization hook if registered
+                if let hook = initializeHook {
+                    try await hook(params.clientInfo, params.capabilities)
+                }
+
+                // Perform version negotiation
+                let clientRequestedVersion = params.protocolVersion
+                let negotiatedProtocolVersion = Version.negotiate(
+                    clientRequestedVersion: clientRequestedVersion)
+
+                // Set initial state with the negotiated protocol version
+                await self.setInitialState(
+                    clientInfo: params.clientInfo,
+                    clientCapabilities: params.capabilities,
+                    protocolVersion: negotiatedProtocolVersion
+                )
+
+                return Initialize.Result(
+                    protocolVersion: negotiatedProtocolVersion,
+                    capabilities: await self.capabilities,
+                    serverInfo: self.serverInfo,
+                    instructions: self.instructions
+                )
+            } catch {
+                await self.resetInitialization()
+                throw error
             }
-
-            // Perform version negotiation
-            let clientRequestedVersion = params.protocolVersion
-            let negotiatedProtocolVersion = Version.negotiate(
-                clientRequestedVersion: clientRequestedVersion)
-
-            // Set initial state with the negotiated protocol version
-            await self.setInitialState(
-                clientInfo: params.clientInfo,
-                clientCapabilities: params.capabilities,
-                protocolVersion: negotiatedProtocolVersion
-            )
-
-            return Initialize.Result(
-                protocolVersion: negotiatedProtocolVersion,
-                capabilities: await self.capabilities,
-                serverInfo: self.serverInfo,
-                instructions: self.instructions
-            )
         }
 
         // Discovery
@@ -1248,7 +1331,37 @@ public actor Server {
         self.clientInfo = clientInfo
         self.clientCapabilities = clientCapabilities
         self.protocolVersion = protocolVersion
-        self.isInitialized = true
+    }
+
+    private func beginInitialization() -> Bool {
+        guard initializationPhase == .notStarted else { return false }
+        initializationPhase = .handling
+        return true
+    }
+
+    private func beginInitializationResponseSend() {
+        guard initializationPhase == .handling else { return }
+        initializationPhase = .responseSending
+    }
+
+    private func finishInitializationResponseSend() async throws {
+        guard initializationPhase == .responseSending else { return }
+        initializationPhase = .responseSent
+        if let notification = pendingInitializedNotification {
+            pendingInitializedNotification = nil
+            try await handleMessage(notification)
+        }
+    }
+
+    private func resetInitialization() {
+        guard initializationPhase == .handling || initializationPhase == .responseSending else {
+            return
+        }
+        initializationPhase = .notStarted
+        pendingInitializedNotification = nil
+        clientInfo = nil
+        clientCapabilities = nil
+        protocolVersion = nil
     }
 
     /// Cancel and remove a pending request task

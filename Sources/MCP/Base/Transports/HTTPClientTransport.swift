@@ -684,3 +684,5 @@ public actor HTTPClientTransport: Transport {
         }
     #endif
 }
+
+extension HTTPClientTransport: HTTPProtocolNegotiationTransport {}

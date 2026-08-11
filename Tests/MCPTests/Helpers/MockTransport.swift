@@ -34,6 +34,7 @@ actor MockTransport: Transport {
 
     var shouldFailConnect = false
     var shouldFailSend = false
+    private var sendObserver: (@Sendable (Data) async -> Void)?
 
     init(logger: Logger = Logger(label: "mcp.test.transport")) {
         self.logger = logger
@@ -57,6 +58,7 @@ actor MockTransport: Transport {
             throw MCPError.transportError(POSIXError(.EIO))
         }
         sentData.append(message)
+        await sendObserver?(message)
     }
 
     public func receive() -> AsyncThrowingStream<Data, Swift.Error> {
@@ -78,6 +80,10 @@ actor MockTransport: Transport {
 
     func setFailSend(_ shouldFail: Bool) {
         shouldFailSend = shouldFail
+    }
+
+    func setSendObserver(_ observer: (@Sendable (Data) async -> Void)?) {
+        sendObserver = observer
     }
 
     func queue(data: Data) {
