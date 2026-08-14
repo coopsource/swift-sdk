@@ -325,7 +325,7 @@ func runAuthorizationScenario(scenario: String, args: [String]) async throws {
 
     let transport = HTTPClientTransport(
         endpoint: serverURL,
-        streaming: true,
+        enableStandaloneGetStream: true,
         authorizer: OAuthAuthorizer(configuration: oauthConfig),
         logger: logger
     )
@@ -489,7 +489,7 @@ func runSSEScenario(_ args: [String]) async throws {
     // Create HTTP transport with streaming enabled
     let transport = HTTPClientTransport(
         endpoint: serverURL,
-        streaming: true,
+        enableStandaloneGetStream: true,
         logger: logger
     )
 
@@ -545,7 +545,7 @@ func runElicitationSEP1034ClientDefaults(_ args: [String]) async throws {
     // Create HTTP transport with streaming enabled for bidirectional communication
     let transport = HTTPClientTransport(
         endpoint: serverURL,
-        streaming: true,
+        enableStandaloneGetStream: true,
         logger: logger
     )
 

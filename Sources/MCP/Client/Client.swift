@@ -445,6 +445,8 @@ public actor Client {
     private var selectedProtocolLifecycle: ProtocolLifecycle?
     /// The protocol version selected for the active connection.
     private var selectedProtocolVersion: String?
+    /// Protocol lifecycle previously selected for an HTTP origin.
+    private var protocolLifecycleCache: [String: ProtocolLifecycle] = [:]
     /// Whether the initialization-based ready notification has been sent.
     private var initializationNotificationSent = false
     /// Aggregate handler used when multi-round-trip mode is manual.
@@ -495,6 +497,17 @@ public actor Client {
     /// Connects to a server and reports the selected protocol lifecycle.
     @discardableResult
     public func connectWithInfo(transport: any Transport) async throws -> ConnectionInfo {
+        let lifecycleCacheKey: String?
+        let cachedProtocolLifecycle: ProtocolLifecycle?
+        if configuration.protocolMode == .automatic,
+            let cacheKeyProvider = transport as? any ProtocolLifecycleCacheKeyProviding
+        {
+            lifecycleCacheKey = await cacheKeyProvider.protocolLifecycleCacheKey()
+            cachedProtocolLifecycle = lifecycleCacheKey.flatMap { protocolLifecycleCache[$0] }
+        } else {
+            lifecycleCacheKey = nil
+            cachedProtocolLifecycle = nil
+        }
         self.connection = transport
         selectedProtocolLifecycle = nil
         selectedProtocolVersion = nil
@@ -506,7 +519,15 @@ public actor Client {
                     .initializationBased,
                     protocolVersion: Version.latestInitializationVersion
                 )
-            case .automatic, .perRequestMetadataOnly:
+            case .automatic:
+                let lifecycle = cachedProtocolLifecycle ?? .perRequestMetadata
+                await transport.updateProtocolLifecycle(
+                    lifecycle,
+                    protocolVersion: lifecycle == .initializationBased
+                        ? Version.latestInitializationVersion
+                        : Version.perRequestMetadataVersion
+                )
+            case .perRequestMetadataOnly:
                 await transport.updateProtocolLifecycle(
                     .perRequestMetadata,
                     protocolVersion: Version.perRequestMetadataVersion
@@ -586,30 +607,50 @@ public actor Client {
             }
         }
 
+        let connectionInfo: ConnectionInfo
         switch configuration.protocolMode {
         case .initializationOnly:
-            return try await initializeConnection()
+            connectionInfo = try await initializeConnection()
         case .automatic:
-            do {
-                return try await discoverConnection()
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch ProtocolLifecycleProbeError.initializationBasedResponse {
-                return try await initializeConnection()
-            } catch ProtocolLifecycleProbeError.inconclusive(let error) {
-                throw error
-            } catch {
-                guard !isRecognizedPerRequestMetadataError(error) else { throw error }
-                guard shouldFallbackToInitialization(after: error) else { throw error }
-                await logger?.warning(
-                    "Server discovery failed; falling back to the initialization handshake",
-                    metadata: ["error": "\(error)"]
-                )
-                return try await initializeConnection()
+            if cachedProtocolLifecycle == .initializationBased {
+                do {
+                    connectionInfo = try await initializeConnection()
+                } catch {
+                    if let lifecycleCacheKey {
+                        protocolLifecycleCache.removeValue(forKey: lifecycleCacheKey)
+                    }
+                    throw error
+                }
+            } else {
+                do {
+                    connectionInfo = try await discoverConnection()
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    switch classifyDiscoveryFailure(error) {
+                    case .initializationBased:
+                        await logger?.warning(
+                            "Server discovery failed; falling back to the initialization handshake",
+                            metadata: ["error": "\(error)"]
+                        )
+                        connectionInfo = try await initializeConnection()
+                    case .inconclusive(let error):
+                        throw error
+                    }
+                }
             }
         case .perRequestMetadataOnly:
-            return try await discoverConnection()
+            do {
+                connectionInfo = try await discoverConnection()
+            } catch {
+                throw underlyingDiscoveryError(error)
+            }
         }
+
+        if let lifecycleCacheKey {
+            protocolLifecycleCache[lifecycleCacheKey] = connectionInfo.protocolLifecycle
+        }
+        return connectionInfo
     }
 
     /// Disconnect the client and cancel all pending requests
@@ -1318,7 +1359,9 @@ public actor Client {
             result = try await awaitDiscovery(context)
         } catch {
             if mayRetryVersion,
-                let retryVersion = mutuallySupportedVersion(from: error)
+                let retryVersion = mutuallySupportedVersion(
+                    from: underlyingDiscoveryError(error)
+                )
             {
                 return try await discoverConnection(
                     requestedVersion: retryVersion,
@@ -1443,8 +1486,47 @@ public actor Client {
             || code == ProtocolErrorCode.unsupportedProtocolVersion
     }
 
-    private func shouldFallbackToInitialization(after _: Swift.Error) -> Bool {
-        !(connection is any HTTPProtocolNegotiationTransport)
+    private enum DiscoveryFailureDisposition {
+        case initializationBased
+        case inconclusive(Swift.Error)
+    }
+
+    private func classifyDiscoveryFailure(
+        _ error: Swift.Error
+    ) -> DiscoveryFailureDisposition {
+        if let probeError = error as? ProtocolLifecycleProbeError {
+            switch probeError {
+            case .initializationBasedResponse:
+                return .initializationBased
+            case .correlatedHTTPResponse(let statusCode, let remoteError):
+                guard statusCode == 200 || [400, 404, 405].contains(statusCode),
+                    !isRecognizedPerRequestMetadataError(remoteError)
+                else {
+                    return .inconclusive(remoteError)
+                }
+                return .initializationBased
+            case .inconclusive(let error):
+                return .inconclusive(error)
+            }
+        }
+
+        if connection is any HTTPProtocolNegotiationTransport {
+            return .inconclusive(error)
+        }
+        guard !isRecognizedPerRequestMetadataError(error) else {
+            return .inconclusive(error)
+        }
+        return .initializationBased
+    }
+
+    private func underlyingDiscoveryError(_ error: Swift.Error) -> Swift.Error {
+        guard let probeError = error as? ProtocolLifecycleProbeError else { return error }
+        switch probeError {
+        case .initializationBasedResponse:
+            return error
+        case .correlatedHTTPResponse(_, let error), .inconclusive(let error):
+            return error
+        }
     }
 
     private func mutuallySupportedVersion(from error: Swift.Error) -> String? {

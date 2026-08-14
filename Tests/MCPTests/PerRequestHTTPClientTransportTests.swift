@@ -153,6 +153,13 @@ import Testing
         }
     }
 
+    private actor ProtocolMethodRecorder {
+        private(set) var methods: [String] = []
+
+        func record(_ method: String) {
+            methods.append(method)
+        }
+    }
     private final class RefreshingAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
         let tracker = AuthorizationCallTracker()
         let maxAuthorizationAttempts = 3
@@ -270,6 +277,63 @@ import Testing
         func initializationVersionDefault() async {
             let transport = makeTransport()
             #expect(await transport.protocolVersion == Version.latestInitializationVersion)
+        }
+
+        @Test("Canonical and compatibility standalone GET options expose the same behavior")
+        @available(*, deprecated)
+        func standaloneGetOptionCompatibility() {
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [PerRequestHTTPURLProtocol.self]
+            let canonical = HTTPClientTransport(
+                endpoint: endpoint,
+                configuration: configuration,
+                enableStandaloneGetStream: false
+            )
+            let compatibility = HTTPClientTransport(
+                endpoint: endpoint,
+                configuration: configuration,
+                streaming: true
+            )
+
+            #expect(canonical.enableStandaloneGetStream == false)
+            #expect(compatibility.enableStandaloneGetStream == true)
+        }
+
+        @Test("Selecting the modern lifecycle clears initialization session state")
+        func modernLifecycleClearsSessionState() async throws {
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [PerRequestHTTPURLProtocol.self]
+            let transport = HTTPClientTransport(
+                endpoint: endpoint,
+                configuration: configuration,
+                enableStandaloneGetStream: false
+            )
+            await PerRequestHTTPURLProtocol.setHandler { [endpoint] _ in
+                (
+                    HTTPURLResponse(
+                        url: endpoint,
+                        statusCode: 200,
+                        httpVersion: "HTTP/1.1",
+                        headerFields: [
+                            "Content-Type": ContentType.json,
+                            "Mcp-Session-Id": "initialization-session",
+                        ]
+                    )!,
+                    Data()
+                )
+            }
+
+            try await transport.connect()
+            try await transport.send(Data())
+            #expect(await transport.sessionID == "initialization-session")
+
+            await transport.updateProtocolLifecycle(
+                .perRequestMetadata,
+                protocolVersion: Version.perRequestMetadataVersion
+            )
+            #expect(await transport.sessionID == nil)
+            #expect(transport.enableStandaloneGetStream == false)
+            await transport.disconnect()
         }
 
         @Test("Per-request JSON response uses one POST without session state")
@@ -768,12 +832,119 @@ import Testing
                 version: "1.0",
                 configuration: .init(protocolMode: .automatic)
             )
-            let info = try await client.connectWithInfo(transport: makeTransport(streaming: true))
+            let info = try await client.connectWithInfo(transport: makeTransport(enableStandaloneGetStream: true))
             #expect(info.protocolLifecycle == .perRequestMetadata)
             #expect(info.protocolVersion == Version.perRequestMetadataVersion)
             await PerRequestHTTPURLProtocol.verifyCallCount(1, for: endpoint)
             await client.disconnect()
         }
+
+        #if !canImport(FoundationNetworking)
+            @Test("Automatic initialization fallback opens the configured standalone GET stream")
+            func automaticFallbackStartsStandaloneGet() async throws {
+                await PerRequestHTTPURLProtocol.storage.reset()
+                await PerRequestHTTPURLProtocol.storage.setHandler { [endpoint] request in
+                    if request.httpMethod == "GET" {
+                        return StreamingHTTPScript(
+                            response: HTTPURLResponse(
+                                url: endpoint,
+                                statusCode: 200,
+                                httpVersion: "HTTP/1.1",
+                                headerFields: ["Content-Type": ContentType.sse]
+                            )!,
+                            events: [.finish(delayMilliseconds: 200)]
+                        )
+                    }
+
+                    let body = try #require(requestBody(request))
+                    let envelope = try JSONDecoder().decode(Value.self, from: body)
+                    let method = try #require(envelope.objectValue?["method"]?.stringValue)
+                    if method == InitializedNotification.name {
+                        return StreamingHTTPScript(
+                            response: HTTPURLResponse(
+                                url: endpoint,
+                                statusCode: 202,
+                                httpVersion: "HTTP/1.1",
+                                headerFields: [:]
+                            )!,
+                            events: [.finish(delayMilliseconds: 0)]
+                        )
+                    }
+
+                    let rpcRequest = try JSONDecoder().decode(AnyRequest.self, from: body)
+                    if method == Discover.name {
+                        return StreamingHTTPScript(
+                            response: HTTPURLResponse(
+                                url: endpoint,
+                                statusCode: 200,
+                                httpVersion: "HTTP/1.1",
+                                headerFields: ["Content-Type": ContentType.json]
+                            )!,
+                            events: [
+                                .data(
+                                    try JSONEncoder().encode(
+                                        AnyMethod.response(
+                                            id: rpcRequest.id,
+                                            error: .methodNotFound("server/discover")
+                                        )
+                                    ),
+                                    delayMilliseconds: 0
+                                ),
+                                .finish(delayMilliseconds: 0),
+                            ]
+                        )
+                    }
+
+                    #expect(method == Initialize.name)
+                    return StreamingHTTPScript(
+                        response: HTTPURLResponse(
+                            url: endpoint,
+                            statusCode: 200,
+                            httpVersion: "HTTP/1.1",
+                            headerFields: [
+                                "Content-Type": ContentType.json,
+                                "Mcp-Session-Id": "automatic-fallback-session",
+                            ]
+                        )!,
+                        events: [
+                            .data(
+                                try JSONEncoder().encode(
+                                    Initialize.response(
+                                        id: rpcRequest.id,
+                                        result: .init(
+                                            protocolVersion: Version.latestInitializationVersion,
+                                            capabilities: .init(),
+                                            serverInfo: .init(
+                                                name: "InitializationServer",
+                                                version: "1.0"
+                                            )
+                                        )
+                                    )
+                                ),
+                                delayMilliseconds: 0
+                            ),
+                            .finish(delayMilliseconds: 0),
+                        ]
+                    )
+                }
+
+                let transport = makeTransport(enableStandaloneGetStream: true)
+                let client = Client(
+                    name: "HTTPClient",
+                    version: "1.0",
+                    configuration: .init(protocolMode: .automatic)
+                )
+                let info = try await client.connectWithInfo(transport: transport)
+                #expect(info.protocolLifecycle == .initializationBased)
+
+                for _ in 0..<100 {
+                    if await PerRequestHTTPURLProtocol.storage.requestCount >= 4 { break }
+                    try await Task.sleep(for: .milliseconds(1))
+                }
+                #expect(await PerRequestHTTPURLProtocol.storage.requestCount >= 4)
+                await client.disconnect()
+            }
+        #endif
 
         @Test("Cancelling HTTP discovery does not start initialization fallback")
         func cancelledAutomaticDiscovery() async throws {
@@ -919,23 +1090,125 @@ import Testing
             ]
         )
         func recognizedProtocolError(expectedCode: Int) async throws {
+            for statusCode in [200, 400, 404, 405] {
+                await PerRequestHTTPURLProtocol.setHandler { [endpoint] request in
+                    let body = try #require(requestBody(request))
+                    let rpcRequest = try JSONDecoder().decode(AnyRequest.self, from: body)
+                    let error = MCPError.remote(
+                        code: expectedCode,
+                        message: "Recognized per-request error",
+                        data: nil
+                    )
+                    return (
+                        HTTPURLResponse(
+                            url: endpoint,
+                            statusCode: statusCode,
+                            httpVersion: "HTTP/1.1",
+                            headerFields: ["Content-Type": ContentType.json]
+                        )!,
+                        try JSONEncoder().encode(
+                            AnyMethod.response(id: rpcRequest.id, error: error)
+                        )
+                    )
+                }
+
+                let client = Client(
+                    name: "HTTPClient",
+                    version: "1.0",
+                    configuration: .init(protocolMode: .automatic)
+                )
+                do {
+                    _ = try await client.connectWithInfo(transport: makeTransport())
+                    Issue.record("Expected a recognized per-request error")
+                } catch let error as MCPError {
+                    #expect(error.code == expectedCode)
+                }
+                await PerRequestHTTPURLProtocol.verifyCallCount(1, for: endpoint)
+                await client.disconnect()
+            }
+        }
+
+        @Test(
+            "A correlated method-not-found discovery response selects initialization",
+            arguments: [200, 400, 404, 405]
+        )
+        func methodNotFoundFallsBack(statusCode: Int) async throws {
             await PerRequestHTTPURLProtocol.setHandler { [endpoint] request in
                 let body = try #require(requestBody(request))
+                let envelope = try JSONDecoder().decode(Value.self, from: body)
+                let method = try #require(envelope.objectValue?["method"]?.stringValue)
+                if method == InitializedNotification.name {
+                    return (
+                        HTTPURLResponse(
+                            url: endpoint,
+                            statusCode: 202,
+                            httpVersion: "HTTP/1.1",
+                            headerFields: [:]
+                        )!,
+                        Data()
+                    )
+                }
                 let rpcRequest = try JSONDecoder().decode(AnyRequest.self, from: body)
-                let error = MCPError.remote(
-                    code: expectedCode,
-                    message: "Recognized per-request error",
-                    data: nil
-                )
-                return (
-                    HTTPURLResponse(
-                        url: endpoint,
-                        statusCode: 400,
-                        httpVersion: "HTTP/1.1",
-                        headerFields: ["Content-Type": ContentType.json]
-                    )!,
-                    try JSONEncoder().encode(AnyMethod.response(id: rpcRequest.id, error: error))
-                )
+                switch rpcRequest.method {
+                case Discover.name:
+                    return (
+                        HTTPURLResponse(
+                            url: endpoint,
+                            statusCode: statusCode,
+                            httpVersion: "HTTP/1.1",
+                            headerFields: ["Content-Type": ContentType.json]
+                        )!,
+                        try JSONEncoder().encode(
+                            AnyMethod.response(
+                                id: rpcRequest.id,
+                                error: .methodNotFound("server/discover")
+                            )
+                        )
+                    )
+                case Initialize.name:
+                    return (
+                        HTTPURLResponse(
+                            url: endpoint,
+                            statusCode: 200,
+                            httpVersion: "HTTP/1.1",
+                            headerFields: ["Content-Type": ContentType.json]
+                        )!,
+                        try JSONEncoder().encode(
+                            Initialize.response(
+                                id: rpcRequest.id,
+                                result: .init(
+                                    protocolVersion: Version.latestInitializationVersion,
+                                    capabilities: .init(),
+                                    serverInfo: .init(
+                                        name: "InitializationServer",
+                                        version: "1.0"
+                                    )
+                                )
+                            )
+                        )
+                    )
+                case Ping.name:
+                    return (
+                        HTTPURLResponse(
+                            url: endpoint,
+                            statusCode: 200,
+                            httpVersion: "HTTP/1.1",
+                            headerFields: ["Content-Type": ContentType.json]
+                        )!,
+                        try JSONEncoder().encode(Ping.response(id: rpcRequest.id, result: .init()))
+                    )
+                default:
+                    Issue.record("Unexpected request method \(rpcRequest.method)")
+                    return (
+                        HTTPURLResponse(
+                            url: endpoint,
+                            statusCode: 500,
+                            httpVersion: "HTTP/1.1",
+                            headerFields: [:]
+                        )!,
+                        Data()
+                    )
+                }
             }
 
             let client = Client(
@@ -943,25 +1216,91 @@ import Testing
                 version: "1.0",
                 configuration: .init(protocolMode: .automatic)
             )
-            do {
-                _ = try await client.connectWithInfo(transport: makeTransport())
-                Issue.record("Expected a recognized per-request error")
-            } catch let error as MCPError {
-                #expect(error.code == expectedCode)
-            }
-            await PerRequestHTTPURLProtocol.verifyCallCount(1, for: endpoint)
+            let info = try await client.connectWithInfo(transport: makeTransport())
+            #expect(info.protocolLifecycle == .initializationBased)
+            try await client.ping()
+            await PerRequestHTTPURLProtocol.verifyCallCount(4, for: endpoint)
             await client.disconnect()
         }
 
-        @Test("HTTP 404 method-not-found identifies a per-request metadata server")
-        func methodNotFoundDoesNotFallback() async throws {
+        @Test("Another correlated non-modern HTTP 200 error selects initialization")
+        func nonModernErrorFallsBack() async throws {
+            await PerRequestHTTPURLProtocol.setHandler { [endpoint] request in
+                let body = try #require(requestBody(request))
+                let envelope = try JSONDecoder().decode(Value.self, from: body)
+                let method = try #require(envelope.objectValue?["method"]?.stringValue)
+                if method == InitializedNotification.name {
+                    return (
+                        HTTPURLResponse(
+                            url: endpoint,
+                            statusCode: 202,
+                            httpVersion: "HTTP/1.1",
+                            headerFields: [:]
+                        )!,
+                        Data()
+                    )
+                }
+                let rpcRequest = try JSONDecoder().decode(AnyRequest.self, from: body)
+                if rpcRequest.method == Discover.name {
+                    return (
+                        HTTPURLResponse(
+                            url: endpoint,
+                            statusCode: 200,
+                            httpVersion: "HTTP/1.1",
+                            headerFields: ["Content-Type": ContentType.json]
+                        )!,
+                        try JSONEncoder().encode(
+                            AnyMethod.response(
+                                id: rpcRequest.id,
+                                error: .invalidParams("Discovery is unavailable")
+                            )
+                        )
+                    )
+                }
+                if rpcRequest.method == Initialize.name {
+                    return (
+                        HTTPURLResponse(
+                            url: endpoint,
+                            statusCode: 200,
+                            httpVersion: "HTTP/1.1",
+                            headerFields: ["Content-Type": ContentType.json]
+                        )!,
+                        try JSONEncoder().encode(
+                            Initialize.response(
+                                id: rpcRequest.id,
+                                result: .init(
+                                    protocolVersion: Version.latestInitializationVersion,
+                                    capabilities: .init(),
+                                    serverInfo: .init(name: "LegacyServer", version: "1.0")
+                                )
+                            )
+                        )
+                    )
+                }
+                Issue.record("Unexpected request method \(rpcRequest.method)")
+                throw MCPError.invalidRequest("Unexpected request")
+            }
+
+            let client = Client(
+                name: "HTTPClient",
+                version: "1.0",
+                configuration: .init(protocolMode: .automatic)
+            )
+            let info = try await client.connectWithInfo(transport: makeTransport())
+            #expect(info.protocolLifecycle == .initializationBased)
+            await PerRequestHTTPURLProtocol.verifyCallCount(3, for: endpoint)
+            await client.disconnect()
+        }
+
+        @Test("Per-request-only mode never falls back after a non-modern discovery error")
+        func perRequestOnlyDoesNotFallback() async throws {
             await PerRequestHTTPURLProtocol.setHandler { [endpoint] request in
                 let body = try #require(requestBody(request))
                 let rpcRequest = try JSONDecoder().decode(AnyRequest.self, from: body)
                 return (
                     HTTPURLResponse(
                         url: endpoint,
-                        statusCode: 404,
+                        statusCode: 200,
                         httpVersion: "HTTP/1.1",
                         headerFields: ["Content-Type": ContentType.json]
                     )!,
@@ -977,13 +1316,166 @@ import Testing
             let client = Client(
                 name: "HTTPClient",
                 version: "1.0",
-                configuration: .init(protocolMode: .automatic)
+                configuration: .init(protocolMode: .perRequestMetadataOnly)
             )
             await #expect(throws: MCPError.self) {
                 _ = try await client.connectWithInfo(transport: makeTransport())
             }
             await PerRequestHTTPURLProtocol.verifyCallCount(1, for: endpoint)
             await client.disconnect()
+        }
+
+        @Test("Malformed and uncorrelated compatibility responses select initialization")
+        func invalidCompatibilityResponsesFallBack() async throws {
+            for (statusCode, responseData) in [
+                (400, Data("not JSON".utf8)),
+                (404, Data(#"{"jsonrpc":"2.0","id":999,"error":{"code":-32601,"message":"Method not found"}}"#.utf8)),
+                (405, Data(#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"}}"#.utf8)),
+            ] {
+                await PerRequestHTTPURLProtocol.setHandler { [endpoint] request in
+                    let body = try #require(requestBody(request))
+                    let envelope = try JSONDecoder().decode(Value.self, from: body)
+                    let method = try #require(envelope.objectValue?["method"]?.stringValue)
+                    if method == InitializedNotification.name {
+                        return (
+                            HTTPURLResponse(
+                                url: endpoint,
+                                statusCode: 202,
+                                httpVersion: "HTTP/1.1",
+                                headerFields: [:]
+                            )!,
+                            Data()
+                        )
+                    }
+                    let rpcRequest = try JSONDecoder().decode(AnyRequest.self, from: body)
+                    if rpcRequest.method == Discover.name {
+                        return (
+                            HTTPURLResponse(
+                                url: endpoint,
+                                statusCode: statusCode,
+                                httpVersion: "HTTP/1.1",
+                                headerFields: ["Content-Type": ContentType.json]
+                            )!,
+                            responseData
+                        )
+                    }
+                    if rpcRequest.method == Initialize.name {
+                        return (
+                            HTTPURLResponse(
+                                url: endpoint,
+                                statusCode: 200,
+                                httpVersion: "HTTP/1.1",
+                                headerFields: ["Content-Type": ContentType.json]
+                            )!,
+                            try JSONEncoder().encode(
+                                Initialize.response(
+                                    id: rpcRequest.id,
+                                    result: .init(
+                                        protocolVersion: Version.latestInitializationVersion,
+                                        capabilities: .init(),
+                                        serverInfo: .init(
+                                            name: "InitializationServer",
+                                            version: "1.0"
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    }
+                    Issue.record("Unexpected request method \(rpcRequest.method)")
+                    throw MCPError.invalidRequest("Unexpected request")
+                }
+
+                let client = Client(
+                    name: "HTTPClient",
+                    version: "1.0",
+                    configuration: .init(protocolMode: .automatic)
+                )
+                let info = try await client.connectWithInfo(transport: makeTransport())
+                #expect(info.protocolLifecycle == .initializationBased)
+                await PerRequestHTTPURLProtocol.verifyCallCount(3, for: endpoint)
+                await client.disconnect()
+            }
+        }
+
+        @Test("Initialization lifecycle is reused for the same HTTP origin")
+        func initializationLifecycleIsCachedByOrigin() async throws {
+            let recorder = ProtocolMethodRecorder()
+            await PerRequestHTTPURLProtocol.setHandler { [endpoint] request in
+                let body = try #require(requestBody(request))
+                let envelope = try JSONDecoder().decode(Value.self, from: body)
+                let method = try #require(envelope.objectValue?["method"]?.stringValue)
+                await recorder.record(method)
+                if method == InitializedNotification.name {
+                    return (
+                        HTTPURLResponse(
+                            url: endpoint,
+                            statusCode: 202,
+                            httpVersion: "HTTP/1.1",
+                            headerFields: [:]
+                        )!,
+                        Data()
+                    )
+                }
+                let rpcRequest = try JSONDecoder().decode(AnyRequest.self, from: body)
+                if method == Discover.name {
+                    return (
+                        HTTPURLResponse(
+                            url: endpoint,
+                            statusCode: 400,
+                            httpVersion: "HTTP/1.1",
+                            headerFields: ["Content-Type": "text/plain"]
+                        )!,
+                        Data("legacy endpoint".utf8)
+                    )
+                }
+                if method == Initialize.name {
+                    return (
+                        HTTPURLResponse(
+                            url: endpoint,
+                            statusCode: 200,
+                            httpVersion: "HTTP/1.1",
+                            headerFields: ["Content-Type": ContentType.json]
+                        )!,
+                        try JSONEncoder().encode(
+                            Initialize.response(
+                                id: rpcRequest.id,
+                                result: .init(
+                                    protocolVersion: Version.latestInitializationVersion,
+                                    capabilities: .init(),
+                                    serverInfo: .init(
+                                        name: "InitializationServer",
+                                        version: "1.0"
+                                    )
+                                )
+                            )
+                        )
+                    )
+                }
+                Issue.record("Unexpected request method \(method)")
+                throw MCPError.invalidRequest("Unexpected request")
+            }
+
+            let client = Client(
+                name: "HTTPClient",
+                version: "1.0",
+                configuration: .init(protocolMode: .automatic)
+            )
+            let first = try await client.connectWithInfo(transport: makeTransport())
+            #expect(first.protocolLifecycle == .initializationBased)
+            await client.disconnect()
+
+            let second = try await client.connectWithInfo(transport: makeTransport())
+            #expect(second.protocolLifecycle == .initializationBased)
+            await client.disconnect()
+
+            #expect(await recorder.methods == [
+                Discover.name,
+                Initialize.name,
+                InitializedNotification.name,
+                Initialize.name,
+                InitializedNotification.name,
+            ])
         }
 
         @Test("JSON responses require a matching ID and JSON content type")
@@ -1093,16 +1585,18 @@ import Testing
         }
 
         private func makeTransport(
-            streaming: Bool = false,
-            authorizer: (any HTTPClientAuthorizer)? = nil
+            enableStandaloneGetStream: Bool = false,
+            authorizer: (any HTTPClientAuthorizer)? = nil,
+            requestModifier: @escaping @Sendable (URLRequest) -> URLRequest = { $0 }
         ) -> HTTPClientTransport {
             let configuration = URLSessionConfiguration.ephemeral
             configuration.protocolClasses = [PerRequestHTTPURLProtocol.self]
             return HTTPClientTransport(
                 endpoint: endpoint,
                 configuration: configuration,
-                streaming: streaming,
-                authorizer: authorizer
+                enableStandaloneGetStream: enableStandaloneGetStream,
+                authorizer: authorizer,
+                requestModifier: requestModifier
             )
         }
 
@@ -1112,7 +1606,7 @@ import Testing
             return HTTPClientTransport(
                 endpoint: endpoint,
                 configuration: configuration,
-                streaming: false
+                enableStandaloneGetStream: false
             )
         }
 

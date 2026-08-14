@@ -47,5 +47,11 @@ package protocol RequestStreamCancelling: Transport {
 /// Classifies the result of an HTTP per-request metadata compatibility probe.
 package enum ProtocolLifecycleProbeError: Error {
     case initializationBasedResponse
+    case correlatedHTTPResponse(statusCode: Int, error: MCPError)
     case inconclusive(MCPError)
+}
+
+/// Supplies a stable key for caching a server's protocol lifecycle.
+package protocol ProtocolLifecycleCacheKeyProviding: Transport {
+    func protocolLifecycleCacheKey() async -> String?
 }
