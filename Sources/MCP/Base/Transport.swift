@@ -27,5 +27,14 @@ package protocol ProtocolLifecycleUpdating: Transport {
     func updateProtocolLifecycle(_ lifecycle: ProtocolLifecycle, protocolVersion: String) async
 }
 
+/// Optional transport hook for bindings that support only a subset of protocol versions.
+///
+/// The server intersects this set with its configured lifecycle modes for discovery and
+/// initialization negotiation. Transports that do not adopt this protocol retain the SDK-wide
+/// version set.
+package protocol TransportProtocolVersionProviding: Transport {
+    func supportedProtocolVersions() -> Set<String>
+}
+
 /// Identifies transports whose lifecycle fallback is determined by HTTP responses.
 package protocol HTTPProtocolNegotiationTransport: Transport {}

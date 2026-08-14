@@ -49,6 +49,45 @@ struct VersioningTests {
         #expect(Version.supported.count == 5)
     }
 
+    @Test("Supported versions partition cleanly by lifecycle")
+    func testSupportedVersionsByLifecycle() {
+        let initialization = Version.supported(for: .initializationBased)
+        let perRequestMetadata = Version.supported(for: .perRequestMetadata)
+
+        #expect(initialization.isDisjoint(with: perRequestMetadata))
+        #expect(initialization.union(perRequestMetadata) == Version.supported)
+        #expect(initialization.contains(Version.latestInitializationVersion))
+        #expect(perRequestMetadata.contains(Version.perRequestMetadataVersion))
+        #expect(!initialization.contains(Version.perRequestMetadataVersion))
+    }
+
+    @Test("Streamable HTTP excludes the deprecated HTTP+SSE revision")
+    func testStreamableHTTPSupportedVersions() {
+        let initialization = Version.streamableHTTPSupported(for: .initializationBased)
+
+        #expect(initialization.isSubset(of: Version.supported(for: .initializationBased)))
+        #expect(!initialization.contains("2024-11-05"))
+        #expect(initialization.contains(Version.latestInitializationVersion))
+        #expect(
+            Version.streamableHTTPSupported(for: .perRequestMetadata)
+                == Version.supported(for: .perRequestMetadata)
+        )
+    }
+
+    @Test("Initialization negotiation respects an authoritative allowlist")
+    func testInitializationNegotiationAllowlist() {
+        let supported: Set<String> = ["2025-03-26", "2025-06-18"]
+
+        #expect(Version.negotiate(
+            clientRequestedVersion: "2024-11-05",
+            supportedVersions: supported
+        ) == "2025-06-18")
+        #expect(Version.negotiate(
+            clientRequestedVersion: "2024-11-05",
+            supportedVersions: []
+        ) == nil)
+    }
+
     @Test("Server's latest version is correct")
     func testServerLatestVersion() {
         #expect(Version.latest == "2025-11-25")

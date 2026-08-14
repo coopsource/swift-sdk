@@ -218,7 +218,7 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
             httpMethod: "POST",
             sessionID: sessionID,
             isInitializationRequest: messageKind.isInitializeRequest,
-            supportedProtocolVersions: Version.supported
+            supportedProtocolVersions: Version.streamableHTTPSupported(for: .initializationBased)
         )
 
         // Run validation pipeline
@@ -317,7 +317,7 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
             httpMethod: "GET",
             sessionID: sessionID,
             isInitializationRequest: false,
-            supportedProtocolVersions: Version.supported
+            supportedProtocolVersions: Version.streamableHTTPSupported(for: .initializationBased)
         )
 
         // Run validation pipeline
@@ -370,7 +370,7 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
             httpMethod: "DELETE",
             sessionID: sessionID,
             isInitializationRequest: false,
-            supportedProtocolVersions: Version.supported
+            supportedProtocolVersions: Version.streamableHTTPSupported(for: .initializationBased)
         )
 
         if let errorResponse = validationPipeline.validate(request, context: context) {
