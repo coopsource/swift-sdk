@@ -332,15 +332,7 @@ func createConformanceServer(
             Tool(name: "test_input_required_result_multi_round", description: "Runs a multi-round input workflow", inputSchema: .object(["type": "object", "properties": [:]])),
             Tool(name: "test_input_required_result_tampered_state", description: "Rejects changed request state", inputSchema: .object(["type": "object", "properties": [:]])),
             Tool(name: "test_input_required_result_capabilities", description: "Uses only declared client capabilities", inputSchema: .object(["type": "object", "properties": [:]])),
-            Tool(name: "test_header_validation", description: "Validates schema-derived HTTP headers", inputSchema: .object([
-                "type": "object",
-                "properties": .object([
-                    "value": .object([
-                        "type": "string",
-                        "x-mcp-header": "Value",
-                    ])
-                ]),
-            ])),
+            conformanceHeaderValidationTool,
             Tool(name: "json_schema_2020_12_tool", description: "Tool with JSON Schema 2020-12 features", inputSchema: .object([
                 "$schema": .string("https://json-schema.org/draft/2020-12/schema"),
                 "type": .string("object"),
@@ -861,6 +853,7 @@ struct MCPHTTPServer {
             ]),
             logger: logger
         )
+        try await configureConformanceToolHeaders(on: perRequestMetadataTransport)
         let perRequestMetadataServer = await createConformanceServer(
             state: state,
             protocolMode: .perRequestMetadataOnly

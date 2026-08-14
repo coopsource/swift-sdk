@@ -9,6 +9,26 @@ import MCP
     import FoundationNetworking
 #endif
 
+package let conformanceHeaderValidationTool = Tool(
+    name: "test_header_validation",
+    description: "Validates schema-derived HTTP headers",
+    inputSchema: .object([
+        "type": "object",
+        "properties": .object([
+            "value": .object([
+                "type": "string",
+                "x-mcp-header": "Value",
+            ])
+        ]),
+    ])
+)
+
+package func configureConformanceToolHeaders(
+    on transport: StreamableHTTPServerTransport
+) async throws {
+    try await transport.updateTools([conformanceHeaderValidationTool])
+}
+
 package actor HTTPApp {
     /// Configuration for the HTTP application.
     package struct Configuration: Sendable {
