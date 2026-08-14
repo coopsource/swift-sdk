@@ -267,6 +267,8 @@ public actor Server {
     private let serverInfo: Server.Info
     /// The server connection
     private var connection: (any Transport)?
+    /// Versions implemented by the active transport binding, when it constrains them.
+    private var transportSupportedProtocolVersions: Set<String>?
     /// The server logger
     private var logger: Logger? {
         get async {
@@ -352,6 +354,11 @@ public actor Server {
         initializeHook: (@Sendable (Client.Info, Client.Capabilities) async throws -> Void)? = nil
     ) async throws {
         self.connection = transport
+        if let versionProvider = transport as? any TransportProtocolVersionProviding {
+            transportSupportedProtocolVersions = await versionProvider.supportedProtocolVersions()
+        } else {
+            transportSupportedProtocolVersions = nil
+        }
         registerDefaultHandlers(initializeHook: initializeHook)
         registerCancellationHandler()
         try await transport.connect()
@@ -435,6 +442,7 @@ public actor Server {
             await connection.disconnect()
         }
         connection = nil
+        transportSupportedProtocolVersions = nil
     }
 
     public func waitUntilCompleted() async {
@@ -1142,14 +1150,21 @@ public actor Server {
     }
 
     private var supportedProtocolVersions: [String] {
-        switch configuration.protocolMode {
+        let lifecycleVersions: Set<String> = switch configuration.protocolMode {
         case .initializationOnly:
-            return Version.preferenceOrder.filter { $0 != Version.perRequestMetadataVersion }
+            Version.supported(for: .initializationBased)
         case .initializationAndPerRequestMetadata:
-            return Version.preferenceOrder
+            Version.supported
         case .perRequestMetadataOnly:
-            return Version.preferenceOrder.filter(Version.perRequestMetadataSupported.contains)
+            Version.supported(for: .perRequestMetadata)
         }
+
+        let effectiveVersions = if let transportSupportedProtocolVersions {
+            lifecycleVersions.intersection(transportSupportedProtocolVersions)
+        } else {
+            lifecycleVersions
+        }
+        return Version.preferenceOrder.filter(effectiveVersions.contains)
     }
 
     private func handleMessage(_ message: Message<AnyNotification>) async throws {
@@ -1276,8 +1291,15 @@ public actor Server {
 
                 // Perform version negotiation
                 let clientRequestedVersion = params.protocolVersion
-                let negotiatedProtocolVersion = Version.negotiate(
-                    clientRequestedVersion: clientRequestedVersion)
+                let initializationVersions = Set(await self.supportedProtocolVersions)
+                    .intersection(Version.supported(for: .initializationBased))
+                guard let negotiatedProtocolVersion = Version.negotiate(
+                    clientRequestedVersion: clientRequestedVersion,
+                    supportedVersions: initializationVersions
+                ) else {
+                    throw MCPError.methodNotFound(
+                        "initialize is not supported by the active transport binding")
+                }
 
                 // Set initial state with the negotiated protocol version
                 await self.setInitialState(

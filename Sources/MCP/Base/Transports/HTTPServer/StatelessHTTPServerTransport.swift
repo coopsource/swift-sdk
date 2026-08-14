@@ -196,7 +196,7 @@ public actor StatelessHTTPServerTransport: Transport, HTTPContextProviding {
             httpMethod: "POST",
             sessionID: nil,
             isInitializationRequest: messageKind.isInitializeRequest,
-            supportedProtocolVersions: Version.supported
+            supportedProtocolVersions: Version.streamableHTTPSupported(for: .initializationBased)
         )
 
         // Run validation pipeline

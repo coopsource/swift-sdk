@@ -26,6 +26,38 @@ public enum Version {
     /// This remains initialization-based until automatic negotiation is enabled by default.
     public static let latest = latestInitializationVersion
 
+    /// Returns the protocol versions supported by one lifecycle mechanism.
+    ///
+    /// The union of both lifecycle sets is ``supported``. A transport binding may support a
+    /// narrower version set.
+    public static func supported(for lifecycle: ProtocolLifecycle) -> Set<String> {
+        switch lifecycle {
+        case .initializationBased:
+            return supported.subtracting(perRequestMetadataSupported)
+        case .perRequestMetadata:
+            return perRequestMetadataSupported
+        }
+    }
+
+    /// Returns the versions implemented by the Streamable HTTP binding for one lifecycle.
+    ///
+    /// Initialization-based Streamable HTTP starts at `2025-03-26`; `2024-11-05` uses the
+    /// deprecated HTTP+SSE binding.
+    public static func streamableHTTPSupported(
+        for lifecycle: ProtocolLifecycle
+    ) -> Set<String> {
+        switch lifecycle {
+        case .initializationBased:
+            return supported(for: lifecycle).intersection([
+                "2025-03-26",
+                "2025-06-18",
+                "2025-11-25",
+            ])
+        case .perRequestMetadata:
+            return supported(for: lifecycle)
+        }
+    }
+
     /// Protocol versions in preference order for explicit negotiation.
     static let preferenceOrder = [
         perRequestMetadataVersion,
@@ -45,12 +77,27 @@ public enum Version {
     /// - Returns: The requested initialization-based version when supported; otherwise the latest
     ///            supported initialization-based version.
     static func negotiate(clientRequestedVersion: String) -> String {
-        if supported.contains(clientRequestedVersion)
-            && clientRequestedVersion != perRequestMetadataVersion
-        {
+        negotiate(
+            clientRequestedVersion: clientRequestedVersion,
+            supportedVersions: supported(for: .initializationBased)
+        ) ?? latestInitializationVersion
+    }
+
+    /// Negotiates from an authoritative initialization-version allowlist.
+    ///
+    /// - Returns: The requested version when allowed, otherwise the most preferred allowed
+    ///   initialization version, or `nil` when the allowlist contains no initialization version.
+    static func negotiate(
+        clientRequestedVersion: String,
+        supportedVersions: Set<String>
+    ) -> String? {
+        let initializationVersions = supportedVersions.intersection(
+            supported(for: .initializationBased)
+        )
+        if initializationVersions.contains(clientRequestedVersion) {
             return clientRequestedVersion
         }
-        return latestInitializationVersion
+        return preferenceOrder.first(where: initializationVersions.contains)
     }
 }
 
