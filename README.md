@@ -7,13 +7,14 @@ Official Swift SDK for the [Model Context Protocol][mcp] (MCP).
 The Model Context Protocol (MCP) defines a standardized way
 for applications to communicate with AI and ML models.
 This Swift SDK implements both client and server components
-according to the [2025-11-25][mcp-spec-2025-11-25] (latest) version
+according to the [2026-07-28][mcp-spec-2026-07-28] version
 of the MCP specification.
 
 ## Table of contents
 
 - [Requirements](#requirements)
 - [Installation](#installation)
+- [Protocol Lifecycle Selection](#protocol-lifecycle-selection)
 - [Client Usage](#client-usage)
   - [Basic Client Setup](#basic-client-setup)
   - [Transport Options for Clients](#transport-options-for-clients)
@@ -89,6 +90,47 @@ Then add the dependency to your target:
 )
 ```
 
+## Protocol Lifecycle Selection
+
+MCP versions through `2025-11-25` use an initialization handshake. Version `2026-07-28`
+carries the protocol version, client information, and capabilities on each request. Clients and
+servers preserve the initialization lifecycle by default. Opt in explicitly while rolling out
+per-request metadata:
+
+```swift
+let client = Client(
+    name: "MyApp",
+    version: "1.0.0",
+    configuration: .init(protocolMode: .automatic)
+)
+let connection = try await client.connectWithInfo(transport: transport)
+
+switch connection.protocolLifecycle {
+case .initializationBased:
+    print("Connected with the initialization lifecycle")
+case .perRequestMetadata:
+    print("Connected with per-request metadata")
+}
+```
+
+Runtime modes can isolate one lifecycle for compatibility testing:
+
+| Component | Initialization only | Automatic or combined | Per-request metadata only |
+| --- | --- | --- | --- |
+| Client | `.initializationOnly` | `.automatic` | `.perRequestMetadataOnly` |
+| Server | `.initializationOnly` | `.initializationAndPerRequestMetadata` | `.perRequestMetadataOnly` |
+
+Pass the selected value through `Client.Configuration(protocolMode:)` or
+`Server.Configuration(protocolMode:)`. Newly constructed configurations and configurations
+decoded without a mode are both initialization-only, preserving existing wire behavior until the
+application explicitly opts in.
+`connect(transport:)` remains available as a compatibility wrapper when the selected lifecycle
+does not need to be inspected. If a per-request-metadata server omits its optional identity, the
+wrapper's required `serverInfo` value is the placeholder `unknown` version `0.0.0`; use
+`connectWithInfo(transport:)` to preserve the absence as `nil`.
+See the [MCP 2026-07-28 migration guide](Documentation/MCP-2026-07-28-MIGRATION.md)
+for source-compatibility details and rollout guidance.
+
 ## Client Usage
 
 The client component allows your application to connect to MCP servers.
@@ -136,7 +178,7 @@ For remote server communication:
 // Create a streaming HTTP transport
 let transport = HTTPClientTransport(
     endpoint: URL(string: "http://localhost:8080")!,
-    streaming: true  // Enable Server-Sent Events for real-time updates
+    enableStandaloneGetStream: true  // Open the initialization-era standalone GET stream
 )
 try await client.connect(transport: transport)
 ```
@@ -176,7 +218,7 @@ for item in content {
         print("Received audio data of type \(mimeType)")
     case .resource(let resource, _, _):
         print("Received embedded resource: \(resource)")
-    case .resourceLink(let uri, let name, _, _, let mimeType, _):
+    case .resourceLink(let uri, let name, _, _, let mimeType, _, _, _, _):
         print("Resource link: \(name) at \(uri), type: \(mimeType ?? "unknown")")
     }
 }
@@ -557,6 +599,46 @@ let (content, isError) = try await client.callTool(
 ```
 
 ### Advanced Client Features
+
+#### Per-Request Metadata Features
+
+When `2026-07-28` is selected, the default multi-round-trip setting automatically handles
+`input_required` results through registered elicitation, sampling, and roots handlers. Use
+`Client.MultiRoundTripMode.manual` to handle each aggregate input map yourself, or `.disabled`
+to reject `input_required` results.
+
+Cacheable discovery, list, and resource-read responses use the server's `ttlMs` and
+`cacheScope` fields. The default cache is bounded to 512 entries. A call can force a reload or
+bypass storage:
+
+```swift
+let (tools, cursor) = try await client.listTools(cachePolicy: .reload)
+let contents = try await client.readResource(
+    uri: "resource://example",
+    cachePolicy: .bypass
+)
+await client.invalidateResponseCache()
+```
+
+Long-lived `2026-07-28` notifications use an explicit subscription:
+
+```swift
+let subscription = try await client.listen(notifications: .init(
+    toolsListChanged: true,
+    resourceSubscriptions: ["resource://example"]
+))
+
+for try await event in subscription.events {
+    if case .notification(let notification) = event {
+        print("Received \(notification.method)")
+    }
+}
+
+try await client.cancelSubscription(subscription.id)
+```
+
+An explicit disconnect retains the registration so it can be re-established with the same id
+after reconnecting. Call `cancelSubscription` to remove it permanently.
 
 #### Strict vs Non-Strict Configuration
 
@@ -1187,7 +1269,8 @@ try await server.start(transport: transport) { clientInfo, clientCapabilities in
 
 ### HTTP Request Context in Handlers
 
-When a server is connected over `StatefulHTTPServerTransport` or `StatelessHTTPServerTransport`,
+When a server is connected over `StatefulHTTPServerTransport`, `StatelessHTTPServerTransport`,
+or `StreamableHTTPServerTransport`,
 method handlers can observe the originating HTTP request (headers, body, path, method) via
 `Server.currentHandlerContext` — a task-local set automatically before each handler runs:
 
@@ -1202,6 +1285,8 @@ await server.withMethodHandler(CallTool.self) { params in
 
 `httpContext` is `nil` for transports that don't carry HTTP context (e.g. `StdioTransport`,
 `InMemoryTransport`) and for handlers reached off the dispatch path.
+The same context reports `protocolLifecycle`, `protocolVersion`, request-scoped client
+information and capabilities, `logLevel`, `requestID`, and `method`.
 
 Task-locals are not inherited by `Task.detached`. If you spawn a detached task from a handler,
 capture the context up front:
@@ -1333,9 +1418,13 @@ The Swift SDK provides multiple built-in transports:
 | [`HTTPClientTransport`](/Sources/MCP/Base/Transports/HTTPClientTransport.swift) | Implements [Streamable HTTP transport](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#streamable-http) using Foundation's URL Loading System | All platforms with Foundation | Remote servers, web applications |
 | [`StatelessHTTPServerTransport`](/Sources/MCP/Base/Transports/HTTPServer/StatelessHTTPServerTransport.swift) | HTTP server transport with simple request-response semantics; no session management or SSE streaming | All platforms with Foundation | Simple HTTP servers, serverless/edge functions |
 | [`StatefulHTTPServerTransport`](/Sources/MCP/Base/Transports/HTTPServer/StatefulHTTPServerTransport.swift) | HTTP server transport with full session management and SSE streaming for server-initiated messages | All platforms with Foundation | Full-featured HTTP servers, streaming notifications |
+| [`StreamableHTTPServerTransport`](/Sources/MCP/Base/Transports/HTTPServer/StreamableHTTPServerTransport.swift) | Per-request-metadata HTTP server with direct JSON and request-scoped SSE responses | All platforms with Foundation | MCP `2026-07-28` HTTP servers |
 | [`InMemoryTransport`](/Sources/MCP/Base/Transports/InMemoryTransport.swift) | Custom in-memory transport for direct communication within the same process | All platforms | Testing, debugging, same-process client-server communication |
 | [`NetworkTransport`](/Sources/MCP/Base/Transports/NetworkTransport.swift) | Custom transport using Apple's Network framework for TCP/UDP connections | Apple platforms only | Low-level networking, custom protocols |
 
+Use `LifecycleHTTPServerRouter` to route initialization/session traffic to an existing HTTP
+session factory and per-request-metadata traffic to `StreamableHTTPServerTransport` at one
+endpoint.
 
 ### Custom Transport Implementation
 
@@ -1614,7 +1703,9 @@ let transport = StdioTransport(logger: logger)
 
 ## Additional Resources
 
-- [MCP Specification](https://modelcontextprotocol.io/specification/2025-11-25)
+- [MCP 2026-07-28 Migration Guide](Documentation/MCP-2026-07-28-MIGRATION.md)
+- [MCP 2026-07-28 Specification](https://modelcontextprotocol.io/specification/2026-07-28)
+- [MCP Versioning](https://modelcontextprotocol.io/docs/2026-07-28/learn/versioning)
 - [Protocol Documentation](https://modelcontextprotocol.io)
 - [GitHub Repository](https://github.com/modelcontextprotocol/swift-sdk)
 
@@ -1632,4 +1723,4 @@ see the [GitHub Releases page](https://github.com/modelcontextprotocol/swift-sdk
 This project is licensed under Apache 2.0 for new contributions, with existing code under MIT. See the [LICENSE](LICENSE) file for details.
 
 [mcp]: https://modelcontextprotocol.io
-[mcp-spec-2025-11-25]: https://modelcontextprotocol.io/specification/2025-11-25
+[mcp-spec-2026-07-28]: https://modelcontextprotocol.io/specification/2026-07-28
