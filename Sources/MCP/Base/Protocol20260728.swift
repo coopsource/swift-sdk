@@ -275,8 +275,11 @@ enum PerRequestMetadataWire {
 
 /// The disposition of a successful MCP result.
 public enum ResultType: Hashable, Codable, Sendable {
+    /// The operation completed normally.
     case complete
+    /// The client must fulfill embedded requests and retry the original operation.
     case inputRequired
+    /// A result type introduced by a later protocol extension.
     case other(String)
 
     public init(from decoder: Decoder) throws {
@@ -302,13 +305,17 @@ public enum ResultType: Hashable, Codable, Sendable {
 
 /// The authorization boundary within which a cached response may be reused.
 public enum CacheScope: String, Hashable, Codable, Sendable {
+    /// The result may be reused across authorization contexts.
     case `public`
+    /// The result may be reused only within the same authorization context.
     case `private`
 }
 
 /// Cache information returned by methods whose results may be reused.
 public struct CachePolicy: Hashable, Codable, Sendable {
+    /// How long the complete result may be reused, in milliseconds.
     public var ttlMs: Int
+    /// The authorization boundary within which the result may be reused.
     public var cacheScope: CacheScope
 
     public init(ttlMs: Int, cacheScope: CacheScope) {
@@ -326,7 +333,9 @@ public enum ProtocolErrorCode {
 
 /// Data returned with an unsupported protocol version error.
 public struct UnsupportedProtocolVersionData: Hashable, Codable, Sendable {
+    /// Protocol versions supported by the endpoint.
     public var supported: [String]
+    /// The unsupported protocol version from the request.
     public var requested: String
 
     public init(supported: [String], requested: String) {
@@ -337,6 +346,7 @@ public struct UnsupportedProtocolVersionData: Hashable, Codable, Sendable {
 
 /// Data returned when a request omitted a capability required by the server.
 public struct MissingRequiredClientCapabilityData: Hashable, Codable, Sendable {
+    /// The capability declaration required to process the request.
     public var requiredCapabilities: Client.Capabilities
 
     public init(requiredCapabilities: Client.Capabilities) {
@@ -349,6 +359,7 @@ public enum Discover: Method {
     public static let name = "server/discover"
 
     public struct Parameters: Hashable, Codable, Sendable {
+        /// Optional request metadata, including lifecycle fields added by the client.
         public var _meta: Metadata
 
         public init(_meta: Metadata = .init()) {
@@ -357,12 +368,19 @@ public enum Discover: Method {
     }
 
     public struct Result: Hashable, Codable, Sendable {
+        /// Protocol versions supported by the server, in server preference order.
         public var supportedVersions: [String]
+        /// Capabilities available from the server.
         public var capabilities: Server.Capabilities
+        /// Optional instructions describing how to use the server.
         public var instructions: String?
+        /// How long this discovery result may be reused, in milliseconds.
         public var ttlMs: Int
+        /// The authorization boundary within which this result may be reused.
         public var cacheScope: CacheScope
+        /// The disposition of this result.
         public var resultType: ResultType
+        /// Optional result metadata, including server identity.
         public var _meta: Metadata?
 
         public init(
@@ -416,9 +434,13 @@ extension Discover.Result {
 
 /// A successful result that requires client input before the original request can complete.
 public struct InputRequiredResult: Hashable, Codable, Sendable {
+    /// The required `input_required` result disposition.
     public var resultType: ResultType
+    /// Embedded client requests, keyed for correlation with the next attempt.
     public var inputRequests: [String: Value]?
+    /// Opaque state that the client returns unchanged on the next attempt.
     public var requestState: String?
+    /// Optional result metadata.
     public var _meta: Metadata?
 
     public init(

@@ -162,9 +162,13 @@ public enum HTTPHeaderName {
     public static let cacheControl = "Cache-Control"
     public static let connection = "Connection"
     public static let allow = "Allow"
+    /// Disables response buffering by supporting reverse proxies.
     public static let xAccelBuffering = "X-Accel-Buffering"
+    /// The standard header carrying the JSON-RPC method name.
     public static let mcpMethod = "Mcp-Method"
+    /// The standard header carrying a request's tool, prompt, or resource name.
     public static let mcpName = "Mcp-Name"
+    /// The prefix for headers derived from `x-mcp-header` tool schema annotations.
     public static let parameterPrefix = "Mcp-Param-"
 }
 

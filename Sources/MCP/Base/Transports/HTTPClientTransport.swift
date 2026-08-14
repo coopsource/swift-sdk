@@ -237,9 +237,8 @@ private struct RequestScopedSSEParser {
 /// // and deliver them through the client's notification handlers
 /// ```
 public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestStreamCancelling,
-    ProtocolLifecycleCacheKeyProviding, ToolHeaderSchemaManaging,
-    ResponseCacheAuthorizationContextProviding,
-    ResponseCacheRequestAuthorizationContextProviding
+    ToolHeaderSchemaManaging, ResponseCacheAuthorizationContextProviding,
+    ResponseCacheRequestAuthorizationContextProviding, ProtocolLifecycleCacheKeyProviding
 {
     /// The server endpoint URL to connect to
     public let endpoint: URL
@@ -503,20 +502,6 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
         }
     }
 
-    package func protocolLifecycleCacheKey() -> String? {
-        guard let scheme = endpoint.scheme?.lowercased(),
-            let host = endpoint.host?.lowercased()
-        else {
-            return nil
-        }
-        let formattedHost = host.contains(":") ? "[\(host)]" : host
-        let defaultPort = scheme == "https" ? 443 : scheme == "http" ? 80 : nil
-        if let port = endpoint.port, port != defaultPort {
-            return "\(scheme)://\(formattedHost):\(port)"
-        }
-        return "\(scheme)://\(formattedHost)"
-    }
-
     package func updateToolHeaderSchemas(
         _ tools: [Tool],
         replacing: Bool
@@ -555,6 +540,20 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
     package func responseCacheAuthorizationContext() -> ResponseCacheAuthorizationContext {
         guard !usesUntrackedAuthorization else { return .unavailable }
         return .known(authorizer?.authorizationHeader(for: endpoint) ?? "")
+    }
+
+    package func protocolLifecycleCacheKey() -> String? {
+        guard let scheme = endpoint.scheme?.lowercased(),
+            let host = endpoint.host?.lowercased()
+        else {
+            return nil
+        }
+        let formattedHost = host.contains(":") ? "[\(host)]" : host
+        let defaultPort = scheme == "https" ? 443 : scheme == "http" ? 80 : nil
+        if let port = endpoint.port, port != defaultPort {
+            return "\(scheme)://\(formattedHost):\(port)"
+        }
+        return "\(scheme)://\(formattedHost)"
     }
 
     package func takeResponseCacheAuthorizationContext(

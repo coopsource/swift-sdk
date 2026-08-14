@@ -7,7 +7,7 @@ import Foundation
 /// Clients can discover available prompts, retrieve their contents,
 /// and provide arguments to customize them.
 ///
-/// - SeeAlso: https://modelcontextprotocol.io/specification/2025-11-25/server/prompts/
+/// - SeeAlso: https://modelcontextprotocol.io/specification/2026-07-28/server/prompts/
 public struct Prompt: Hashable, Codable, Sendable {
     /// The prompt name
     public let name: String
@@ -136,7 +136,7 @@ public struct Prompt: Hashable, Codable, Sendable {
             case audio(data: String, mimeType: String)
             /// Embedded resource content (EmbeddedResource from spec)
             case resource(resource: Resource.Content, annotations: Resource.Annotations? = nil, _meta: Metadata? = nil)
-            /// Resource link
+            /// Resource link.
             case resourceLink(
                 uri: String, name: String, title: String? = nil,
                 description: String? = nil, mimeType: String? = nil,
@@ -285,7 +285,7 @@ extension Prompt.Message.Content: ExpressibleByStringInterpolation {
 // MARK: -
 
 /// To retrieve available prompts, clients send a `prompts/list` request.
-/// - SeeAlso: https://modelcontextprotocol.io/specification/2025-11-25/server/prompts/#listing-prompts
+/// - SeeAlso: https://modelcontextprotocol.io/specification/2026-07-28/server/prompts/#listing-prompts
 public enum ListPrompts: Method {
     public static let name: String = "prompts/list"
 
@@ -310,6 +310,7 @@ public enum ListPrompts: Method {
         /// Whether this complete result may be reused across authorization contexts.
         public var cacheScope: CacheScope?
 
+        /// Creates a prompt-list result.
         public init(
             prompts: [Prompt],
             nextCursor: String? = nil,
@@ -350,16 +351,20 @@ public enum ListPrompts: Method {
 
 /// To retrieve a specific prompt, clients send a `prompts/get` request.
 /// Arguments may be auto-completed through the completion API.
-/// - SeeAlso: https://modelcontextprotocol.io/specification/2025-11-25/server/prompts/#getting-a-prompt
+///
+/// - SeeAlso: https://modelcontextprotocol.io/specification/2026-07-28/server/prompts/#getting-a-prompt
 public enum GetPrompt: MultiRoundTripMethod {
     public static let name: String = "prompts/get"
 
     public struct Parameters: Hashable, Codable, Sendable {
         public let name: String
         public let arguments: [String: String]?
+        /// Results of embedded input requests from the preceding attempt.
         public let inputResponses: [String: Value]?
+        /// Opaque server state copied unchanged from the preceding attempt.
         public let requestState: String?
 
+        /// Creates prompt request parameters.
         public init(
             name: String,
             arguments: [String: String]? = nil,
@@ -410,7 +415,7 @@ public enum GetPrompt: MultiRoundTripMethod {
 }
 
 /// When the list of available prompts changes, servers that declared the listChanged capability SHOULD send a notification.
-/// - SeeAlso: https://modelcontextprotocol.io/specification/2025-11-25/server/prompts/#list-changed-notification
+/// - SeeAlso: https://modelcontextprotocol.io/specification/2026-07-28/server/prompts/#list-changed-notification
 public struct PromptListChangedNotification: Notification {
     public static let name: String = "notifications/prompts/list_changed"
 }

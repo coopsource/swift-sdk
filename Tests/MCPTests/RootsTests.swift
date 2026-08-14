@@ -268,7 +268,8 @@ struct RootsTests {
             version: "1.0.0",
             capabilities: Client.Capabilities(
                 roots: Client.Capabilities.Roots(listChanged: true)
-            )
+            ),
+            configuration: .init(protocolMode: .initializationOnly)
         )
 
         await client.withRootsHandler {
@@ -305,7 +306,8 @@ struct RootsTests {
         // Client has NO roots capability (default empty capabilities)
         let client = Client(
             name: "test-client",
-            version: "1.0.0"
+            version: "1.0.0",
+            configuration: .init(protocolMode: .initializationOnly)
         )
 
         // Start server and client
@@ -340,7 +342,8 @@ struct RootsTests {
         // Client has NO roots capability but registers handler anyway
         let client = Client(
             name: "test-client",
-            version: "1.0.0"
+            version: "1.0.0",
+            configuration: .init(protocolMode: .initializationOnly)
         )
 
         await client.withRootsHandler {
@@ -377,7 +380,8 @@ struct RootsTests {
             version: "1.0.0",
             capabilities: Client.Capabilities(
                 roots: Client.Capabilities.Roots(listChanged: true)
-            )
+            ),
+            configuration: .init(protocolMode: .initializationOnly)
         )
 
         // Register notification handler on server
@@ -422,7 +426,8 @@ struct RootsTests {
             version: "1.0.0",
             capabilities: Client.Capabilities(
                 roots: Client.Capabilities.Roots(listChanged: true)
-            )
+            ),
+            configuration: .init(protocolMode: .initializationOnly)
         )
 
         // NO handler registered on client
@@ -460,7 +465,8 @@ struct RootsTests {
             version: "1.0.0",
             capabilities: Client.Capabilities(
                 roots: Client.Capabilities.Roots(listChanged: true)
-            )
+            ),
+            configuration: .init(protocolMode: .initializationOnly)
         )
 
         await client.withRootsHandler {

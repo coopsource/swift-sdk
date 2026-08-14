@@ -628,7 +628,11 @@ struct SubscriptionTests {
         let pair = await InMemoryTransport.createConnectedPair()
         let server = Server(name: "Server", version: "1.0")
         try await server.start(transport: pair.server)
-        let client = Client(name: "Client", version: "1.0")
+        let client = Client(
+            name: "Client",
+            version: "1.0",
+            configuration: .init(protocolMode: .initializationOnly)
+        )
         _ = try await client.connect(transport: pair.client)
 
         await #expect(throws: MCPError.self) {

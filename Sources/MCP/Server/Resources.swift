@@ -6,7 +6,7 @@ import Foundation
 /// such as files, database schemas, or application-specific information.
 /// Each resource is uniquely identified by a URI.
 ///
-/// - SeeAlso: https://modelcontextprotocol.io/specification/2025-11-25/server/resources/
+/// - SeeAlso: https://modelcontextprotocol.io/specification/2026-07-28/server/resources/
 public struct Resource: Hashable, Codable, Sendable {
     /// The resource name
     public var name: String
@@ -248,7 +248,7 @@ public struct Resource: Hashable, Codable, Sendable {
 // MARK: -
 
 /// To discover available resources, clients send a `resources/list` request.
-/// - SeeAlso: https://modelcontextprotocol.io/specification/2025-11-25/server/resources/#listing-resources
+/// - SeeAlso: https://modelcontextprotocol.io/specification/2026-07-28/server/resources/#listing-resources
 public enum ListResources: Method {
     public static let name: String = "resources/list"
 
@@ -273,6 +273,7 @@ public enum ListResources: Method {
         /// Whether this complete result may be reused across authorization contexts.
         public var cacheScope: CacheScope?
 
+        /// Creates a resource-list result.
         public init(
             resources: [Resource],
             nextCursor: String? = nil,
@@ -312,15 +313,19 @@ public enum ListResources: Method {
 }
 
 /// To retrieve resource contents, clients send a `resources/read` request:
-/// - SeeAlso: https://modelcontextprotocol.io/specification/2025-11-25/server/resources/#reading-resources
+///
+/// - SeeAlso: https://modelcontextprotocol.io/specification/2026-07-28/server/resources/#reading-resources
 public enum ReadResource: MultiRoundTripMethod {
     public static let name: String = "resources/read"
 
     public struct Parameters: Hashable, Codable, Sendable {
         public let uri: String
+        /// Results of embedded input requests from the preceding attempt.
         public let inputResponses: [String: Value]?
+        /// Opaque server state copied unchanged from the preceding attempt.
         public let requestState: String?
 
+        /// Creates resource-read parameters.
         public init(
             uri: String,
             inputResponses: [String: Value]? = nil,
@@ -341,6 +346,7 @@ public enum ReadResource: MultiRoundTripMethod {
         /// Whether this complete result may be reused across authorization contexts.
         public var cacheScope: CacheScope?
 
+        /// Creates a resource-read result.
         public init(
             contents: [Resource.Content],
             _meta: Metadata? = nil,
@@ -376,7 +382,7 @@ public enum ReadResource: MultiRoundTripMethod {
 }
 
 /// To discover available resource templates, clients send a `resources/templates/list` request.
-/// - SeeAlso: https://modelcontextprotocol.io/specification/2025-11-25/server/resources/#resource-templates
+/// - SeeAlso: https://modelcontextprotocol.io/specification/2026-07-28/server/resources/#resource-templates
 public enum ListResourceTemplates: Method {
     public static let name: String = "resources/templates/list"
 
@@ -402,6 +408,7 @@ public enum ListResourceTemplates: Method {
         /// Whether this complete result may be reused across authorization contexts.
         public var cacheScope: CacheScope?
 
+        /// Creates a resource-template-list result.
         public init(
             templates: [Resource.Template],
             nextCursor: String? = nil,
@@ -445,7 +452,7 @@ public enum ListResourceTemplates: Method {
 }
 
 /// When the list of available resources changes, servers that declared the listChanged capability SHOULD send a notification.
-/// - SeeAlso: https://modelcontextprotocol.io/specification/2025-11-25/server/resources/#list-changed-notification
+/// - SeeAlso: https://modelcontextprotocol.io/specification/2026-07-28/server/resources/#list-changed-notification
 public struct ResourceListChangedNotification: Notification {
     public static let name: String = "notifications/resources/list_changed"
 
@@ -477,7 +484,7 @@ public enum ResourceUnsubscribe: Method {
 }
 
 /// When a resource changes, servers that declared the updated capability SHOULD send a notification to subscribed clients.
-/// - SeeAlso: https://modelcontextprotocol.io/specification/2025-11-25/server/resources/#subscriptions
+/// - SeeAlso: https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/subscriptions
 public struct ResourceUpdatedNotification: Notification {
     public static let name: String = "notifications/resources/updated"
 

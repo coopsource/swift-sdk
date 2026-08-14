@@ -4,11 +4,11 @@ import Testing
 
 @Suite("Version Negotiation Tests")
 struct VersioningTests {
-    @Test("Client requests latest supported version")
-    func testClientRequestsLatestSupportedVersion() {
-        let clientVersion = Version.latest
+    @Test("Client requests latest initialization version")
+    func testClientRequestsLatestInitializationVersion() {
+        let clientVersion = Version.latestInitializationVersion
         let negotiatedVersion = Version.negotiate(clientRequestedVersion: clientVersion)
-        #expect(negotiatedVersion == Version.latest)
+        #expect(negotiatedVersion == Version.latestInitializationVersion)
     }
 
     @Test("Client requests older supported version")
@@ -22,21 +22,21 @@ struct VersioningTests {
     func testClientRequestsUnsupportedVersion() {
         let clientVersion = "2023-01-01"  // An unsupported version
         let negotiatedVersion = Version.negotiate(clientRequestedVersion: clientVersion)
-        #expect(negotiatedVersion == Version.latest)
+        #expect(negotiatedVersion == Version.latestInitializationVersion)
     }
 
     @Test("Client requests empty version string")
     func testClientRequestsEmptyVersionString() {
         let clientVersion = ""
         let negotiatedVersion = Version.negotiate(clientRequestedVersion: clientVersion)
-        #expect(negotiatedVersion == Version.latest)
+        #expect(negotiatedVersion == Version.latestInitializationVersion)
     }
 
     @Test("Client requests garbage version string")
     func testClientRequestsGarbageVersionString() {
         let clientVersion = "not-a-version"
         let negotiatedVersion = Version.negotiate(clientRequestedVersion: clientVersion)
-        #expect(negotiatedVersion == Version.latest)
+        #expect(negotiatedVersion == Version.latestInitializationVersion)
     }
 
     @Test("Server's supported versions correctly defined")
@@ -74,14 +74,14 @@ struct VersioningTests {
         )
     }
 
-    @Test("Initialization negotiation respects an authoritative allowlist")
-    func testInitializationNegotiationAllowlist() {
-        let supported: Set<String> = ["2025-03-26", "2025-06-18"]
+    @Test("Initialization negotiation respects a binding-specific allowlist")
+    func testBindingSpecificInitializationNegotiation() {
+        let streamableHTTP = Version.streamableHTTPSupported(for: .initializationBased)
 
         #expect(Version.negotiate(
             clientRequestedVersion: "2024-11-05",
-            supportedVersions: supported
-        ) == "2025-06-18")
+            supportedVersions: streamableHTTP
+        ) == Version.latestInitializationVersion)
         #expect(Version.negotiate(
             clientRequestedVersion: "2024-11-05",
             supportedVersions: []
@@ -90,7 +90,7 @@ struct VersioningTests {
 
     @Test("Server's latest version is correct")
     func testServerLatestVersion() {
-        #expect(Version.latest == "2025-11-25")
+        #expect(Version.latest == "2026-07-28")
     }
 
     @Test("Client requests new 2025-11-25 version")

@@ -79,6 +79,11 @@ package protocol ResponseCacheRequestAuthorizationContextProviding: Transport {
     ) async -> ResponseCacheAuthorizationContext
 }
 
+/// Supplies a stable key for caching a server's protocol lifecycle.
+package protocol ProtocolLifecycleCacheKeyProviding: Transport {
+    func protocolLifecycleCacheKey() async -> String?
+}
+
 /// Optional HTTP-client hook for schemas that define tool parameter headers.
 package protocol ToolHeaderSchemaManaging: Transport {
     func updateToolHeaderSchemas(_ tools: [Tool], replacing: Bool) async -> [Tool]
@@ -91,9 +96,4 @@ package enum ProtocolLifecycleProbeError: Error {
     case initializationBasedResponse
     case correlatedHTTPResponse(statusCode: Int, error: MCPError)
     case inconclusive(MCPError)
-}
-
-/// Supplies a stable key for caching a server's protocol lifecycle.
-package protocol ProtocolLifecycleCacheKeyProviding: Transport {
-    func protocolLifecycleCacheKey() async -> String?
 }

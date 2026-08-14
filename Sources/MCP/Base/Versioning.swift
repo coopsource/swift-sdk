@@ -21,15 +21,14 @@ public enum Version {
     /// The newest initialization-based protocol version supported by this implementation.
     public static let latestInitializationVersion = "2025-11-25"
 
-    /// The latest protocol version selected by the default lifecycle behavior.
-    ///
-    /// This remains initialization-based until automatic negotiation is enabled by default.
-    public static let latest = latestInitializationVersion
+    /// The newest protocol version supported by this implementation.
+    public static let latest = perRequestMetadataVersion
 
     /// Returns the protocol versions supported by one lifecycle mechanism.
     ///
-    /// The union of both lifecycle sets is ``supported``. A transport binding may support a
-    /// narrower version set.
+    /// Use this partition when an endpoint supports only initialization-based sessions or only
+    /// per-request metadata. The union of both lifecycle sets is ``supported``. This partitions
+    /// lifecycle semantics only; a transport binding may support a narrower version set.
     public static func supported(for lifecycle: ProtocolLifecycle) -> Set<String> {
         switch lifecycle {
         case .initializationBased:
@@ -41,8 +40,15 @@ public enum Version {
 
     /// Returns the versions implemented by the Streamable HTTP binding for one lifecycle.
     ///
-    /// Initialization-based Streamable HTTP starts at `2025-03-26`; `2024-11-05` uses the
-    /// deprecated HTTP+SSE binding.
+    /// The initialization-based Streamable HTTP binding was introduced in `2025-03-26`.
+    /// Protocol version `2024-11-05` instead uses the deprecated HTTP+SSE binding, so it is a
+    /// member of ``supported(for:)`` but **not** of this set.
+    ///
+    /// Prefer ``supported(for:)`` to describe lifecycle semantics. Use this narrower partition
+    /// when the question is what a *Streamable HTTP endpoint* actually implements — for example
+    /// when an application supplies its own ``HTTPRequestValidator`` and needs to enforce the
+    /// same version set this package's own transports enforce. Deriving that set by hand
+    /// instead reproduces a rule that drifts silently as revisions are added.
     public static func streamableHTTPSupported(
         for lifecycle: ProtocolLifecycle
     ) -> Set<String> {

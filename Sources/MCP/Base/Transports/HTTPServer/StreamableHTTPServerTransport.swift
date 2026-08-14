@@ -95,6 +95,9 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
 
     /// Creates a per-request-metadata transport with a custom origin policy and all other
     /// standard validation enabled.
+    ///
+    /// Protocol-version validation remains transport-owned. To replace the Origin, Accept, and
+    /// Content-Type chain, use ``init(validationPipeline:logger:toolHeaderSchemaProvider:)``.
     public init(
         originValidator: OriginValidator,
         logger: Logger? = nil,

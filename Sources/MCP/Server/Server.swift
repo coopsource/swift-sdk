@@ -43,6 +43,7 @@ public actor Server {
         /// Maximum queued messages and waiting publishers for each subscription.
         public var subscriptionBufferCapacity: Int
 
+        /// Creates a server configuration.
         public init(
             strict: Bool = false,
             protocolMode: ProtocolMode = .initializationOnly,
@@ -148,8 +149,10 @@ public actor Server {
 
         /// Logging capabilities
         public struct Logging: Hashable, Codable, Sendable {
+            /// Additional settings carried by this capability object.
             public var settings: [String: Value]
 
+            /// Creates a logging capability with additional settings.
             public init(settings: [String: Value] = [:]) { self.settings = settings }
             public init(from decoder: Decoder) throws {
                 settings = try [String: Value](from: decoder)
@@ -159,8 +162,10 @@ public actor Server {
 
         /// Completions capabilities
         public struct Completions: Hashable, Codable, Sendable {
+            /// Additional settings carried by this capability object.
             public var settings: [String: Value]
 
+            /// Creates a completions capability with additional settings.
             public init(settings: [String: Value] = [:]) { self.settings = settings }
             public init(from decoder: Decoder) throws {
                 settings = try [String: Value](from: decoder)
@@ -185,6 +190,7 @@ public actor Server {
         /// Additional capabilities not defined by this SDK version.
         public var additionalCapabilities: [String: Value]
 
+        /// Creates a server capability declaration.
         public init(
             completions: Completions? = nil,
             logging: Logging? = nil,
@@ -373,6 +379,7 @@ public actor Server {
     /// The task for the message handling loop
     private var task: Task<Void, Never>?
 
+    /// Creates a server.
     public init(
         name: String,
         version: String,
@@ -588,7 +595,7 @@ public actor Server {
 
     // MARK: - Registration
 
-    /// Register a method handler
+    /// Register a method handler.
     @discardableResult
     public func withMethodHandler<M: Method>(
         _ type: M.Type,
@@ -627,7 +634,7 @@ public actor Server {
 
     // MARK: - Sending
 
-    /// Send a response to a request
+    /// Send a response to a request.
     public func send<M: Method>(_ response: Response<M>) async throws {
         try await send(
             response,
@@ -664,7 +671,7 @@ public actor Server {
         try await connection.send(responseData)
     }
 
-    /// Send a notification to connected clients
+    /// Send a notification to connected clients.
     public func notify<N: Notification>(_ notification: Message<N>) async throws {
         guard let connection = connection else {
             throw MCPError.internalError("Server connection not initialized")
