@@ -54,6 +54,243 @@ public struct HTTPValidationContext: Sendable {
     }
 }
 
+private enum HTTPMediaValueParser {
+    struct MediaRange {
+        let type: String
+        let subtype: String
+        let parameters: [String: String]
+        let quality: Int
+
+        private var typeSpecificity: Int {
+            if type == "*" { return 0 }
+            if subtype == "*" { return 1 }
+            return 2
+        }
+
+        func matches(
+            type expectedType: String,
+            subtype expectedSubtype: String,
+            parameters expectedParameters: [String: String] = [:]
+        ) -> Bool {
+            (type == "*" || type == expectedType)
+                && (subtype == "*" || subtype == expectedSubtype)
+                && parameters.allSatisfy { expectedParameters[$0.key] == $0.value }
+        }
+
+        func isLessSpecific(than other: MediaRange) -> Bool {
+            if typeSpecificity != other.typeSpecificity {
+                return typeSpecificity < other.typeSpecificity
+            }
+            return parameters.count < other.parameters.count
+        }
+
+        func hasSameSpecificity(as other: MediaRange) -> Bool {
+            typeSpecificity == other.typeSpecificity
+                && parameters.count == other.parameters.count
+        }
+    }
+
+    static func accepts(_ value: String, type: String, subtype: String) -> Bool {
+        guard let elements = split(value, on: ","), !elements.isEmpty else { return false }
+        var matches: [MediaRange] = []
+        for element in elements {
+            guard let range = parse(element, allowsWildcards: true, parsesQuality: true) else {
+                return false
+            }
+            if range.matches(type: type, subtype: subtype) {
+                matches.append(range)
+            }
+        }
+        guard let mostSpecific = matches.max(by: { $0.isLessSpecific(than: $1) }) else {
+            return false
+        }
+        let qualities = Set(
+            matches.lazy.filter { $0.hasSameSpecificity(as: mostSpecific) }.map(\.quality)
+        )
+        guard qualities.count == 1, let quality = qualities.first else { return false }
+        return quality > 0
+    }
+
+    static func contentType(_ value: String, matches type: String, subtype: String) -> Bool {
+        guard let values = split(value, on: ","), values.count == 1,
+            let mediaType = parse(values[0], allowsWildcards: false, parsesQuality: false)
+        else {
+            return false
+        }
+        return mediaType.type == type && mediaType.subtype == subtype
+    }
+
+    private static func parse(
+        _ value: String,
+        allowsWildcards: Bool,
+        parsesQuality: Bool
+    ) -> MediaRange? {
+        guard let parts = split(value, on: ";"), let essence = parts.first else { return nil }
+        let typeAndSubtype = trimOWS(essence).split(
+            separator: "/",
+            maxSplits: 1,
+            omittingEmptySubsequences: false
+        )
+        guard typeAndSubtype.count == 2,
+            isToken(String(typeAndSubtype[0])),
+            isToken(String(typeAndSubtype[1]))
+        else {
+            return nil
+        }
+
+        let type = typeAndSubtype[0].lowercased()
+        let subtype = typeAndSubtype[1].lowercased()
+        if allowsWildcards {
+            guard subtype == "*" || !subtype.contains("*") else { return nil }
+            guard type != "*" || subtype == "*" else { return nil }
+            guard type == "*" || !type.contains("*") else { return nil }
+        } else {
+            guard !type.contains("*"), !subtype.contains("*") else { return nil }
+        }
+
+        var quality = 1000
+        var qualitySeen = false
+        var mediaParameters: [String: String] = [:]
+        for rawParameter in parts.dropFirst() {
+            let parameter = trimOWS(rawParameter)
+            guard !parameter.isEmpty else { return nil }
+            guard let equals = parameter.firstIndex(of: "=") else { return nil }
+
+            let untrimmedName = String(parameter[..<equals])
+            let untrimmedValue = String(parameter[parameter.index(after: equals)...])
+            let trimmedName = trimOWS(untrimmedName)
+            let name = trimmedName.lowercased()
+            let rawValue = trimOWS(untrimmedValue)
+            guard untrimmedName == trimmedName, untrimmedValue == rawValue else { return nil }
+            guard isToken(name), isParameterValue(rawValue) else { return nil }
+
+            if parsesQuality, name == "q" {
+                guard !qualitySeen, !rawValue.hasPrefix("\"") else { return nil }
+                guard let parsedQuality = parseQuality(rawValue) else { return nil }
+                quality = parsedQuality
+                qualitySeen = true
+            } else {
+                guard mediaParameters.updateValue(rawValue, forKey: name) == nil else {
+                    return nil
+                }
+            }
+        }
+
+        return MediaRange(
+            type: type,
+            subtype: subtype,
+            parameters: mediaParameters,
+            quality: quality
+        )
+    }
+
+    private static func parseQuality(_ value: String) -> Int? {
+        if value == "0" { return 0 }
+        if value == "1" { return 1000 }
+
+        guard value.count >= 2, value.count <= 5,
+            value[value.index(after: value.startIndex)] == "."
+        else {
+            return nil
+        }
+        let whole = value[value.startIndex]
+        let fraction = value.dropFirst(2)
+        guard fraction.count <= 3, fraction.allSatisfy(\.isNumber) else { return nil }
+        if whole == "1" {
+            return fraction.allSatisfy { $0 == "0" } ? 1000 : nil
+        }
+        guard whole == "0" else { return nil }
+        let padded = fraction + String(repeating: "0", count: 3 - fraction.count)
+        return Int(padded)
+    }
+
+    private static func isParameterValue(_ value: String) -> Bool {
+        if isToken(value) { return true }
+        guard value.count >= 2, value.first == "\"", value.last == "\"" else {
+            return false
+        }
+        var escaped = false
+        for scalar in value.dropFirst().dropLast().unicodeScalars {
+            let byte = scalar.value
+            if escaped {
+                guard byte == 0x09 || byte == 0x20 || (0x21...0x7E).contains(byte) else {
+                    return false
+                }
+                escaped = false
+            } else if byte == 0x5C {
+                escaped = true
+            } else {
+                guard byte == 0x09 || byte == 0x20 || byte == 0x21
+                    || (0x23...0x5B).contains(byte) || (0x5D...0x7E).contains(byte)
+                else {
+                    return false
+                }
+            }
+        }
+        return !escaped
+    }
+
+    private static func isToken(_ value: String) -> Bool {
+        guard !value.isEmpty else { return false }
+        return value.unicodeScalars.allSatisfy { scalar in
+            switch scalar.value {
+            case 0x30...0x39, 0x41...0x5A, 0x61...0x7A:
+                return true
+            case 0x21, 0x23, 0x24, 0x25, 0x26, 0x27, 0x2A, 0x2B, 0x2D, 0x2E,
+                0x5E, 0x5F, 0x60, 0x7C, 0x7E:
+                return true
+            default:
+                return false
+            }
+        }
+    }
+
+    /// Splits a header value on a separator, honoring quoted strings.
+    ///
+    /// Empty elements are skipped rather than rejected: RFC 9110 §5.6.1 requires recipients to
+    /// parse and ignore a reasonable number of empty list elements, and the §5.6.6 parameter
+    /// grammar makes each parameter optional. A value that is entirely empty elements yields an
+    /// empty list, which callers reject on their own terms. `nil` still signals a malformed
+    /// value, such as an unterminated quoted string.
+    private static func split(_ value: String, on separator: Character) -> [String]? {
+        var result: [String] = []
+        var current = ""
+        var quoted = false
+        var escaped = false
+        for character in value {
+            if quoted {
+                current.append(character)
+                if escaped {
+                    escaped = false
+                } else if character == "\\" {
+                    escaped = true
+                } else if character == "\"" {
+                    quoted = false
+                }
+            } else if character == "\"" {
+                quoted = true
+                current.append(character)
+            } else if character == separator {
+                if !trimOWS(current).isEmpty {
+                    result.append(current)
+                }
+                current = ""
+            } else {
+                current.append(character)
+            }
+        }
+        guard !quoted, !escaped else { return nil }
+        if !trimOWS(current).isEmpty {
+            result.append(current)
+        }
+        return result
+    }
+
+    private static func trimOWS(_ value: String) -> String {
+        value.trimmingCharacters(in: CharacterSet(charactersIn: " \t"))
+    }
+}
+
 // MARK: - Accept Header Validator
 
 /// Validates the `Accept` header based on the HTTP method and transport response mode.
@@ -78,12 +315,16 @@ public struct AcceptHeaderValidator: HTTPRequestValidator {
 
     public func validate(_ request: HTTPRequest, context: HTTPValidationContext) -> HTTPResponse? {
         let accept = request.header(HTTPHeaderName.accept) ?? ""
-        let acceptTypes = accept.split(separator: ",").map {
-            $0.trimmingCharacters(in: .whitespaces)
-        }
-
-        let hasJSON = acceptTypes.contains { $0.hasPrefix(ContentType.json) }
-        let hasSSE = acceptTypes.contains { $0.hasPrefix(ContentType.sse) }
+        let hasJSON = HTTPMediaValueParser.accepts(
+            accept,
+            type: "application",
+            subtype: "json"
+        )
+        let hasSSE = HTTPMediaValueParser.accepts(
+            accept,
+            type: "text",
+            subtype: "event-stream"
+        )
 
         switch context.httpMethod {
         case "POST":
@@ -137,10 +378,11 @@ public struct ContentTypeValidator: HTTPRequestValidator {
         guard context.httpMethod == "POST" else { return nil }
 
         let contentType = request.header(HTTPHeaderName.contentType) ?? ""
-        let mainType = contentType.split(separator: ";").first?
-            .trimmingCharacters(in: .whitespaces) ?? ""
-
-        guard mainType == ContentType.json else {
+        guard HTTPMediaValueParser.contentType(
+            contentType,
+            matches: "application",
+            subtype: "json"
+        ) else {
             return .error(
                 statusCode: 415,
                 .invalidRequest(

@@ -1,6 +1,16 @@
 import Foundation
 import Logging
 
+private func makeStreamableHTTPValidationPipeline(
+    originValidator: OriginValidator
+) -> StandardValidationPipeline {
+    StandardValidationPipeline(validators: [
+        originValidator,
+        AcceptHeaderValidator(mode: .sseRequired),
+        ContentTypeValidator(),
+    ])
+}
+
 /// A Streamable HTTP server transport for the per-request-metadata lifecycle.
 ///
 /// Each JSON-RPC request or notification arrives in its own POST. A request
@@ -8,7 +18,7 @@ import Logging
 /// first, in which case the response becomes a request-scoped SSE stream. This
 /// transport does not create sessions, a standalone GET stream, or replay state.
 public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
-    RequestScopedSending, RequestCancellationRegistering
+    RequestScopedSending, RequestCancellationRegistering, TransportProtocolVersionProviding
 {
     public nonisolated let logger: Logger
 
@@ -38,7 +48,7 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
     }
 
     private let validationPipeline: any HTTPRequestValidationPipeline
-    private let supportedProtocolVersions: Set<String>
+    private let bindingSupportedProtocolVersions: Set<String>
 
     private let incomingStream: AsyncThrowingStream<Data, Swift.Error>
     private let incomingContinuation: AsyncThrowingStream<Data, Swift.Error>.Continuation
@@ -58,12 +68,12 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
         validationPipeline: (any HTTPRequestValidationPipeline)? = nil,
         logger: Logger? = nil
     ) {
-        self.validationPipeline = validationPipeline ?? StandardValidationPipeline(validators: [
-            OriginValidator.localhost(),
-            AcceptHeaderValidator(mode: .sseRequired),
-            ContentTypeValidator(),
-        ])
-        self.supportedProtocolVersions = [Version.perRequestMetadataVersion]
+        self.validationPipeline = validationPipeline ?? makeStreamableHTTPValidationPipeline(
+            originValidator: .localhost()
+        )
+        self.bindingSupportedProtocolVersions = Version.streamableHTTPSupported(
+            for: .perRequestMetadata
+        )
         self.logger = logger ?? Logger(
             label: "mcp.transport.http.server.per-request-metadata",
             factory: { _ in SwiftLogNoOpLogHandler() }
@@ -72,6 +82,20 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
         let (stream, continuation) = AsyncThrowingStream<Data, Swift.Error>.makeStream()
         self.incomingStream = stream
         self.incomingContinuation = continuation
+    }
+
+    /// Creates a per-request-metadata transport with a custom origin policy and all other
+    /// standard validation enabled.
+    public init(
+        originValidator: OriginValidator,
+        logger: Logger? = nil
+    ) {
+        self.init(
+            validationPipeline: makeStreamableHTTPValidationPipeline(
+                originValidator: originValidator
+            ),
+            logger: logger
+        )
     }
 
     // MARK: - Transport
@@ -90,6 +114,10 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
 
     public func receive() -> AsyncThrowingStream<Data, Swift.Error> {
         incomingStream
+    }
+
+    package func supportedProtocolVersions() -> Set<String> {
+        bindingSupportedProtocolVersions
     }
 
     public func send(_ data: Data) async throws {
@@ -148,7 +176,7 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
             httpMethod: "POST",
             sessionID: nil,
             isInitializationRequest: false,
-            supportedProtocolVersions: supportedProtocolVersions
+            supportedProtocolVersions: bindingSupportedProtocolVersions
         )
         if let response = validationPipeline.validate(request, context: validationContext) {
             return response
@@ -392,9 +420,9 @@ public actor StreamableHTTPServerTransport: Transport, HTTPContextProviding,
             )
         }
 
-        guard supportedProtocolVersions.contains(headerVersion) else {
+        guard bindingSupportedProtocolVersions.contains(headerVersion) else {
             let data = try? Value(UnsupportedProtocolVersionData(
-                supported: supportedProtocolVersions.sorted(by: >),
+                supported: bindingSupportedProtocolVersions.sorted(by: >),
                 requested: headerVersion
             ))
             return makeErrorResponse(
