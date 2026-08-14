@@ -107,6 +107,49 @@ private struct AdapterHarness {
 
 @Suite("MCP conformance HTTP adapter", .serialized, .timeLimit(.minutes(1)))
 struct HTTPHandlerTests {
+    @Test("Conformance custom-header schema is installed on the transport")
+    func conformanceCustomHeaderSchema() async throws {
+        let transport = StreamableHTTPServerTransport(
+            validationPipeline: StandardValidationPipeline(validators: [])
+        )
+        try await configureConformanceToolHeaders(on: transport)
+        let body = try PerRequestMetadataWire.encodeRequest(
+            CallTool.request(
+                id: .string("missing-header"),
+                .init(
+                    name: conformanceHeaderValidationTool.name,
+                    arguments: ["value": .string("Hello")]
+                )
+            ),
+            protocolVersion: Version.perRequestMetadataVersion,
+            clientInfo: .init(name: "Conformance test client", version: "1.0"),
+            clientCapabilities: .init(),
+            using: JSONEncoder()
+        )
+        var headers = [
+            HTTPHeaderName.contentType: "application/json",
+            HTTPHeaderName.accept: "application/json, text/event-stream",
+            HTTPHeaderName.protocolVersion: Version.perRequestMetadataVersion,
+        ]
+        headers.merge(
+            try MCPHTTPHeaders.requestHeaders(for: body, toolPlans: [:])
+        ) { _, new in new }
+
+        let response = await transport.handleRequest(
+            HTTPRequest(method: "POST", headers: headers, body: body, path: "/mcp")
+        )
+        let responseBody = try #require(response.bodyData)
+        let object = try #require(
+            JSONDecoder().decode(Value.self, from: responseBody).objectValue
+        )
+
+        #expect(response.statusCode == 400)
+        #expect(
+            object["error"]?.objectValue?["code"]?.intValue
+                == ProtocolErrorCode.headerMismatch
+        )
+    }
+
     @Test("Disconnect before route completion cancels server work")
     func disconnectBeforeResponse() async throws {
         let probe = AdapterCancellationProbe()
