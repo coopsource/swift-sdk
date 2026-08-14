@@ -264,6 +264,62 @@ struct LifecycleHTTPServerRouterTests {
         await server.stop()
     }
 
+    @Test("An established session takes precedence over conflicting version headers")
+    func sessionTakesPrecedenceOverVersionHeader() async throws {
+        let recorder = InitializationRouteRecorder()
+        let (router, _, server) = try await makeRouter(recorder: recorder)
+        let body = Data(#"{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}"#.utf8)
+
+        let get = await router.handleRequest(HTTPRequest(
+            method: "GET",
+            headers: [
+                HTTPHeaderName.protocolVersion: Version.perRequestMetadataVersion,
+                HTTPHeaderName.sessionID: "session-1",
+            ]
+        ))
+        let delete = await router.handleRequest(HTTPRequest(
+            method: "DELETE",
+            headers: [
+                HTTPHeaderName.protocolVersion: "2099-01-01",
+                HTTPHeaderName.sessionID: "session-1",
+            ]
+        ))
+        let post = await router.handleRequest(makeRouterRequest(
+            body: body,
+            protocolVersion: "2099-01-01",
+            sessionID: "session-1"
+        ))
+
+        #expect(get.statusCode == 200)
+        #expect(delete.statusCode == 200)
+        #expect(post.statusCode == 200)
+        #expect(await recorder.count == 3)
+
+        await server.stop()
+    }
+
+    @Test("An empty session header does not claim an initialization session")
+    func emptySessionDoesNotTakePrecedence() async throws {
+        let recorder = InitializationRouteRecorder()
+        let (router, _, server) = try await makeRouter(recorder: recorder)
+        let body = Data(
+            #"{"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}}"#.utf8
+        )
+
+        let response = await router.handleRequest(makeRouterRequest(
+            body: body,
+            protocolVersion: "2099-01-01",
+            sessionID: ""
+        ))
+
+        #expect(response.statusCode == 400)
+        #expect(try routerResponseObject(response)["error"]?
+            .objectValue?["code"]?.intValue == -32602)
+        #expect(await recorder.count == 0)
+
+        await server.stop()
+    }
+
     @Test("Protocol mode can isolate either HTTP lifecycle")
     func protocolModesIsolateLifecycles() async throws {
         let initializationRecorder = InitializationRouteRecorder()
