@@ -87,6 +87,8 @@ final class MockDiscoveryClient: OAuthDiscoveryFetching, @unchecked Sendable {
 final class MockTokenClient: OAuthTokenRequesting, @unchecked Sendable {
     var requestCallCount = 0
     var capturedParameters: [String: String]?
+    var capturedParameterHistory: [[String: String]] = []
+    var capturedEndpoints: [URL] = []
     var invokePrivateKeyAssertion = false
     var privateKeyAssertions: [String] = []
     var tokenResponse = OAuthTokenResponse(
@@ -105,6 +107,8 @@ final class MockTokenClient: OAuthTokenRequesting, @unchecked Sendable {
     ) async throws -> OAuthTokenResponse {
         requestCallCount += 1
         capturedParameters = parameters
+        capturedParameterHistory.append(parameters)
+        capturedEndpoints.append(endpoint)
         if invokePrivateKeyAssertion,
             case .privateKeyJWT(let clientID, let assertionFactory) = authentication
         {
@@ -651,6 +655,91 @@ struct OAuthAuthorizerTests {
 
         #expect(discovery.fetchProtectedResourceMetadataCallCount == 2)
         #expect(registrar.registerCallCount == 2)
+    }
+
+    @Test("A changed issuer never receives another server's refresh token")
+    func refreshTokenDoesNotCrossIssuerBoundary() async throws {
+        let firstIssuer = URL(string: "https://auth.example.com")!
+        let secondIssuer = URL(string: "https://other-auth.example.com")!
+        let discovery = MockDiscoveryClient(authorizationServer: firstIssuer)
+        discovery.authorizationServerMetadataResult.metadata = .init(
+            issuer: firstIssuer,
+            authorizationEndpoint: firstIssuer.appendingPathComponent("authorize"),
+            tokenEndpoint: firstIssuer.appendingPathComponent("token"),
+            registrationEndpoint: nil,
+            codeChallengeMethodsSupported: ["S256"],
+            tokenEndpointAuthMethodsSupported: ["private_key_jwt"],
+            clientIDMetadataDocumentSupported: true
+        )
+        let tokenClient = MockTokenClient()
+        tokenClient.tokenResponse = .init(
+            accessToken: "token-a",
+            tokenType: "Bearer",
+            expiresIn: 3600,
+            scope: nil,
+            refreshToken: "refresh-a"
+        )
+        let authorizer = OAuthAuthorizer(
+            configuration: OAuthConfiguration(
+                authentication: .privateKeyJWT(
+                    clientID: "https://client.example.com/metadata.json",
+                    assertionFactory: { _, _ in "assertion" }
+                )
+            ),
+            urlValidator: MockURLValidator(),
+            discoveryClient: discovery,
+            tokenEndpointClient: tokenClient,
+            clientRegistrar: MockClientRegistrar(),
+            authCodeFlow: MockAuthCodeFlow()
+        )
+
+        _ = try await authorizer.handleChallenge(
+            statusCode: 401,
+            headers: headers401,
+            endpoint: endpoint,
+            operationKey: nil,
+            session: .shared
+        )
+
+        discovery.protectedResourceMetadataResult = .init(
+            resource: nil,
+            authorizationServers: [secondIssuer],
+            scopesSupported: nil
+        )
+        discovery.authorizationServerMetadataResult = (
+            server: secondIssuer,
+            metadata: .init(
+                issuer: secondIssuer,
+                authorizationEndpoint: secondIssuer.appendingPathComponent("authorize"),
+                tokenEndpoint: secondIssuer.appendingPathComponent("token"),
+                registrationEndpoint: nil,
+                codeChallengeMethodsSupported: ["S256"],
+                tokenEndpointAuthMethodsSupported: ["private_key_jwt"],
+                clientIDMetadataDocumentSupported: true
+            )
+        )
+        tokenClient.tokenResponse = .init(
+            accessToken: "token-b",
+            tokenType: "Bearer",
+            expiresIn: 3600,
+            scope: nil,
+            refreshToken: "refresh-b"
+        )
+
+        _ = try await authorizer.handleChallenge(
+            statusCode: 401,
+            headers: headers401,
+            endpoint: endpoint,
+            operationKey: nil,
+            session: .shared
+        )
+
+        #expect(tokenClient.capturedEndpoints == [
+            firstIssuer.appendingPathComponent("token"),
+            secondIssuer.appendingPathComponent("token"),
+        ])
+        #expect(tokenClient.capturedParameterHistory[1]["grant_type"] == "client_credentials")
+        #expect(tokenClient.capturedParameterHistory[1]["refresh_token"] == nil)
     }
 
     @Test("Failed dynamic registration can be retried")

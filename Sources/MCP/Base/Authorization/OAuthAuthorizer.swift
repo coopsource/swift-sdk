@@ -260,7 +260,9 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
 
         switch statusCode {
         case 401:
-            if let refreshToken = tokenStorage.load()?.refreshToken {
+            if let storedToken = tokenStorage.load(),
+                let refreshToken = storedToken.refreshToken
+            {
                 tokenStorage.clear()
                 let metadata = try await discoverProtectedResourceMetadata(
                     endpoint: endpoint,
@@ -276,7 +278,8 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
                     challengeScope: challenge?.scope,
                     scopesSupported: metadata.scopesSupported
                 )
-                if try await refreshAccessToken(
+                if storedTokenMatchesSelectedAuthorizationServer(storedToken),
+                    try await refreshAccessToken(
                     refreshToken: refreshToken,
                     resource: resource,
                     requestedScopes: requestedScopes,
@@ -389,6 +392,23 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
         }
     }
 
+    private func storedTokenMatchesSelectedAuthorizationServer(
+        _ token: OAuthAccessToken
+    ) -> Bool {
+        guard let selectedAuthorizationServer,
+            let selectedAuthorizationServerIssuer
+        else {
+            return false
+        }
+        if let tokenIssuer = token.authorizationServerIssuer {
+            return tokenIssuer == selectedAuthorizationServerIssuer
+        }
+        guard let tokenAuthorizationServer = token.authorizationServer else {
+            return false
+        }
+        return authorizationServersMatch(tokenAuthorizationServer, selectedAuthorizationServer)
+    }
+
     public func prepareAuthorization(for endpoint: URL, session: URLSession) async throws {
         guard configuration.proactiveRefreshWindowSeconds > 0 else { return }
         guard let token = tokenStorage.load() else { return }
@@ -397,6 +417,10 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
         }
         guard let refreshToken = token.refreshToken else { return }
         guard let asMeta = authorizationServerMetadata, asMeta.tokenEndpoint != nil else { return }
+        guard storedTokenMatchesSelectedAuthorizationServer(token) else {
+            tokenStorage.clear()
+            return
+        }
 
         let resource: URL
         do {
