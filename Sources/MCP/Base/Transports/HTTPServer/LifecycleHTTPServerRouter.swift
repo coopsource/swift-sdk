@@ -55,6 +55,12 @@ public actor LifecycleHTTPServerRouter {
             return true
         }
 
+        // Once an initialization-based session exists, its requests continue on the
+        // session handler even if a client sends a conflicting or unknown version header.
+        if let sessionID = request.header(HTTPHeaderName.sessionID), !sessionID.isEmpty {
+            return false
+        }
+
         if let body = request.body,
             JSONRPCMessageKind(data: body)?.isInitializeRequest == true
         {
