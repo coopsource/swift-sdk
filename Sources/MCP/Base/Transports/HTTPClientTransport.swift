@@ -207,9 +207,9 @@ private struct RequestScopedSSEParser {
 /// - Protocol-version routing through the `MCP-Protocol-Version` header
 /// - Cross-platform request-scoped response streaming
 ///
-/// For initialization-based connections, `streaming` controls whether the transport opens a
-/// standalone SSE stream. Per-request-metadata connections ignore that option because each
-/// request chooses JSON or request-scoped SSE through its HTTP response.
+/// For initialization-based connections, `enableStandaloneGetStream` controls whether the
+/// transport opens a standalone SSE stream. Per-request-metadata connections ignore that option
+/// because each request chooses JSON or request-scoped SSE through its HTTP response.
 ///
 /// - Important: Initialization-based standalone SSE streams are not supported on Linux.
 ///   Request-scoped SSE responses are streamed on Linux and Apple platforms.
@@ -236,7 +236,9 @@ private struct RequestScopedSSEParser {
 /// // The transport will automatically handle SSE events
 /// // and deliver them through the client's notification handlers
 /// ```
-public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestStreamCancelling {
+public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestStreamCancelling,
+    ProtocolLifecycleCacheKeyProviding
+{
     /// The server endpoint URL to connect to
     public let endpoint: URL
     private let session: URLSession
@@ -252,7 +254,10 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
     /// Lifecycle-specific behavior selected by the client.
     private var protocolLifecycle: ProtocolLifecycle = .initializationBased
 
-    private let streaming: Bool
+    /// Whether initialization-based connections open a standalone GET event stream.
+    ///
+    /// Per-request-metadata connections independently accept request-scoped SSE responses.
+    public nonisolated let enableStandaloneGetStream: Bool
     private var streamingTask: Task<Void, Never>?
 
     /// Logger instance for transport-related events
@@ -298,8 +303,8 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
     /// - Parameters:
     ///   - endpoint: The server URL to connect to
     ///   - configuration: URLSession configuration to use for HTTP requests
-    ///   - streaming: Whether initialization-based connections open a standalone SSE stream
-    ///     (default: true). Per-request-metadata connections ignore this option.
+    ///   - enableStandaloneGetStream: Whether initialization-based connections open a standalone
+    ///     GET event stream (default: true). Per-request-metadata connections ignore this option.
     ///   - sseInitializationTimeout: Maximum time to wait for session ID before proceeding with SSE (default: 10 seconds)
     ///   - protocolVersion: The MCP protocol version to use (default: "2025-11-25")
     ///   - authorizer: Optional ``HTTPClientAuthorizer`` for automatic Bearer token acquisition and retries.
@@ -308,7 +313,7 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
     public init(
         endpoint: URL,
         configuration: URLSessionConfiguration = .default,
-        streaming: Bool = true,
+        enableStandaloneGetStream: Bool = true,
         sseInitializationTimeout: TimeInterval = 10,
         protocolVersion: String = Version.latestInitializationVersion,
         authorizer: (any HTTPClientAuthorizer)? = nil,
@@ -319,7 +324,38 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
         self.init(
             endpoint: endpoint,
             session: session,
-            streaming: streaming,
+            enableStandaloneGetStream: enableStandaloneGetStream,
+            sseInitializationTimeout: sseInitializationTimeout,
+            protocolVersion: protocolVersion,
+            authorizer: authorizer,
+            requestModifier: requestModifier,
+            logger: logger
+        )
+    }
+
+    /// Creates an HTTP transport using the earlier standalone-stream option label.
+    ///
+    /// Use ``init(endpoint:configuration:enableStandaloneGetStream:sseInitializationTimeout:protocolVersion:authorizer:requestModifier:logger:)``
+    /// for new code.
+    @available(
+        *, deprecated,
+        renamed:
+            "init(endpoint:configuration:enableStandaloneGetStream:sseInitializationTimeout:protocolVersion:authorizer:requestModifier:logger:)"
+    )
+    public init(
+        endpoint: URL,
+        configuration: URLSessionConfiguration = .default,
+        streaming: Bool,
+        sseInitializationTimeout: TimeInterval = 10,
+        protocolVersion: String = Version.latestInitializationVersion,
+        authorizer: (any HTTPClientAuthorizer)? = nil,
+        requestModifier: @escaping (URLRequest) -> URLRequest = { $0 },
+        logger: Logger? = nil
+    ) {
+        self.init(
+            endpoint: endpoint,
+            configuration: configuration,
+            enableStandaloneGetStream: streaming,
             sseInitializationTimeout: sseInitializationTimeout,
             protocolVersion: protocolVersion,
             authorizer: authorizer,
@@ -331,7 +367,7 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
     internal init(
         endpoint: URL,
         session: URLSession,
-        streaming: Bool = false,
+        enableStandaloneGetStream: Bool = false,
         sseInitializationTimeout: TimeInterval = 10,
         protocolVersion: String = Version.latestInitializationVersion,
         authorizer: (any HTTPClientAuthorizer)? = nil,
@@ -347,7 +383,7 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
             delegate: requestStreamDelegate,
             delegateQueue: nil
         )
-        self.streaming = streaming
+        self.enableStandaloneGetStream = enableStandaloneGetStream
         self.sseInitializationTimeout = sseInitializationTimeout
         self.protocolVersion = protocolVersion
         self.requestModifier = requestModifier
@@ -393,7 +429,7 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
 
         setupInitialSessionIDSignal()
 
-        if streaming, protocolLifecycle == .initializationBased {
+        if enableStandaloneGetStream, protocolLifecycle == .initializationBased {
             streamingTask = Task { await startListeningForServerEvents() }
         }
 
@@ -439,7 +475,7 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
 
         switch lifecycle {
         case .initializationBased:
-            if isConnected, streaming, streamingTask == nil {
+            if isConnected, enableStandaloneGetStream, streamingTask == nil {
                 streamingTask = Task { await startListeningForServerEvents() }
             }
         case .perRequestMetadata:
@@ -458,6 +494,20 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
         } else {
             pendingRequestCancellations.insert(id)
         }
+    }
+
+    package func protocolLifecycleCacheKey() -> String? {
+        guard let scheme = endpoint.scheme?.lowercased(),
+            let host = endpoint.host?.lowercased()
+        else {
+            return nil
+        }
+        let formattedHost = host.contains(":") ? "[\(host)]" : host
+        let defaultPort = scheme == "https" ? 443 : scheme == "http" ? 80 : nil
+        if let port = endpoint.port, port != defaultPort {
+            return "\(scheme)://\(formattedHost):\(port)"
+        }
+        return "\(scheme)://\(formattedHost)"
     }
 
     /// Sends data through an HTTP POST request
@@ -774,16 +824,10 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
             let data = try await collect(body)
             if let remoteError = decodedResponseError(from: data, requestID: requestID) {
                 if isDiscovery {
-                    if isRecognizedPerRequestMetadataError(
-                        remoteError,
-                        statusCode: response.statusCode
-                    ) {
-                        throw ProtocolLifecycleProbeError.inconclusive(remoteError)
-                    }
-                    if [400, 404, 405].contains(response.statusCode) {
-                        throw ProtocolLifecycleProbeError.initializationBasedResponse
-                    }
-                    throw ProtocolLifecycleProbeError.inconclusive(remoteError)
+                    throw ProtocolLifecycleProbeError.correlatedHTTPResponse(
+                        statusCode: response.statusCode,
+                        error: remoteError
+                    )
                 }
                 messageContinuation.yield(data)
                 return
@@ -796,6 +840,17 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
 
         if hasContentType(contentType, ContentType.json) {
             let data = try await collect(body)
+            if isDiscovery,
+                let remoteError = decodedResponseError(
+                    from: data,
+                    requestID: requestID
+                )
+            {
+                throw ProtocolLifecycleProbeError.correlatedHTTPResponse(
+                    statusCode: response.statusCode,
+                    error: remoteError
+                )
+            }
             try validatePerRequestResponse(data, requestID: requestID)
             messageContinuation.yield(data)
             return
@@ -921,16 +976,6 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
         isDiscovery ? ProtocolLifecycleProbeError.inconclusive(error) : error
     }
 
-    private func isRecognizedPerRequestMetadataError(
-        _ error: MCPError,
-        statusCode: Int
-    ) -> Bool {
-        if statusCode == 404, case .methodNotFound = error { return true }
-        return error.code == ProtocolErrorCode.headerMismatch
-            || error.code == ProtocolErrorCode.missingRequiredClientCapability
-            || error.code == ProtocolErrorCode.unsupportedProtocolVersion
-    }
-
     private func withSerializedAuthorization<Result: Sendable>(
         _ operation: @escaping @Sendable () async throws -> Result
     ) async throws -> Result {
@@ -1050,7 +1095,7 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
             throw MCPError.internalError("Endpoint not found")
 
         case 405:
-            if streaming {
+            if enableStandaloneGetStream {
                 self.streamingTask?.cancel()
                 throw MCPError.internalError("Server does not support streaming")
             }
@@ -1112,7 +1157,7 @@ public actor HTTPClientTransport: Transport, ProtocolLifecycleUpdating, RequestS
 
     private func startListeningForServerEvents() async {
         #if os(Linux)
-            if streaming {
+            if enableStandaloneGetStream {
                 logger.warning(
                     "SSE streaming was requested but is not fully supported on Linux. SSE connection will not be attempted."
                 )

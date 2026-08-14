@@ -164,7 +164,7 @@ import Testing
             let transport = HTTPClientTransport(
                 endpoint: testEndpoint,
                 configuration: configuration,
-                streaming: false,
+                enableStandaloneGetStream: false,
                 logger: nil
             )
 
@@ -180,7 +180,7 @@ import Testing
             let transport = HTTPClientTransport(
                 endpoint: testEndpoint,
                 configuration: configuration,
-                streaming: false,
+                enableStandaloneGetStream: false,
                 logger: nil
             )
             try await transport.connect()
@@ -222,7 +222,7 @@ import Testing
             let transport = HTTPClientTransport(
                 endpoint: testEndpoint,
                 configuration: configuration,
-                streaming: false,
+                enableStandaloneGetStream: false,
                 logger: nil
             )
             try await transport.connect()
@@ -256,7 +256,7 @@ import Testing
             let transport = HTTPClientTransport(
                 endpoint: testEndpoint,
                 configuration: configuration,
-                streaming: false,
+                enableStandaloneGetStream: false,
                 logger: nil
             )
             try await transport.connect()
@@ -315,7 +315,7 @@ import Testing
             let transport = HTTPClientTransport(
                 endpoint: testEndpoint,
                 configuration: configuration,
-                streaming: false,
+                enableStandaloneGetStream: false,
                 logger: nil
             )
             try await transport.connect()
@@ -353,7 +353,7 @@ import Testing
             let transport = HTTPClientTransport(
                 endpoint: testEndpoint,
                 configuration: configuration,
-                streaming: false,
+                enableStandaloneGetStream: false,
                 logger: nil
             )
             try await transport.connect()
@@ -390,7 +390,7 @@ import Testing
             let transport = HTTPClientTransport(
                 endpoint: testEndpoint,
                 configuration: configuration,
-                streaming: false,
+                enableStandaloneGetStream: false,
                 logger: nil
             )
             try await transport.connect()
@@ -432,7 +432,7 @@ import Testing
             let transport = HTTPClientTransport(
                 endpoint: testEndpoint,
                 configuration: configuration,
-                streaming: false,
+                enableStandaloneGetStream: false,
                 logger: nil
             )
             try await transport.connect()
@@ -475,7 +475,7 @@ import Testing
             let transport = HTTPClientTransport(
                 endpoint: testEndpoint,
                 configuration: configuration,
-                streaming: false,
+                enableStandaloneGetStream: false,
                 logger: nil
             )
             try await transport.connect()
@@ -638,7 +638,7 @@ import Testing
             let transport = HTTPClientTransport(
                 endpoint: testEndpoint,
                 configuration: configuration,
-                streaming: false,
+                enableStandaloneGetStream: false,
                 authorizer: OAuthAuthorizer(configuration: .init(authentication: .none(clientID: "test-client"))),
                 logger: nil
             )
@@ -875,7 +875,7 @@ import Testing
             let transport = HTTPClientTransport(
                 endpoint: testEndpoint,
                 configuration: configuration,
-                streaming: false,
+                enableStandaloneGetStream: false,
                 authorizer: OAuthAuthorizer(configuration: .init(
                     authentication: .none(clientID: "test-client"),
                     retryPolicy: .init(maxAuthorizationAttempts: 8, maxScopeUpgradeAttempts: 1)
@@ -944,7 +944,7 @@ import Testing
             let transport = HTTPClientTransport(
                 endpoint: testEndpoint,
                 configuration: configuration,
-                streaming: false,
+                enableStandaloneGetStream: false,
                 logger: nil
             )
             try await transport.connect()
@@ -987,7 +987,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: testEndpoint,
                     configuration: configuration,
-                    streaming: true,
+                    enableStandaloneGetStream: true,
                     sseInitializationTimeout: 1,
                     logger: nil
                 )
@@ -1048,7 +1048,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: testEndpoint,
                     configuration: configuration,
-                    streaming: true,
+                    enableStandaloneGetStream: true,
                     sseInitializationTimeout: 1,
                     logger: nil
                 )
@@ -1112,7 +1112,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: testEndpoint,
                     configuration: configuration,
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     logger: nil
                 )
 
@@ -1275,7 +1275,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: testEndpoint,
                     configuration: configuration,
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     requestModifier: { request in
                         var modifiedRequest = request
                         modifiedRequest.addValue(
@@ -1300,7 +1300,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: scenario.streaming,
+                    enableStandaloneGetStream: scenario.streaming,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -1326,7 +1326,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: scenario.streaming,
+                    enableStandaloneGetStream: scenario.streaming,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -1350,7 +1350,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: scenario.streaming,
+                    enableStandaloneGetStream: scenario.streaming,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -1374,7 +1374,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: scenario.streaming,
+                    enableStandaloneGetStream: scenario.streaming,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -1401,7 +1401,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -1439,7 +1439,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -1477,7 +1477,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -1515,7 +1515,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -1550,7 +1550,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: scenario.streaming,
+                    enableStandaloneGetStream: scenario.streaming,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -1574,7 +1574,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -1603,7 +1603,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: scenario.streaming,
+                    enableStandaloneGetStream: scenario.streaming,
                     sseInitializationTimeout: scenario.sseInitializationTimeout!,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
@@ -1627,7 +1627,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -1662,7 +1662,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -1697,7 +1697,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -1735,7 +1735,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -1754,7 +1754,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -1790,7 +1790,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -1815,7 +1815,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -1846,7 +1846,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -1885,7 +1885,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -1918,7 +1918,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -1949,7 +1949,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -1974,7 +1974,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -1999,7 +1999,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -2024,7 +2024,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -2049,7 +2049,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -2085,7 +2085,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -2121,7 +2121,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -2157,7 +2157,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -2193,7 +2193,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -2225,7 +2225,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: scenario.streaming,
+                    enableStandaloneGetStream: scenario.streaming,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -2252,7 +2252,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: scenario.streaming,
+                    enableStandaloneGetStream: scenario.streaming,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -2279,7 +2279,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -2311,7 +2311,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: scenario.streaming,
+                    enableStandaloneGetStream: scenario.streaming,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -2338,7 +2338,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: scenario.testEndpoint,
                     configuration: MockResponses.ephemeralConfiguration(),
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     authorizer: OAuthAuthorizer(configuration: scenario.oauthConfiguration),
                     logger: nil
                 )
@@ -2369,7 +2369,7 @@ import Testing
                 let transport = HTTPClientTransport(
                     endpoint: testEndpoint,
                     configuration: configuration,
-                    streaming: false,
+                    enableStandaloneGetStream: false,
                     protocolVersion: protocolVersion,
                     logger: nil
                 )
