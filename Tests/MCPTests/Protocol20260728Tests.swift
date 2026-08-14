@@ -129,6 +129,18 @@ struct Protocol20260728Tests {
         #expect(throws: DecodingError.self) {
             try JSONDecoder().decode(Client.Capabilities.self, from: malformed)
         }
+
+        for identifier in [
+            "cöm.example/feature",
+            "com.example/féature",
+            "com.example/feature１",
+        ] {
+            #expect(throws: EncodingError.self) {
+                try JSONEncoder().encode(
+                    Client.Capabilities(extensions: [identifier: .object([:])])
+                )
+            }
+        }
     }
 
     @Test("Sampling tool results accept every JSON structured-content shape")

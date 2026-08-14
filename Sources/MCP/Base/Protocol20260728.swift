@@ -21,24 +21,46 @@ enum ProtocolExtensionIdentifier {
         let name = segments[1]
         guard !name.isEmpty else { return true }
         guard let first = name.first, let last = name.last,
-            first.isLetter || first.isNumber,
-            last.isLetter || last.isNumber
+            isASCIIAlphanumeric(first),
+            isASCIIAlphanumeric(last)
         else {
             return false
         }
         return name.allSatisfy {
-            $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" || $0 == "."
+            isASCIIAlphanumeric($0) || $0 == "-" || $0 == "_" || $0 == "."
         }
     }
 
     private static func validLabel(_ label: Substring) -> Bool {
         guard let first = label.first, let last = label.last,
-            first.isLetter,
-            last.isLetter || last.isNumber
+            isASCIILetter(first),
+            isASCIIAlphanumeric(last)
         else {
             return false
         }
-        return label.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" }
+        return label.allSatisfy { isASCIIAlphanumeric($0) || $0 == "-" }
+    }
+
+    private static func isASCIIAlphanumeric(_ character: Character) -> Bool {
+        isASCIILetter(character) || isASCIIDigit(character)
+    }
+
+    private static func isASCIILetter(_ character: Character) -> Bool {
+        guard character.unicodeScalars.count == 1,
+            let value = character.unicodeScalars.first?.value
+        else {
+            return false
+        }
+        return (0x41...0x5A).contains(value) || (0x61...0x7A).contains(value)
+    }
+
+    private static func isASCIIDigit(_ character: Character) -> Bool {
+        guard character.unicodeScalars.count == 1,
+            let value = character.unicodeScalars.first?.value
+        else {
+            return false
+        }
+        return (0x30...0x39).contains(value)
     }
 }
 
