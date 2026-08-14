@@ -1,6 +1,18 @@
 import Foundation
 import Logging
 
+private func makeStatefulHTTPValidationPipeline(
+    originValidator: OriginValidator
+) -> StandardValidationPipeline {
+    StandardValidationPipeline(validators: [
+        originValidator,
+        AcceptHeaderValidator(mode: .sseRequired),
+        ContentTypeValidator(),
+        ProtocolVersionValidator(),
+        SessionValidator(),
+    ])
+}
+
 /// A stateful HTTP server transport that manages sessions and uses SSE for streaming responses.
 ///
 /// This transport implements the MCP Streamable HTTP specification with full session management:
@@ -29,7 +41,9 @@ import Logging
 /// and receive `HTTPResponse` values to convert to your framework's native types.
 /// For SSE responses, the `.stream` case provides an `AsyncThrowingStream<Data, Error>`
 /// to pipe to the client.
-public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
+public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding,
+    TransportProtocolVersionProviding
+{
     public nonisolated let logger: Logger
 
     // MARK: - Dependencies
@@ -100,13 +114,9 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
         logger: Logger? = nil
     ) {
         self.sessionIDGenerator = sessionIDGenerator
-        self.validationPipeline = validationPipeline ?? StandardValidationPipeline(validators: [
-            OriginValidator.localhost(),
-            AcceptHeaderValidator(mode: .sseRequired),
-            ContentTypeValidator(),
-            ProtocolVersionValidator(),
-            SessionValidator(),
-        ])
+        self.validationPipeline = validationPipeline ?? makeStatefulHTTPValidationPipeline(
+            originValidator: .localhost()
+        )
         self.retryInterval = retryInterval
         self.logger = logger ?? Logger(
             label: "mcp.transport.http.server.stateful",
@@ -116,6 +126,27 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
         let (stream, continuation) = AsyncThrowingStream<Data, Swift.Error>.makeStream()
         self.incomingStream = stream
         self.incomingContinuation = continuation
+    }
+
+    /// Creates a stateful transport with a custom origin policy and all other standard
+    /// validation enabled.
+    ///
+    /// Use this overload when deploying beyond localhost. To replace the complete validation
+    /// chain, use ``init(sessionIDGenerator:validationPipeline:retryInterval:logger:)``.
+    public init(
+        originValidator: OriginValidator,
+        sessionIDGenerator: any SessionIDGenerator = UUIDSessionIDGenerator(),
+        retryInterval: Int? = nil,
+        logger: Logger? = nil
+    ) {
+        self.init(
+            sessionIDGenerator: sessionIDGenerator,
+            validationPipeline: makeStatefulHTTPValidationPipeline(
+                originValidator: originValidator
+            ),
+            retryInterval: retryInterval,
+            logger: logger
+        )
     }
 
     // MARK: - Transport Conformance
@@ -156,6 +187,10 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
 
     public func receive() -> AsyncThrowingStream<Data, Swift.Error> {
         incomingStream
+    }
+
+    package func supportedProtocolVersions() -> Set<String> {
+        Version.streamableHTTPSupported(for: .initializationBased)
     }
 
     // MARK: - HTTP Request Handler

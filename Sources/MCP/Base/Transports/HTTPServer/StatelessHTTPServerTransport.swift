@@ -1,6 +1,17 @@
 import Foundation
 import Logging
 
+private func makeStatelessHTTPValidationPipeline(
+    originValidator: OriginValidator
+) -> StandardValidationPipeline {
+    StandardValidationPipeline(validators: [
+        originValidator,
+        AcceptHeaderValidator(mode: .jsonOnly),
+        ContentTypeValidator(),
+        ProtocolVersionValidator(),
+    ])
+}
+
 /// A stateless HTTP server transport that returns single JSON responses.
 ///
 /// This transport implements a minimal subset of the MCP Streamable HTTP specification:
@@ -29,7 +40,9 @@ import Logging
 /// - Session management is handled externally or not needed
 ///
 /// For full streaming and session support, use ``StatefulHTTPServerTransport`` instead.
-public actor StatelessHTTPServerTransport: Transport, HTTPContextProviding {
+public actor StatelessHTTPServerTransport: Transport, HTTPContextProviding,
+    TransportProtocolVersionProviding
+{
     public nonisolated let logger: Logger
 
     // MARK: - Dependencies
@@ -70,12 +83,9 @@ public actor StatelessHTTPServerTransport: Transport, HTTPContextProviding {
         validationPipeline: (any HTTPRequestValidationPipeline)? = nil,
         logger: Logger? = nil
     ) {
-        self.validationPipeline = validationPipeline ?? StandardValidationPipeline(validators: [
-            OriginValidator.localhost(),
-            AcceptHeaderValidator(mode: .jsonOnly),
-            ContentTypeValidator(),
-            ProtocolVersionValidator(),
-        ])
+        self.validationPipeline = validationPipeline ?? makeStatelessHTTPValidationPipeline(
+            originValidator: .localhost()
+        )
         self.logger = logger ?? Logger(
             label: "mcp.transport.http.server.stateless",
             factory: { _ in SwiftLogNoOpLogHandler() }
@@ -84,6 +94,23 @@ public actor StatelessHTTPServerTransport: Transport, HTTPContextProviding {
         let (stream, continuation) = AsyncThrowingStream<Data, Swift.Error>.makeStream()
         self.incomingStream = stream
         self.incomingContinuation = continuation
+    }
+
+    /// Creates a stateless transport with a custom origin policy and all other standard
+    /// validation enabled.
+    ///
+    /// Use this overload when deploying beyond localhost. To replace the complete validation
+    /// chain, use ``init(validationPipeline:logger:)``.
+    public init(
+        originValidator: OriginValidator,
+        logger: Logger? = nil
+    ) {
+        self.init(
+            validationPipeline: makeStatelessHTTPValidationPipeline(
+                originValidator: originValidator
+            ),
+            logger: logger
+        )
     }
 
     // MARK: - Transport Conformance
@@ -142,6 +169,10 @@ public actor StatelessHTTPServerTransport: Transport, HTTPContextProviding {
 
     public func receive() -> AsyncThrowingStream<Data, Swift.Error> {
         incomingStream
+    }
+
+    package func supportedProtocolVersions() -> Set<String> {
+        Version.streamableHTTPSupported(for: .initializationBased)
     }
 
     // MARK: - HTTP Request Handler

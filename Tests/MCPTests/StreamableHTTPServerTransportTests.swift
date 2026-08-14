@@ -296,6 +296,69 @@ struct StreamableHTTPServerTransportTests {
         #expect(invalidOrigin.statusCode == 403)
     }
 
+    @Test("A custom streamable origin keeps the rest of standard validation")
+    func customOriginPreservesStandardValidation() async throws {
+        let transport = StreamableHTTPServerTransport(
+            originValidator: OriginValidator(
+                allowedHosts: ["mcp.example.com"],
+                allowedOrigins: ["https://app.example.com"]
+            )
+        )
+        let body = try makePerRequestBody(id: nil, method: "notifications/example")
+        let remoteHeaders = [
+            HTTPHeaderName.host: "mcp.example.com",
+            HTTPHeaderName.origin: "https://app.example.com",
+        ]
+
+        let invalidHost = await transport.handleRequest(makePerRequestHTTPPost(
+            body: body,
+            extraHeaders: remoteHeaders.merging([
+                HTTPHeaderName.host: "attacker.example.com"
+            ]) { _, new in new }
+        ))
+        let invalidOrigin = await transport.handleRequest(makePerRequestHTTPPost(
+            body: body,
+            extraHeaders: remoteHeaders.merging([
+                HTTPHeaderName.origin: "https://attacker.example.com"
+            ]) { _, new in new }
+        ))
+        let accepted = await transport.handleRequest(makePerRequestHTTPPost(
+            body: body,
+            extraHeaders: remoteHeaders
+        ))
+        let invalidAccept = await transport.handleRequest(makePerRequestHTTPPost(
+            body: body,
+            extraHeaders: remoteHeaders.merging([
+                HTTPHeaderName.accept: ContentType.json
+            ]) { _, new in new }
+        ))
+        let invalidContentType = await transport.handleRequest(makePerRequestHTTPPost(
+            body: body,
+            extraHeaders: remoteHeaders.merging([
+                HTTPHeaderName.contentType: "text/plain"
+            ]) { _, new in new }
+        ))
+        let olderBody = try makePerRequestBody(
+            id: nil,
+            method: "notifications/example",
+            protocolVersion: Version.latestInitializationVersion
+        )
+        let invalidVersion = await transport.handleRequest(makePerRequestHTTPPost(
+            body: olderBody,
+            protocolVersion: Version.latestInitializationVersion,
+            extraHeaders: remoteHeaders
+        ))
+
+        #expect(invalidHost.statusCode == 421)
+        #expect(invalidOrigin.statusCode == 403)
+        #expect(accepted.statusCode == 202)
+        #expect(invalidAccept.statusCode == 406)
+        #expect(invalidContentType.statusCode == 415)
+        #expect(invalidVersion.statusCode == 400)
+        #expect(try decodeResponseObject(invalidVersion)["error"]?
+            .objectValue?["code"]?.intValue == ProtocolErrorCode.unsupportedProtocolVersion)
+    }
+
     @Test("Server JSON-RPC requests cannot be sent on a request response")
     func serverRequestsRejected() async throws {
         let transport = StreamableHTTPServerTransport(

@@ -10,13 +10,26 @@ private struct FixedSessionIDGenerator: SessionIDGenerator {
     func generateSessionID() -> String { sessionID }
 }
 
-private func makeInitializeBody(id: String = "1") -> Data {
+private let remoteOriginValidator = OriginValidator(
+    allowedHosts: ["mcp.example.com"],
+    allowedOrigins: ["https://app.example.com"]
+)
+
+private let remoteOriginHeaders = [
+    HTTPHeaderName.host: "mcp.example.com",
+    HTTPHeaderName.origin: "https://app.example.com",
+]
+
+private func makeInitializeBody(
+    id: String = "1",
+    protocolVersion: String = Version.latestInitializationVersion
+) -> Data {
     let json: [String: Any] = [
         "jsonrpc": "2.0",
         "id": id,
         "method": "initialize",
         "params": [
-            "protocolVersion": "2025-11-25",
+            "protocolVersion": protocolVersion,
             "capabilities": [:] as [String: Any],
             "clientInfo": ["name": "test", "version": "1.0"],
         ] as [String: Any],
@@ -51,7 +64,9 @@ private func makeResponseBody(id: String = "2") -> Data {
 private func makeStatefulPOSTRequest(
     body: Data,
     sessionID: String? = nil,
-    authorization: String? = nil
+    authorization: String? = nil,
+    protocolVersion: String? = nil,
+    extraHeaders: [String: String] = [:]
 ) -> HTTPRequest {
     var headers: [String: String] = [
         "Content-Type": "application/json",
@@ -63,6 +78,10 @@ private func makeStatefulPOSTRequest(
     if let authorization {
         headers[HTTPHeaderName.authorization] = authorization
     }
+    if let protocolVersion {
+        headers[HTTPHeaderName.protocolVersion] = protocolVersion
+    }
+    headers.merge(extraHeaders) { _, new in new }
     return HTTPRequest(method: "POST", headers: headers, body: body)
 }
 
@@ -84,13 +103,22 @@ private func makeDELETERequest(sessionID: String) -> HTTPRequest {
     )
 }
 
-private func makeStatelessPOSTRequest(body: Data) -> HTTPRequest {
-    HTTPRequest(
+private func makeStatelessPOSTRequest(
+    body: Data,
+    protocolVersion: String? = nil,
+    extraHeaders: [String: String] = [:]
+) -> HTTPRequest {
+    var headers = [
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    ]
+    if let protocolVersion {
+        headers[HTTPHeaderName.protocolVersion] = protocolVersion
+    }
+    headers.merge(extraHeaders) { _, new in new }
+    return HTTPRequest(
         method: "POST",
-        headers: [
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        ],
+        headers: headers,
         body: body
     )
 }
@@ -657,6 +685,108 @@ struct StatefulHTTPServerTransportTests {
         await transport.disconnect()
     }
 
+    @Test("Default stateful validation rejects the per-request-metadata version")
+    func testDefaultValidationRejectsPerRequestMetadataVersion() async throws {
+        let transport = StatefulHTTPServerTransport()
+        try await transport.connect()
+
+        let response = await transport.handleRequest(makeStatefulPOSTRequest(
+            body: makeNotificationBody(),
+            protocolVersion: Version.perRequestMetadataVersion
+        ))
+        let body = try #require(response.bodyData)
+        let message = try #require(
+            JSONDecoder().decode(Value.self, from: body).objectValue?["error"]?
+                .objectValue?["message"]?.stringValue
+        )
+
+        #expect(response.statusCode == 400)
+        #expect(message.contains("Unsupported protocol version"))
+        await transport.disconnect()
+    }
+
+    @Test("Default stateful validation rejects the HTTP+SSE protocol version")
+    func testDefaultValidationRejectsHTTPPlusSSEVersion() async throws {
+        let transport = StatefulHTTPServerTransport()
+        try await transport.connect()
+
+        let response = await transport.handleRequest(makeStatefulPOSTRequest(
+            body: makeNotificationBody(),
+            protocolVersion: "2024-11-05"
+        ))
+
+        #expect(response.statusCode == 400)
+        await transport.disconnect()
+    }
+
+    @Test("A custom stateful origin keeps the rest of standard validation")
+    func testCustomOriginPreservesStatefulValidation() async throws {
+        let transport = StatefulHTTPServerTransport(
+            originValidator: remoteOriginValidator
+        )
+        try await transport.connect()
+
+        let invalidHost = await transport.handleRequest(makeStatefulPOSTRequest(
+            body: makeInitializeBody(),
+            extraHeaders: remoteOriginHeaders.merging([
+                HTTPHeaderName.host: "attacker.example.com"
+            ]) { _, new in new }
+        ))
+        let invalidOrigin = await transport.handleRequest(makeStatefulPOSTRequest(
+            body: makeInitializeBody(),
+            extraHeaders: remoteOriginHeaders.merging([
+                HTTPHeaderName.origin: "https://attacker.example.com"
+            ]) { _, new in new }
+        ))
+
+        let initialization = await transport.handleRequest(makeStatefulPOSTRequest(
+            body: makeInitializeBody(),
+            extraHeaders: remoteOriginHeaders
+        ))
+        let sessionID = try #require(initialization.headers[HTTPHeaderName.sessionID])
+
+        let invalidAccept = await transport.handleRequest(makeStatefulPOSTRequest(
+            body: makeNotificationBody(),
+            sessionID: sessionID,
+            extraHeaders: remoteOriginHeaders.merging([
+                HTTPHeaderName.accept: ContentType.json
+            ]) { _, new in new }
+        ))
+        let invalidContentType = await transport.handleRequest(makeStatefulPOSTRequest(
+            body: makeNotificationBody(),
+            sessionID: sessionID,
+            extraHeaders: remoteOriginHeaders.merging([
+                HTTPHeaderName.contentType: "text/plain"
+            ]) { _, new in new }
+        ))
+        let invalidVersion = await transport.handleRequest(makeStatefulPOSTRequest(
+            body: makeNotificationBody(),
+            sessionID: sessionID,
+            protocolVersion: Version.perRequestMetadataVersion,
+            extraHeaders: remoteOriginHeaders
+        ))
+        let missingSession = await transport.handleRequest(makeStatefulPOSTRequest(
+            body: makeNotificationBody(),
+            extraHeaders: remoteOriginHeaders
+        ))
+
+        #expect(invalidHost.statusCode == 421)
+        #expect(invalidOrigin.statusCode == 403)
+        #expect(initialization.statusCode == 200)
+        #expect(invalidAccept.statusCode == 406)
+        #expect(invalidContentType.statusCode == 415)
+        #expect(invalidVersion.statusCode == 400)
+        #expect(missingSession.statusCode == 400)
+        let missingSessionBody = try #require(missingSession.bodyData)
+        let missingSessionMessage = try #require(
+            JSONDecoder().decode(Value.self, from: missingSessionBody).objectValue?["error"]?
+                .objectValue?["message"]?.stringValue
+        )
+        #expect(missingSessionMessage.contains("Missing \(HTTPHeaderName.sessionID) header"))
+
+        await transport.disconnect()
+    }
+
     // MARK: - OAuth Bearer Validation
 
     @Test("Bearer auth validator returns 401 with challenge when authorization is missing")
@@ -1013,6 +1143,92 @@ struct StatelessHTTPServerTransportTests {
         await transport.disconnect()
     }
 
+    @Test("Default stateless validation rejects the per-request-metadata version")
+    func testDefaultValidationRejectsPerRequestMetadataVersion() async throws {
+        let transport = StatelessHTTPServerTransport()
+        try await transport.connect()
+
+        let response = await transport.handleRequest(makeStatelessPOSTRequest(
+            body: makeNotificationBody(),
+            protocolVersion: Version.perRequestMetadataVersion
+        ))
+        let body = try #require(response.bodyData)
+        let message = try #require(
+            JSONDecoder().decode(Value.self, from: body).objectValue?["error"]?
+                .objectValue?["message"]?.stringValue
+        )
+
+        #expect(response.statusCode == 400)
+        #expect(message.contains("Unsupported protocol version"))
+        await transport.disconnect()
+    }
+
+    @Test("Default stateless validation rejects the HTTP+SSE protocol version")
+    func testDefaultValidationRejectsHTTPPlusSSEVersion() async throws {
+        let transport = StatelessHTTPServerTransport()
+        try await transport.connect()
+
+        let response = await transport.handleRequest(makeStatelessPOSTRequest(
+            body: makeNotificationBody(),
+            protocolVersion: "2024-11-05"
+        ))
+
+        #expect(response.statusCode == 400)
+        await transport.disconnect()
+    }
+
+    @Test("A custom stateless origin keeps the rest of standard validation")
+    func testCustomOriginPreservesStatelessValidation() async throws {
+        let transport = StatelessHTTPServerTransport(
+            originValidator: remoteOriginValidator
+        )
+        try await transport.connect()
+
+        let invalidHost = await transport.handleRequest(makeStatelessPOSTRequest(
+            body: makeNotificationBody(),
+            extraHeaders: remoteOriginHeaders.merging([
+                HTTPHeaderName.host: "attacker.example.com"
+            ]) { _, new in new }
+        ))
+        let invalidOrigin = await transport.handleRequest(makeStatelessPOSTRequest(
+            body: makeNotificationBody(),
+            extraHeaders: remoteOriginHeaders.merging([
+                HTTPHeaderName.origin: "https://attacker.example.com"
+            ]) { _, new in new }
+        ))
+
+        let accepted = await transport.handleRequest(makeStatelessPOSTRequest(
+            body: makeNotificationBody(),
+            extraHeaders: remoteOriginHeaders
+        ))
+        let invalidAccept = await transport.handleRequest(makeStatelessPOSTRequest(
+            body: makeNotificationBody(),
+            extraHeaders: remoteOriginHeaders.merging([
+                HTTPHeaderName.accept: ContentType.sse
+            ]) { _, new in new }
+        ))
+        let invalidContentType = await transport.handleRequest(makeStatelessPOSTRequest(
+            body: makeNotificationBody(),
+            extraHeaders: remoteOriginHeaders.merging([
+                HTTPHeaderName.contentType: "text/plain"
+            ]) { _, new in new }
+        ))
+        let invalidVersion = await transport.handleRequest(makeStatelessPOSTRequest(
+            body: makeNotificationBody(),
+            protocolVersion: Version.perRequestMetadataVersion,
+            extraHeaders: remoteOriginHeaders
+        ))
+
+        #expect(invalidHost.statusCode == 421)
+        #expect(invalidOrigin.statusCode == 403)
+        #expect(accepted.statusCode == 202)
+        #expect(invalidAccept.statusCode == 406)
+        #expect(invalidContentType.statusCode == 415)
+        #expect(invalidVersion.statusCode == 400)
+
+        await transport.disconnect()
+    }
+
     // MARK: - Terminated State
 
     @Test("After disconnect returns 404")
@@ -1177,6 +1393,26 @@ struct ServerHandlerContextTests {
     }
 
     // MARK: Server integration — end-to-end
+
+    @Test("Streamable HTTP initialization does not negotiate the HTTP+SSE revision")
+    func testStreamableHTTPInitializationExcludesHTTPPlusSSEVersion() async throws {
+        let transport = makeStatelessTransport()
+        let server = Server(name: "TestServer", version: "1.0")
+        try await server.start(transport: transport)
+        defer { Task { await server.stop() } }
+
+        let response = await transport.handleRequest(makeStatelessPOSTRequest(
+            body: makeInitializeBody(protocolVersion: "2024-11-05")
+        ))
+        let body = try #require(response.bodyData)
+        let result = try #require(
+            JSONDecoder().decode(Value.self, from: body).objectValue?["result"]?.objectValue
+        )
+
+        #expect(response.statusCode == 200)
+        #expect(result["protocolVersion"]?.stringValue == Version.latestInitializationVersion)
+
+    }
 
     @Test("Server handler reads HTTP context via Server.currentHandlerContext")
     func testServerHandlerReadsHTTPContext() async throws {
