@@ -8,7 +8,11 @@ struct ClientTests {
     @Test("Client connect and disconnect")
     func testClientConnectAndDisconnect() async throws {
         let transport = MockTransport()
-        let client = Client(name: "TestClient", version: "1.0")
+        let client = Client(
+            name: "TestClient",
+            version: "1.0",
+            configuration: .init(protocolMode: .initializationOnly)
+        )
 
         #expect(await transport.isConnected == false)
 
@@ -22,7 +26,7 @@ struct ClientTests {
                 let response = Initialize.response(
                     id: request.id,
                     result: .init(
-                        protocolVersion: Version.latest,
+                        protocolVersion: Version.latestInitializationVersion,
                         capabilities: .init(),
                         serverInfo: .init(name: "TestServer", version: "1.0"),
                         instructions: nil
@@ -34,7 +38,7 @@ struct ClientTests {
 
         let result = try await client.connect(transport: transport)
         #expect(await transport.isConnected == true)
-        #expect(result.protocolVersion == Version.latest)
+        #expect(result.protocolVersion == Version.latestInitializationVersion)
         await client.disconnect()
         #expect(await transport.isConnected == false)
         initTask.cancel()
@@ -46,7 +50,11 @@ struct ClientTests {
     )
     func testClientPing() async throws {
         let transport = MockTransport()
-        let client = Client(name: "TestClient", version: "1.0")
+        let client = Client(
+            name: "TestClient",
+            version: "1.0",
+            configuration: .init(protocolMode: .initializationOnly)
+        )
 
         // Queue a response for the initialize request
         try await Task.sleep(for: .milliseconds(10))  // Wait for request to be sent
@@ -59,7 +67,7 @@ struct ClientTests {
             let response = Initialize.response(
                 id: request.id,
                 result: .init(
-                    protocolVersion: Version.latest,
+                    protocolVersion: Version.latestInitializationVersion,
                     capabilities: .init(),
                     serverInfo: .init(name: "TestServer", version: "1.0"),
                     instructions: nil
@@ -70,7 +78,7 @@ struct ClientTests {
 
             // Now complete the connect call which will automatically initialize
             let result = try await client.connect(transport: transport)
-            #expect(result.protocolVersion == Version.latest)
+            #expect(result.protocolVersion == Version.latestInitializationVersion)
             #expect(result.serverInfo.name == "TestServer")
             #expect(result.serverInfo.version == "1.0")
 
@@ -101,7 +109,11 @@ struct ClientTests {
     func testClientConnectionFailure() async {
         let transport = MockTransport()
         await transport.setFailConnect(true)
-        let client = Client(name: "TestClient", version: "1.0")
+        let client = Client(
+            name: "TestClient",
+            version: "1.0",
+            configuration: .init(protocolMode: .initializationOnly)
+        )
 
         do {
             try await client.connect(transport: transport)
@@ -120,7 +132,11 @@ struct ClientTests {
     @Test("Send failure handling")
     func testClientSendFailure() async throws {
         let transport = MockTransport()
-        let client = Client(name: "TestClient", version: "1.0")
+        let client = Client(
+            name: "TestClient",
+            version: "1.0",
+            configuration: .init(protocolMode: .initializationOnly)
+        )
 
         // Set up a task to handle the initialize response
         let initTask = Task {
@@ -132,7 +148,7 @@ struct ClientTests {
                 let response = Initialize.response(
                     id: request.id,
                     result: .init(
-                        protocolVersion: Version.latest,
+                        protocolVersion: Version.latestInitializationVersion,
                         capabilities: .init(),
                         serverInfo: .init(name: "TestServer", version: "1.0"),
                         instructions: nil
@@ -169,7 +185,7 @@ struct ClientTests {
     @Test("Strict configuration - capabilities check")
     func testStrictConfiguration() async throws {
         let transport = MockTransport()
-        let config = Client.Configuration.strict
+        let config = Client.Configuration(strict: true, protocolMode: .initializationOnly)
         let client = Client(name: "TestClient", version: "1.0", configuration: config)
 
         // Set up a task to handle the initialize response
@@ -182,7 +198,7 @@ struct ClientTests {
                 let response = Initialize.response(
                     id: request.id,
                     result: .init(
-                        protocolVersion: Version.latest,
+                        protocolVersion: Version.latestInitializationVersion,
                         capabilities: .init(),
                         serverInfo: .init(name: "TestServer", version: "1.0"),
                         instructions: nil
@@ -225,7 +241,7 @@ struct ClientTests {
     @Test("Non-strict configuration - capabilities check")
     func testNonStrictConfiguration() async throws {
         let transport = MockTransport()
-        let config = Client.Configuration.default
+        let config = Client.Configuration(protocolMode: .initializationOnly)
         let client = Client(name: "TestClient", version: "1.0", configuration: config)
 
         // Set up a task to handle the initialize response
@@ -238,7 +254,7 @@ struct ClientTests {
                 let response = Initialize.response(
                     id: request.id,
                     result: .init(
-                        protocolVersion: Version.latest,
+                        protocolVersion: Version.latestInitializationVersion,
                         capabilities: .init(),
                         serverInfo: .init(name: "TestServer", version: "1.0"),
                         instructions: nil
@@ -317,7 +333,11 @@ struct ClientTests {
     @Test("Batch request - success")
     func testBatchRequestSuccess() async throws {
         let transport = MockTransport()
-        let client = Client(name: "TestClient", version: "1.0")
+        let client = Client(
+            name: "TestClient",
+            version: "1.0",
+            configuration: .init(protocolMode: .initializationOnly)
+        )
 
         // Set up a task to handle the initialize response
         let initTask = Task {
@@ -329,7 +349,7 @@ struct ClientTests {
                 let response = Initialize.response(
                     id: request.id,
                     result: .init(
-                        protocolVersion: Version.latest,
+                        protocolVersion: Version.latestInitializationVersion,
                         capabilities: .init(),
                         serverInfo: .init(name: "TestServer", version: "1.0"),
                         instructions: nil
@@ -397,7 +417,11 @@ struct ClientTests {
     @Test("Batch request - mixed success/error")
     func testBatchRequestMixed() async throws {
         let transport = MockTransport()
-        let client = Client(name: "TestClient", version: "1.0")
+        let client = Client(
+            name: "TestClient",
+            version: "1.0",
+            configuration: .init(protocolMode: .initializationOnly)
+        )
 
         // Set up a task to handle the initialize response
         let initTask = Task {
@@ -409,7 +433,7 @@ struct ClientTests {
                 let response = Initialize.response(
                     id: request.id,
                     result: .init(
-                        protocolVersion: Version.latest,
+                        protocolVersion: Version.latestInitializationVersion,
                         capabilities: .init(),
                         serverInfo: .init(name: "TestServer", version: "1.0"),
                         instructions: nil
@@ -477,7 +501,11 @@ struct ClientTests {
     @Test("Batch request - empty")
     func testBatchRequestEmpty() async throws {
         let transport = MockTransport()
-        let client = Client(name: "TestClient", version: "1.0")
+        let client = Client(
+            name: "TestClient",
+            version: "1.0",
+            configuration: .init(protocolMode: .initializationOnly)
+        )
 
         // Set up a task to handle the initialize response
         let initTask = Task {
@@ -489,7 +517,7 @@ struct ClientTests {
                 let response = Initialize.response(
                     id: request.id,
                     result: .init(
-                        protocolVersion: Version.latest,
+                        protocolVersion: Version.latestInitializationVersion,
                         capabilities: .init(),
                         serverInfo: .init(name: "TestServer", version: "1.0"),
                         instructions: nil
@@ -517,7 +545,11 @@ struct ClientTests {
     @Test("Notify method sends notifications")
     func testClientNotify() async throws {
         let transport = MockTransport()
-        let client = Client(name: "TestClient", version: "1.0")
+        let client = Client(
+            name: "TestClient",
+            version: "1.0",
+            configuration: .init(protocolMode: .initializationOnly)
+        )
 
         // Set up a task to handle the initialize response
         let initTask = Task {
@@ -529,7 +561,7 @@ struct ClientTests {
                 let response = Initialize.response(
                     id: request.id,
                     result: .init(
-                        protocolVersion: Version.latest,
+                        protocolVersion: Version.latestInitializationVersion,
                         capabilities: .init(),
                         serverInfo: .init(name: "TestServer", version: "1.0"),
                         instructions: nil
@@ -573,7 +605,11 @@ struct ClientTests {
     @Test("Initialize sends initialized notification")
     func testClientInitializeNotification() async throws {
         let transport = MockTransport()
-        let client = Client(name: "TestClient", version: "1.0")
+        let client = Client(
+            name: "TestClient",
+            version: "1.0",
+            configuration: .init(protocolMode: .initializationOnly)
+        )
 
         // Create a task for initialize
         let initTask = Task {
@@ -589,7 +625,7 @@ struct ClientTests {
                 let response = Initialize.response(
                     id: request.id,
                     result: .init(
-                        protocolVersion: Version.latest,
+                        protocolVersion: Version.latestInitializationVersion,
                         capabilities: .init(),
                         serverInfo: .init(name: "TestServer", version: "1.0"),
                         instructions: nil
@@ -652,7 +688,11 @@ struct ClientTests {
     @Test("Race condition between send error and response")
     func testSendErrorResponseRace() async throws {
         let transport = MockTransport()
-        let client = Client(name: "TestClient", version: "1.0")
+        let client = Client(
+            name: "TestClient",
+            version: "1.0",
+            configuration: .init(protocolMode: .initializationOnly)
+        )
 
         // Set up a task to handle the initialize response
         let initTask = Task {
@@ -664,7 +704,7 @@ struct ClientTests {
                 let response = Initialize.response(
                     id: request.id,
                     result: .init(
-                        protocolVersion: Version.latest,
+                        protocolVersion: Version.latestInitializationVersion,
                         capabilities: .init(),
                         serverInfo: .init(name: "TestServer", version: "1.0"),
                         instructions: nil
@@ -713,7 +753,11 @@ struct ClientTests {
     @Test("Race condition between response and send error")
     func testResponseSendErrorRace() async throws {
         let transport = MockTransport()
-        let client = Client(name: "TestClient", version: "1.0")
+        let client = Client(
+            name: "TestClient",
+            version: "1.0",
+            configuration: .init(protocolMode: .initializationOnly)
+        )
 
         // Set up a task to handle the initialize response
         let initTask = Task {
@@ -725,7 +769,7 @@ struct ClientTests {
                 let response = Initialize.response(
                     id: request.id,
                     result: .init(
-                        protocolVersion: Version.latest,
+                        protocolVersion: Version.latestInitializationVersion,
                         capabilities: .init(),
                         serverInfo: .init(name: "TestServer", version: "1.0"),
                         instructions: nil

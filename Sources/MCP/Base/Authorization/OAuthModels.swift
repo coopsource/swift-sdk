@@ -192,7 +192,7 @@ public struct OAuthAccessToken: Sendable, Codable {
     /// before registration completes).
     public let clientID: String?
 
-    /// Creates a new access token record.
+    /// Creates an access token record.
     public init(
         value: String,
         tokenType: String,

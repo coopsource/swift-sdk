@@ -495,7 +495,8 @@ struct SamplingIntegrationTests {
 
         let client = Client(
             name: "SamplingHandlerTestClient",
-            version: "1.0"
+            version: "1.0",
+            configuration: .init(protocolMode: .initializationOnly)
         )
 
         nonisolated(unsafe) var handlerCalled = false
@@ -540,7 +541,8 @@ struct SamplingIntegrationTests {
 
         let client = Client(
             name: "SamplingTestClient",
-            version: "1.0"
+            version: "1.0",
+            configuration: .init(protocolMode: .initializationOnly)
         )
 
         // Register sampling handler on client to respond to server's request
@@ -708,7 +710,8 @@ struct SamplingIntegrationTests {
         // Client WITHOUT sampling capability
         let client = Client(
             name: "ErrorTestClient",
-            version: "1.0"
+            version: "1.0",
+            configuration: .init(protocolMode: .initializationOnly)
         )
 
         try await server.start(transport: serverTransport)
@@ -744,7 +747,7 @@ struct SamplingIntegrationTests {
             name: "StrictTestClient",
             version: "1.0",
             capabilities: .init(sampling: .init()),
-            configuration: .strict
+            configuration: .init(strict: true, protocolMode: .initializationOnly)
         )
 
         // Register sampling handler
@@ -793,7 +796,7 @@ struct SamplingIntegrationTests {
             name: "StrictTestClient",
             version: "1.0",
             capabilities: .init(),
-            configuration: .strict
+            configuration: .init(strict: true, protocolMode: .initializationOnly)
         )
 
         try await server.start(transport: serverTransport)
@@ -826,7 +829,7 @@ struct SamplingIntegrationTests {
             name: "NonStrictTestClient",
             version: "1.0",
             capabilities: .init(),
-            configuration: .default
+            configuration: .init(protocolMode: .initializationOnly)
         )
 
         // Register sampling handler anyway

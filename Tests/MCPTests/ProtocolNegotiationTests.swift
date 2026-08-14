@@ -37,14 +37,13 @@ private actor NegotiationEventProbe {
 
 @Suite("MCP 2026-07-28 protocol negotiation", .timeLimit(.minutes(1)))
 struct ProtocolNegotiationTests {
-    @Test("Per-request metadata client discovers a per-request server")
-    func perRequestDiscovery() async throws {
+    @Test("Default client and server preserve the initialization lifecycle")
+    func defaultInitializationLifecycle() async throws {
         let transports = await InMemoryTransport.createConnectedPair()
         let server = Server(
-            name: "PerRequestServer",
+            name: "InitializationServer",
             version: "1.2.3",
-            capabilities: .init(tools: .init()),
-            configuration: .init(protocolMode: .perRequestMetadataOnly)
+            capabilities: .init(tools: .init())
         )
         await server.withMethodHandler(ContextProbe.self) { _ in
             let context = Server.currentHandlerContext
@@ -57,25 +56,48 @@ struct ProtocolNegotiationTests {
         try await server.start(transport: transports.server)
 
         let client = Client(
-            name: "PerRequestClient",
+            name: "InitializationClient",
             version: "4.5.6",
-            capabilities: .init(roots: .init()),
-            configuration: .init(protocolMode: .perRequestMetadataOnly)
+            capabilities: .init(roots: .init())
         )
         let connection = try await client.connectWithInfo(transport: transports.client)
 
-        #expect(connection.protocolLifecycle == .perRequestMetadata)
-        #expect(connection.protocolVersion == Version.perRequestMetadataVersion)
-        #expect(connection.serverInfo?.name == "PerRequestServer")
+        #expect(connection.protocolLifecycle == .initializationBased)
+        #expect(connection.protocolVersion == Version.latestInitializationVersion)
+        #expect(connection.serverInfo?.name == "InitializationServer")
         #expect(connection.capabilities.tools != nil)
 
         let result = try await client.sendAndAwait(ContextProbe.request())
-        #expect(result.lifecycle == .perRequestMetadata)
-        #expect(result.protocolVersion == Version.perRequestMetadataVersion)
-        #expect(result.clientName == "PerRequestClient")
+        #expect(result.lifecycle == .initializationBased)
+        #expect(result.protocolVersion == Version.latestInitializationVersion)
+        #expect(result.clientName == "InitializationClient")
 
         await client.disconnect()
         await server.stop()
+    }
+
+    @Test("Compatibility connect marks an omitted per-request server identity")
+    func compatibilityConnectWithoutServerIdentity() async throws {
+        let infoTransport = await discoveryTransportWithoutServerIdentity()
+        let infoClient = Client(
+            name: "InfoClient",
+            version: "1.0",
+            configuration: .init(protocolMode: .perRequestMetadataOnly)
+        )
+        let connection = try await infoClient.connectWithInfo(transport: infoTransport)
+        #expect(connection.serverInfo == nil)
+        await infoClient.disconnect()
+
+        let compatibilityTransport = await discoveryTransportWithoutServerIdentity()
+        let compatibilityClient = Client(
+            name: "CompatibilityClient",
+            version: "1.0",
+            configuration: .init(protocolMode: .perRequestMetadataOnly)
+        )
+        let result = try await compatibilityClient.connect(transport: compatibilityTransport)
+        #expect(result.serverInfo.name == "unknown")
+        #expect(result.serverInfo.version == "0.0.0")
+        await compatibilityClient.disconnect()
     }
 
     @Test("Automatic client selects a per-request-metadata-only server")
@@ -174,14 +196,15 @@ struct ProtocolNegotiationTests {
         let server = Server(
             name: "CombinedServer",
             version: "1.0",
-            configuration: .init(
-                strict: true,
-                protocolMode: .initializationAndPerRequestMetadata
-            )
+            configuration: .init(protocolMode: .initializationAndPerRequestMetadata)
         )
         try await server.start(transport: transports.server)
 
-        let client = Client(name: "InitializationClient", version: "1.0")
+        let client = Client(
+            name: "InitializationClient",
+            version: "1.0",
+            configuration: .init(protocolMode: .initializationOnly)
+        )
         let connection = try await client.connectWithInfo(transport: transports.client)
 
         #expect(connection.protocolLifecycle == .initializationBased)
@@ -219,7 +242,7 @@ struct ProtocolNegotiationTests {
         let client = Client(
             name: "StrictClient",
             version: "1.0",
-            configuration: .strict
+            configuration: .init(strict: true, protocolMode: .initializationOnly)
         )
         await client.withMethodHandler(ClientRequestProbeMethod.self) { _ in
             await probe.recordClientRequest()
@@ -1015,6 +1038,7 @@ struct ProtocolNegotiationTests {
         #expect(client.multiRoundTripMode == .disabled)
         #expect(client.responseCacheMode == .disabled)
         #expect(server.protocolMode == .initializationOnly)
+        #expect(server.subscriptionBufferCapacity == 32)
 
         let noTimeout = Client.Configuration(discoveryProbeTimeout: 0)
         #expect(
@@ -1023,6 +1047,33 @@ struct ProtocolNegotiationTests {
                 from: JSONEncoder().encode(noTimeout)
             ) == noTimeout
         )
+    }
+
+    @Test("Programmatic defaults preserve the initialization lifecycle")
+    func programmaticDefaults() {
+        for configuration in [Client.Configuration(), .default, .strict] {
+            #expect(configuration.protocolMode == .initializationOnly)
+            #expect(configuration.discoveryProbeTimeout == 2)
+            #expect(configuration.multiRoundTripMode == .automatic(maxRounds: 8))
+            #expect(configuration.subscriptionBufferCapacity == 32)
+            #expect(configuration.responseCacheMode == .enabled(maxEntries: 512))
+        }
+
+        for configuration in [Server.Configuration(), .default, .strict] {
+            #expect(configuration.protocolMode == .initializationOnly)
+            #expect(configuration.subscriptionBufferCapacity == 32)
+        }
+
+        #expect(Client.Configuration.default.strict == false)
+        #expect(Client.Configuration.strict.strict == true)
+        #expect(Server.Configuration.default.strict == false)
+        #expect(Server.Configuration.strict.strict == true)
+
+        let initialize = Initialize.Parameters(
+            capabilities: .init(),
+            clientInfo: .init(name: "Client", version: "1.0")
+        )
+        #expect(initialize.protocolVersion == Version.latestInitializationVersion)
     }
 
     private func protocolVersion(in request: AnyRequest) -> String? {
@@ -1039,6 +1090,25 @@ struct ProtocolNegotiationTests {
             try await Task.sleep(for: .milliseconds(1))
         }
         Issue.record("Timed out waiting for test condition")
+    }
+
+    private func discoveryTransportWithoutServerIdentity() async -> MockTransport {
+        let transport = MockTransport()
+        await transport.setSendObserver { data in
+            guard let request = try? JSONDecoder().decode(AnyRequest.self, from: data),
+                request.method == Discover.name
+            else { return }
+            try? await transport.queue(response: Discover.response(
+                id: request.id,
+                result: .init(
+                    supportedVersions: [Version.perRequestMetadataVersion],
+                    capabilities: .init(),
+                    ttlMs: 0,
+                    cacheScope: .private
+                )
+            ))
+        }
+        return transport
     }
 
     private func validRequest(id: Int, method: String) -> Value {

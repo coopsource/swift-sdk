@@ -379,7 +379,8 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding,
         standaloneSSEContinuation = sseContinuation
 
         // Extract protocol version for priming event
-        let protocolVersion = request.header(HTTPHeaderName.protocolVersion) ?? Version.latest
+        let protocolVersion =
+            request.header(HTTPHeaderName.protocolVersion) ?? Version.latestInitializationVersion
 
         // Send priming event
         sendPrimingEvent(
@@ -489,7 +490,8 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding,
         }
 
         // Send a new priming event so the client can resume again if disconnected
-        let protocolVersion = request.header(HTTPHeaderName.protocolVersion) ?? Version.latest
+        let protocolVersion =
+            request.header(HTTPHeaderName.protocolVersion) ?? Version.latestInitializationVersion
         sendPrimingEvent(
             streamID: replay.streamID,
             continuation: sseContinuation,
@@ -549,7 +551,8 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding,
             return version
         }
         // For other requests, use the header
-        return request.header(HTTPHeaderName.protocolVersion) ?? Version.latest
+        return request.header(HTTPHeaderName.protocolVersion)
+            ?? Version.latestInitializationVersion
     }
 
     // MARK: - Session Helpers

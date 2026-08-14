@@ -1,8 +1,12 @@
 /// Notification types requested on a `subscriptions/listen` stream.
 public struct SubscriptionFilter: Hashable, Codable, Sendable {
+    /// Whether to receive tool-list change notifications.
     public var toolsListChanged: Bool?
+    /// Whether to receive prompt-list change notifications.
     public var promptsListChanged: Bool?
+    /// Whether to receive resource-list change notifications.
     public var resourcesListChanged: Bool?
+    /// Resource URIs for which update notifications are requested.
     public var resourceSubscriptions: [String]?
 
     public init(
@@ -49,7 +53,9 @@ public enum SubscriptionsListen: Method {
     public static let name = "subscriptions/listen"
 
     public struct Parameters: Hashable, Codable, Sendable {
+        /// Notification types requested by the client.
         public var notifications: SubscriptionFilter
+        /// Optional request metadata.
         public var _meta: Metadata?
 
         public init(
@@ -62,7 +68,9 @@ public enum SubscriptionsListen: Method {
     }
 
     public struct Result: Hashable, Codable, Sendable {
+        /// The disposition of the completed subscription stream.
         public var resultType: ResultType
+        /// Result metadata containing the subscription identifier.
         public var _meta: Metadata
 
         public init(
@@ -83,7 +91,9 @@ public struct SubscriptionsAcknowledgedNotification: Notification {
     public static let name = "notifications/subscriptions/acknowledged"
 
     public struct Parameters: Hashable, Codable, Sendable {
+        /// Metadata containing the subscription identifier.
         public var _meta: Metadata
+        /// Notification types accepted by the server.
         public var notifications: SubscriptionFilter
 
         public init(
@@ -101,8 +111,11 @@ public struct SubscriptionsAcknowledgedNotification: Notification {
 
 /// A notification correlated with one active subscription.
 public struct SubscriptionNotification: Hashable, Sendable {
+    /// The subscription that received the notification.
     public let subscriptionID: ID
+    /// The notification's MCP method name.
     public let method: String
+    /// The notification parameters.
     public let parameters: Value
 
     public init(subscriptionID: ID, method: String, parameters: Value) {

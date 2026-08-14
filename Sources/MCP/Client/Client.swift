@@ -140,8 +140,11 @@ public actor Client {
 
     /// An aggregate request passed to a manual multi-round-trip handler.
     public struct MultiRoundTripContext: Hashable, Codable, Sendable {
+        /// The original request method.
         public let method: String
+        /// The one-based input-required round number.
         public let round: Int
+        /// The aggregate input request returned by the server.
         public let inputRequired: InputRequiredResult
 
         public init(method: String, round: Int, inputRequired: InputRequiredResult) {
@@ -189,6 +192,7 @@ public actor Client {
         /// Storage policy for cacheable per-request-metadata responses.
         public var responseCacheMode: ResponseCacheMode
 
+        /// Creates a client configuration.
         public init(
             strict: Bool = false,
             protocolMode: ProtocolMode = .initializationOnly,
@@ -329,8 +333,10 @@ public actor Client {
         public struct Sampling: Hashable, Sendable {
             /// Tools sub-capability for sampling
             public struct Tools: Hashable, Codable, Sendable {
+                /// Additional settings carried by this capability object.
                 public var settings: [String: Value]
 
+                /// Creates a tools sampling capability with additional settings.
                 public init(settings: [String: Value] = [:]) { self.settings = settings }
                 public init(from decoder: Decoder) throws {
                     settings = try [String: Value](from: decoder)
@@ -340,8 +346,10 @@ public actor Client {
 
             /// Context sub-capability for sampling
             public struct Context: Hashable, Codable, Sendable {
+                /// Additional settings carried by this capability object.
                 public var settings: [String: Value]
 
+                /// Creates a context sampling capability with additional settings.
                 public init(settings: [String: Value] = [:]) { self.settings = settings }
                 public init(from decoder: Decoder) throws {
                     settings = try [String: Value](from: decoder)
@@ -364,8 +372,10 @@ public actor Client {
         public struct Elicitation: Hashable, Sendable {
             /// Form-based elicitation sub-capability
             public struct Form: Hashable, Codable, Sendable {
+                /// Additional settings carried by this capability object.
                 public var settings: [String: Value]
 
+                /// Creates a form elicitation capability with additional settings.
                 public init(settings: [String: Value] = [:]) { self.settings = settings }
                 public init(from decoder: Decoder) throws {
                     settings = try [String: Value](from: decoder)
@@ -375,8 +385,10 @@ public actor Client {
 
             /// URL-based elicitation sub-capability
             public struct URL: Hashable, Codable, Sendable {
+                /// Additional settings carried by this capability object.
                 public var settings: [String: Value]
 
+                /// Creates a URL elicitation capability with additional settings.
                 public init(settings: [String: Value] = [:]) { self.settings = settings }
                 public init(from decoder: Decoder) throws {
                     settings = try [String: Value](from: decoder)
@@ -408,6 +420,7 @@ public actor Client {
         /// Additional capabilities not defined by this SDK version.
         public var additionalCapabilities: [String: Value]
 
+        /// Creates a client capability declaration.
         public init(
             sampling: Sampling? = nil,
             elicitation: Elicitation? = nil,
@@ -558,6 +571,7 @@ public actor Client {
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
 
+    /// Creates a client.
     public init(
         name: String,
         version: String,
@@ -575,7 +589,12 @@ public actor Client {
         self.configuration = configuration
     }
 
-    /// Connect to the server using the given transport
+    /// Connect to the server using the given transport.
+    ///
+    /// A per-request-metadata server may omit its identity. Because the established
+    /// ``Initialize/Result`` shape requires `serverInfo`, this compatibility wrapper returns
+    /// `unknown` and `0.0.0` in that case. Use ``connectWithInfo(transport:)`` when server
+    /// identity is significant; its ``ConnectionInfo/serverInfo`` remains `nil` when omitted.
     @discardableResult
     public func connect(transport: any Transport) async throws -> Initialize.Result {
         try await connectWithInfo(transport: transport).initializeResult
@@ -751,7 +770,7 @@ public actor Client {
         return connectionInfo
     }
 
-    /// Disconnect the client and cancel all pending requests
+    /// Disconnect the client and cancel all pending requests.
     public func disconnect() async {
         await logger?.debug("Initiating client disconnect...")
 
@@ -868,7 +887,7 @@ public actor Client {
         return self
     }
 
-    /// Send a notification to the server
+    /// Send a notification to the server.
     public func notify<N: Notification>(_ notification: Message<N>) async throws {
         guard let connection = connection else {
             throw MCPError.internalError("Client connection not initialized")
@@ -2117,7 +2136,7 @@ public actor Client {
     private func _initialize() async throws -> Initialize.Result {
         let request = Initialize.request(
             .init(
-                protocolVersion: Version.latest,
+                protocolVersion: Version.latestInitializationVersion,
                 capabilities: capabilities,
                 clientInfo: clientInfo
             ))
@@ -2145,6 +2164,7 @@ public actor Client {
         return result
     }
 
+    /// Checks an initialization-based connection.
     public func ping() async throws {
         guard selectedProtocolLifecycle != .perRequestMetadata else {
             throw MCPError.methodNotFound(
@@ -2156,6 +2176,7 @@ public actor Client {
 
     // MARK: - Prompts
 
+    /// Gets a prompt and automatically handles supported multi-round-trip input.
     public func getPrompt(name: String, arguments: [String: String]? = nil) async throws
         -> (description: String?, messages: [Prompt.Message])
     {
@@ -2165,12 +2186,14 @@ public actor Client {
         return (description: result.description, messages: result.messages)
     }
 
+    /// Lists prompts, reusing a matching fresh response when permitted.
     public func listPrompts(cursor: String? = nil) async throws
         -> (prompts: [Prompt], nextCursor: String?)
     {
         try await listPrompts(cursor: cursor, cachePolicy: .useIfFresh)
     }
 
+    /// Lists prompts with explicit response-cache behavior.
     public func listPrompts(
         cursor: String? = nil,
         cachePolicy: ResponseCachePolicy
@@ -2190,10 +2213,12 @@ public actor Client {
 
     // MARK: - Resources
 
+    /// Reads a resource with automatic multi-round-trip input and fresh-response reuse.
     public func readResource(uri: String) async throws -> [Resource.Content] {
         try await readResource(uri: uri, cachePolicy: .useIfFresh)
     }
 
+    /// Reads a resource with explicit response-cache behavior.
     public func readResource(
         uri: String,
         cachePolicy: ResponseCachePolicy
@@ -2204,12 +2229,14 @@ public actor Client {
         return result.contents
     }
 
+    /// Lists resources, reusing a matching fresh response when permitted.
     public func listResources(cursor: String? = nil) async throws -> (
         resources: [Resource], nextCursor: String?
     ) {
         try await listResources(cursor: cursor, cachePolicy: .useIfFresh)
     }
 
+    /// Lists resources with explicit response-cache behavior.
     public func listResources(
         cursor: String? = nil,
         cachePolicy: ResponseCachePolicy
@@ -2227,6 +2254,7 @@ public actor Client {
         return (resources: result.resources, nextCursor: result.nextCursor)
     }
 
+    /// Subscribes to a resource on an initialization-based connection.
     public func subscribeToResource(uri: String) async throws {
         guard selectedProtocolLifecycle != .perRequestMetadata else {
             throw MCPError.methodNotFound(
@@ -2237,12 +2265,14 @@ public actor Client {
         _ = try await sendAndAwait(request)
     }
 
+    /// Lists resource templates, reusing a matching fresh response when permitted.
     public func listResourceTemplates(cursor: String? = nil) async throws -> (
         templates: [Resource.Template], nextCursor: String?
     ) {
         try await listResourceTemplates(cursor: cursor, cachePolicy: .useIfFresh)
     }
 
+    /// Lists resource templates with explicit response-cache behavior.
     public func listResourceTemplates(
         cursor: String? = nil,
         cachePolicy: ResponseCachePolicy
@@ -2262,12 +2292,14 @@ public actor Client {
 
     // MARK: - Tools
 
+    /// Lists tools, reusing a matching fresh response when permitted.
     public func listTools(cursor: String? = nil) async throws -> (
         tools: [Tool], nextCursor: String?
     ) {
         try await listTools(cursor: cursor, cachePolicy: .useIfFresh)
     }
 
+    /// Lists tools with explicit response-cache behavior.
     public func listTools(
         cursor: String? = nil,
         cachePolicy: ResponseCachePolicy
@@ -2304,7 +2336,7 @@ public actor Client {
     ///           Use `onNotification(ProgressNotification.self)` to receive progress updates.
     /// - Returns: A tuple containing the tool's content response and an optional error flag.
     /// - Note: For advanced use cases requiring cancellation support, use `send()` directly to get a `RequestContext`.
-    /// - SeeAlso: https://modelcontextprotocol.io/specification/2025-11-25/server/tools/#calling-tools
+    /// - SeeAlso: https://modelcontextprotocol.io/specification/2026-07-28/server/tools/#calling-tools
     public func callTool(
         name: String,
         arguments: [String: Value]? = nil,
@@ -2326,7 +2358,7 @@ public actor Client {
     ///           Use `onNotification(ProgressNotification.self)` to receive progress updates.
     /// - Returns: A tuple containing the tool's content response and an optional error flag.
     /// - Note: For advanced use cases requiring cancellation support, use `send()` directly to get a `RequestContext`.
-    /// - SeeAlso: https://modelcontextprotocol.io/specification/2025-11-25/server/tools/#calling-tools
+    /// - SeeAlso: https://modelcontextprotocol.io/specification/2026-07-28/server/tools/#calling-tools
     public func callTool(
         name: String,
         arguments: [String: Value]? = nil,
@@ -2353,7 +2385,7 @@ public actor Client {
     ///
     /// - Parameter handler: A closure that processes sampling requests and returns completions
     /// - Returns: Self for method chaining
-    /// - SeeAlso: https://modelcontextprotocol.io/docs/concepts/sampling#how-sampling-works
+    /// - SeeAlso: https://modelcontextprotocol.io/specification/2026-07-28/client/sampling
     @discardableResult
     public func withSamplingHandler(
         _ handler:
@@ -2373,7 +2405,7 @@ public actor Client {
     ///
     /// - Parameter handler: A closure that processes elicitation requests and returns user actions
     /// - Returns: Self for method chaining
-    /// - SeeAlso: https://modelcontextprotocol.io/specification/2025-06-18/client/elicitation
+    /// - SeeAlso: https://modelcontextprotocol.io/specification/2026-07-28/client/elicitation
     @discardableResult
     public func withElicitationHandler(
         _ handler:
@@ -2393,7 +2425,7 @@ public actor Client {
     ///
     /// - Parameter handler: A closure that returns the list of available roots
     /// - Returns: Self for method chaining
-    /// - SeeAlso: https://modelcontextprotocol.io/specification/2025-11-25/client/roots
+    /// - SeeAlso: https://modelcontextprotocol.io/specification/2026-07-28/client/roots
     @discardableResult
     public func withRootsHandler(
         _ handler: @escaping @Sendable () async throws -> [Root]

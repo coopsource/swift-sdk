@@ -7,7 +7,7 @@ import Foundation
 /// Each tool is uniquely identified by a name and includes metadata
 /// describing its schema.
 ///
-/// - SeeAlso: https://modelcontextprotocol.io/specification/2025-11-25/server/tools/
+/// - SeeAlso: https://modelcontextprotocol.io/specification/2026-07-28/server/tools/
 public struct Tool: Hashable, Codable, Sendable {
     /// The tool name
     public let name: String
@@ -121,7 +121,7 @@ public struct Tool: Hashable, Codable, Sendable {
         case audio(data: String, mimeType: String, annotations: Resource.Annotations?, _meta: Metadata?)
         /// Embedded resource content (EmbeddedResource from spec)
         case resource(resource: Resource.Content, annotations: Resource.Annotations? = nil, _meta: Metadata? = nil)
-        /// Resource link
+        /// Resource link.
         case resourceLink(
             uri: String, name: String, title: String? = nil, description: String? = nil,
             mimeType: String? = nil,
@@ -319,7 +319,7 @@ public struct Tool: Hashable, Codable, Sendable {
 // MARK: -
 
 /// To discover available tools, clients send a `tools/list` request.
-/// - SeeAlso: https://modelcontextprotocol.io/specification/2025-11-25/server/tools/#listing-tools
+/// - SeeAlso: https://modelcontextprotocol.io/specification/2026-07-28/server/tools/#listing-tools
 public enum ListTools: Method {
     public static let name = "tools/list"
 
@@ -344,6 +344,7 @@ public enum ListTools: Method {
         /// Whether this complete result may be reused across authorization contexts.
         public var cacheScope: CacheScope?
 
+        /// Creates a tool-list result.
         public init(
             tools: [Tool],
             nextCursor: String? = nil,
@@ -383,7 +384,8 @@ public enum ListTools: Method {
 }
 
 /// To call a tool, clients send a `tools/call` request.
-/// - SeeAlso: https://modelcontextprotocol.io/specification/2025-11-25/server/tools/#calling-tools
+///
+/// - SeeAlso: https://modelcontextprotocol.io/specification/2026-07-28/server/tools/#calling-tools
 public enum CallTool: MultiRoundTripMethod {
     public static let name = "tools/call"
 
@@ -406,6 +408,7 @@ public enum CallTool: MultiRoundTripMethod {
         /// Opaque server state copied unchanged from the preceding attempt.
         public let requestState: String?
 
+        /// Creates tool-call parameters.
         public init(
             name: String,
             arguments: [String: Value]? = nil,
@@ -507,7 +510,7 @@ public enum CallTool: MultiRoundTripMethod {
 }
 
 /// When the list of available tools changes, servers that declared the listChanged capability SHOULD send a notification:
-/// - SeeAlso: https://spec.modelcontextprotocol.io/specification/2025-06-18/server/tools/#list-changed-notification
+/// - SeeAlso: https://modelcontextprotocol.io/specification/2026-07-28/server/tools/#list-changed-notification
 public struct ToolListChangedNotification: Notification {
     public static let name: String = "notifications/tools/list_changed"
 }

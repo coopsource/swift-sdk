@@ -213,7 +213,7 @@ public enum Sampling {
             case audio(data: String, mimeType: String)
             /// Embedded resource content
             case resource(resource: Resource.Content, annotations: Resource.Annotations?, _meta: Metadata?)
-            /// Resource link
+            /// Resource link.
             case resourceLink(
                 uri: String, name: String, title: String?, description: String?,
                 mimeType: String?, annotations: Resource.Annotations?, size: Int? = nil,
@@ -221,6 +221,7 @@ public enum Sampling {
             )
         }
 
+        /// Creates tool-result content with any JSON structured value.
         public init(
             toolUseId: String,
             content: [ContentBlock],

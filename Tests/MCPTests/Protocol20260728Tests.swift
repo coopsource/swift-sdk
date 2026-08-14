@@ -5,11 +5,11 @@ import Testing
 
 @Suite("MCP 2026-07-28 wire models")
 struct Protocol20260728Tests {
-    @Test("Version is supported without changing the default lifecycle")
+    @Test("Version is the latest supported protocol revision")
     func versionSupport() {
         #expect(Version.perRequestMetadataVersion == "2026-07-28")
         #expect(Version.supported.contains("2026-07-28"))
-        #expect(Version.latest == "2025-11-25")
+        #expect(Version.latest == "2026-07-28")
         #expect(Version.latestInitializationVersion == "2025-11-25")
         #expect(Version.preferenceOrder.first == "2026-07-28")
     }
@@ -148,15 +148,12 @@ struct Protocol20260728Tests {
             try JSONDecoder().decode(Client.Capabilities.self, from: malformed)
         }
 
-        for identifier in [
-            "cöm.example/feature",
-            "com.example/féature",
-            "com.example/feature１",
-        ] {
+        for identifier in ["éxample.com/feature", "com.example/名", "com.example/f１２"] {
+            let capabilities = Client.Capabilities(
+                extensions: [identifier: .object([:])]
+            )
             #expect(throws: EncodingError.self) {
-                try JSONEncoder().encode(
-                    Client.Capabilities(extensions: [identifier: .object([:])])
-                )
+                try JSONEncoder().encode(capabilities)
             }
         }
     }

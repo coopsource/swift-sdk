@@ -96,7 +96,11 @@ struct RoundtripTests {
             return ReadResource.Result(contents: [.text("Hello, World!", uri: request.uri)])
         }
 
-        let client = Client(name: "TestClient", version: "1.0")
+        let client = Client(
+            name: "TestClient",
+            version: "1.0",
+            configuration: .init(protocolMode: .initializationOnly)
+        )
 
         try await server.start(transport: serverTransport)
 
@@ -107,7 +111,7 @@ struct RoundtripTests {
             #expect(result.serverInfo.version == "1.0.0")
             #expect(result.capabilities.prompts != nil)
             #expect(result.capabilities.tools != nil)
-            #expect(result.protocolVersion == Version.latest)
+            #expect(result.protocolVersion == Version.latestInitializationVersion)
         }
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {

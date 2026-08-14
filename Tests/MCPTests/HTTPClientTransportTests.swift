@@ -1116,7 +1116,11 @@ import Testing
                     logger: nil
                 )
 
-                let client = Client(name: "TestClient", version: "1.0.0")
+                let client = Client(
+                    name: "TestClient",
+                    version: "1.0.0",
+                    configuration: .init(protocolMode: .initializationOnly)
+                )
 
                 // Use an actor to track request sequence
                 actor RequestTracker {
@@ -1178,7 +1182,7 @@ import Testing
 
                         let requestID = json["id"] as! String
                         let result = Initialize.Result(
-                            protocolVersion: Version.latest,
+                            protocolVersion: Version.latestInitializationVersion,
                             capabilities: .init(tools: .init()),
                             serverInfo: .init(name: "Mock Server", version: "0.0.1"),
                             instructions: nil
@@ -1231,7 +1235,7 @@ import Testing
 
                 // Step 1: Initialize client
                 let initResult = try await client.connect(transport: transport)
-                #expect(initResult.protocolVersion == Version.latest)
+                #expect(initResult.protocolVersion == Version.latestInitializationVersion)
                 #expect(initResult.capabilities.tools != nil)
 
                 // Step 2: Call a tool
