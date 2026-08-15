@@ -57,3 +57,17 @@ is sent.
   modern state clearing, and request-scoped SSE independence
 - `PerRequestHTTPClientTransportTests`: 29 tests and `ProtocolNegotiationTests`: 23 tests passed on
   the PR 05 branch; the full 648-test suite passed on macOS
+
+
+## Related upstream pull requests
+
+- **[#271](https://github.com/modelcontextprotocol/swift-sdk/pull/271) — Windows build guards**
+  (for [#261](https://github.com/modelcontextprotocol/swift-sdk/issues/261)). Deliberately left to
+  its author rather than folded in here. It replaces `#if !os(Linux)` with
+  `canImport(EventSource)` / `canImport(FoundationNetworking)`; this unit keeps the same five guard
+  sites and adds none, so the change maps one-to-one and the rebase is a single hunk either way
+  (`streaming` was renamed to `enableStandaloneGetStream` on one guard's context line). Worth noting
+  for that pull request: the per-request POST path added here is platform-agnostic — a delegate-based
+  `dataTask` plus this unit's own SSE parser — so with #271 applied, Windows gains working
+  request-scoped SSE rather than only graceful degradation.
+  [triage §#271](https://github.com/coopsource/swift-sdk/blob/swift-sdk-mcp-update-07-28-26/Documentation/MCP-2026-07-28-UPSTREAM-PR-TRIAGE.md#pr-271).

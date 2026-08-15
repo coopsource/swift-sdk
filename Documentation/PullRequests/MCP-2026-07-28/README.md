@@ -16,14 +16,14 @@ directory refers to. Regenerate this table after any restack.
 | 3 | `mcp-2026-discovery-negotiation` | `3776cc5ad6d6930c8553d6a43fa844127a384184` |
 | 4 | `mcp-2026-multi-round-trip` | `6602fa17025600b5c14ebac3cf6f12c7d7323a27` |
 | 5 | `mcp-2026-http-client` | `6cb1c3f90b8d2ab782af7b1cfae1c48eba3abeb9` |
-| 6 | `mcp-2026-http-server` | `05f2276c4953b16e130c86966a35cf82fd1e9649` |
-| 7 | `mcp-2026-http-lifecycle-routing` | `853cd14178eee3bd51b3a492d5d1412f524fa05c` |
-| 8 | `mcp-2026-tool-headers` | `bf8eac5aafa9e036f26f5c00e23c545d5a734f2e` |
-| 9 | `mcp-2026-subscriptions` | `38397dc0f0c31d5306267a617389dafb514174c6` |
-| 10 | `mcp-2026-response-caching` | `4431fa82f15ed96e773aa7168d975e037519a36e` |
-| 11 | `mcp-2026-conformance` | `7b97662dd3ce16dd059428494b1e4b273a8da36a` |
-| 12 | `mcp-2026-defaults-release` | `af3d4f028e61d5187bc36933f48963e3672fc36a` |
-| aggregate | `swift-sdk-mcp-update-07-28-26` | `51edd14b6779e13b6baf7a01be9226216ec0e202` |
+| 6 | `mcp-2026-http-server` | `19f9576bb3b93ebdca4fd9c83a82fbfdf157243e` |
+| 7 | `mcp-2026-http-lifecycle-routing` | `0bfd7a0217a1c3870f0cdafd5ec05128687b6dbd` |
+| 8 | `mcp-2026-tool-headers` | `ecd199f4fa86bc2fc5a8b52b4ea2ab8ea27f56fc` |
+| 9 | `mcp-2026-subscriptions` | `f4d9fb9ade3d00c997c7ec2e2c0a260a0f730b2b` |
+| 10 | `mcp-2026-response-caching` | `48f59c1195de106c7a871277e725c35ff50a7577` |
+| 11 | `mcp-2026-conformance` | `5bb05e56cc44761199d02ce5fdd1a7c679643e78` |
+| 12 | `mcp-2026-defaults-release` | `13a483eee9fecf1f6ba76672dfead3d053bf1aad` |
+| aggregate | `swift-sdk-mcp-update-07-28-26` | this branch — a self-reference would go stale on every commit |
 
 Earlier reports quote the tips that existed when they were written; the third-party audit
 report's Gate A section maps the pre-audit tips to these.
