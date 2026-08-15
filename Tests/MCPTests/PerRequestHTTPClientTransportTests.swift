@@ -160,6 +160,21 @@ import Testing
             methods.append(method)
         }
     }
+
+    private struct ProtocolRequestRecord: Sendable {
+        let request: AnyRequest
+        let headerVersion: String?
+    }
+
+    private actor ProtocolRequestRecorder {
+        private(set) var records: [ProtocolRequestRecord] = []
+
+        func record(_ request: AnyRequest, headerVersion: String?) -> Int {
+            records.append(.init(request: request, headerVersion: headerVersion))
+            return records.count
+        }
+    }
+
     private final class RefreshingAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
         let tracker = AuthorizationCallTracker()
         let maxAuthorizationAttempts = 3
@@ -1128,6 +1143,85 @@ import Testing
             }
         }
 
+        @Test("A correlated HTTP error retries the advertised version")
+        func correlatedHTTPAdvertisedVersionRetry() async throws {
+            let recorder = ProtocolRequestRecorder()
+            await PerRequestHTTPURLProtocol.setHandler { [endpoint] request in
+                #expect(request.httpMethod == "POST")
+                let body = try #require(requestBody(request))
+                let rpcRequest = try JSONDecoder().decode(AnyRequest.self, from: body)
+                let call = await recorder.record(
+                    rpcRequest,
+                    headerVersion: request.value(
+                        forHTTPHeaderField: HTTPHeaderName.protocolVersion)
+                )
+
+                if call == 1 {
+                    return (
+                        HTTPURLResponse(
+                            url: endpoint,
+                            statusCode: 400,
+                            httpVersion: "HTTP/1.1",
+                            headerFields: ["Content-Type": ContentType.json]
+                        )!,
+                        try JSONEncoder().encode(AnyMethod.response(
+                            id: rpcRequest.id,
+                            error: .remote(
+                                code: ProtocolErrorCode.unsupportedProtocolVersion,
+                                message: "Retry the advertised version",
+                                data: try Value(UnsupportedProtocolVersionData(
+                                    supported: [Version.perRequestMetadataVersion],
+                                    requested: Version.perRequestMetadataVersion
+                                ))
+                            )
+                        ))
+                    )
+                }
+
+                #expect(call == 2)
+                return (
+                    HTTPURLResponse(
+                        url: endpoint,
+                        statusCode: 200,
+                        httpVersion: "HTTP/1.1",
+                        headerFields: ["Content-Type": ContentType.json]
+                    )!,
+                    try JSONEncoder().encode(Discover.response(
+                        id: rpcRequest.id,
+                        result: .init(
+                            supportedVersions: [Version.perRequestMetadataVersion],
+                            capabilities: .init(),
+                            ttlMs: 0,
+                            cacheScope: .public
+                        )
+                    ))
+                )
+            }
+
+            let client = Client(
+                name: "HTTPClient",
+                version: "1.0",
+                configuration: .init(protocolMode: .automatic)
+            )
+            let info = try await client.connectWithInfo(transport: makeTransport())
+            #expect(info.protocolLifecycle == .perRequestMetadata)
+            #expect(info.protocolVersion == Version.perRequestMetadataVersion)
+
+            let records = await recorder.records
+            #expect(records.count == 2)
+            #expect(records.allSatisfy { $0.request.method == Discover.name })
+            #expect(records[0].request.id != records[1].request.id)
+            #expect(records[0].request.params == records[1].request.params)
+            for record in records {
+                let bodyVersion = protocolVersion(in: record.request)
+                #expect(record.headerVersion == Version.perRequestMetadataVersion)
+                #expect(bodyVersion == Version.perRequestMetadataVersion)
+                #expect(record.headerVersion == bodyVersion)
+            }
+            await PerRequestHTTPURLProtocol.verifyCallCount(2, for: endpoint)
+            await client.disconnect()
+        }
+
         @Test(
             "A correlated method-not-found discovery response selects initialization",
             arguments: [200, 400, 404, 405]
@@ -1623,6 +1717,12 @@ import Testing
                     ])
                 ]),
             ]))
+        }
+
+        private func protocolVersion(in request: AnyRequest) -> String? {
+            request.params.objectValue?["_meta"]?.objectValue?[
+                ProtocolMetadataKey.protocolVersion
+            ]?.stringValue
         }
     }
 
