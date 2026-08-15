@@ -2,19 +2,23 @@
 
 ## Scope
 
-This report records the conformance results for the modified Swift SDK client
-and server fixtures. It separates frozen-revision requirements from optional
-extension and post-release coverage so the registration decision is based on
-the scored requirements.
+This report records the initial independent conformance results for the
+modified Swift SDK client and server fixtures, the review of each scored
+warning, and the corrections incorporated into the existing review stack. It
+separates frozen-revision requirements from optional extension and post-release
+coverage so the registration decision is based on the scored requirements.
 
 - Conformance commit: `c321dd32035556e6769d3724a8ee97d87c3faaac`
-- Swift SDK commit: `584f8ff96b0e2cf9deb2b125eb614392e032b511`
+- Initial Swift SDK commit: `584f8ff96b0e2cf9deb2b125eb614392e032b511`
+- Corrected review-stack tip: `30afa8ddeb7e7287e75ad9579b2e33dd8b1c68cb`
 - Swift branch: `swift-sdk-mcp-update-07-28-26`
 - Repository: `coopsource/swift-sdk`
 - Test date: 2026-08-14
 
-No Swift implementation code was changed as part of this findings handoff.
-The three scored warnings below are intentionally visible and are not added to
+Independent review confirmed that all three scored warnings were real gaps in
+the MCP 2026 work. Their corrections now belong to PRs 03, 05, 09, and 11;
+there is no follow-up correction PR. No unrelated released-code defect was
+changed. The original warnings remain recorded below and were never added to
 `conformance-baseline.yml`.
 
 ## Environment
@@ -71,7 +75,7 @@ The repository helper script was also exercised for the 2026-07-28 run:
 scripts/run-conformance-2026-07-28.sh
 ```
 
-## Results
+## Initial Results
 
 | Revision | Side | Passing checks | Scored MUST failures | Scored SHOULD warnings | Unscored failures |
 | --- | --- | ---: | ---: | ---: | ---: |
@@ -90,18 +94,25 @@ when its only scored problems are SHOULD warnings. Swift verification must
 inspect the warning checks in the output; a zero exit status alone does not
 prove that all scored SHOULD requirements pass.
 
-## Prioritized Scored Follow-up
+## Resolution of Scored Findings
 
 ### 1. Client supported-version retry
 
 Check: `sep-2575-client-retry-supported-version`
 
-When the first initialize attempt is rejected with the supported-version error,
-retry once using an advertised supported version even if that version equals
-the version requested on the first attempt. The current client suppresses the
-retry when the advertised value equals the original request.
+When the first discovery attempt is rejected with the structured
+supported-version error, the client must retry once using a mutually supported
+advertised version even if it equals the version requested on the first
+attempt. Swift previously suppressed that retry.
 
-Tests should prove all of the following together:
+Resolved in PR 03, with transport-boundary coverage in PR 05. The policy still
+requires a correlated `-32022` response, retries only idempotent
+`server/discover`, and remains bounded by `mayRetryVersion`. It does not retry
+authentication failures, transient transport failures, malformed data, or
+cancellation. Tests prove fresh JSON-RPC IDs, unchanged version metadata, no
+initialization fallback, and surfacing of a distinguishable second rejection.
+
+The focused coverage proves all of the following together:
 
 - exactly one retry occurs;
 - initialization continues successfully after that retry;
@@ -112,18 +123,21 @@ Tests should prove all of the following together:
 
 Check: `sep-2575-server-sends-prompts-list-changed-on-subscription`
 
-Update the Swift conformance server fixture so its prompt-change diagnostic
-acknowledges the trigger and then emits the filtered prompt list-change
-notification. Preserve the subscription ID and the requested filter in the
-notification path.
+Resolved in PRs 09 and 11. Subscription tests consume prompt-only and tool-only
+acknowledgments before publication, then prove prompt notifications carry only
+the prompt listener's request ID. The hidden conformance diagnostic awaits
+`Server.notify(.promptListChanged)` and returns a normal tool result only after
+publication succeeds.
 
 ### 3. Tool list-change notification after subscription
 
 Check: `sep-2575-server-sends-tools-list-changed-on-subscription`
 
-Apply the equivalent fixture behavior for tool-list changes: acknowledge the
-diagnostic trigger, emit the filtered notification, and preserve the
-subscription ID and filter semantics.
+Resolved in PRs 09 and 11. The same focused test proves tool notifications
+carry only the tool listener's request ID and cannot appear on the prompt
+listener. The hidden diagnostic awaits `Server.notify(.toolListChanged)`.
+Neither diagnostic is added to `tools/list`, mutates persistent fixture state,
+or writes directly to a transport.
 
 ## Optional, Unscored Backlog
 
@@ -161,9 +175,36 @@ The evidence from this run supports the following narrower sequence:
    those results to decide whether `.build/debug` is portable enough or a
    `swift build --show-bin-path` wrapper is warranted; do not change the tested
    command based on speculation alone.
-5. Address the three scored SHOULD warnings in the priority order above, with
-   focused timing, ordering, cancellation, subscription-ID, and filter tests.
-   Keep Tasks and authorization extensions in separate follow-ups.
+5. The three scored SHOULD warnings are corrected in their owning review units
+   with focused retry, ordering, subscription-ID, and filter tests. Keep Tasks,
+   authorization extensions, and post-release schema coverage in separate
+   follow-ups.
+
+## Corrected Stack Verification
+
+The corrected PR 12 tip passed the following local release gates:
+
+- `swift test`: 750 SDK tests in 51 suites and 6 adapter tests in 1 suite;
+- `swift package generate-documentation --target MCP --warnings-as-errors`;
+- `scripts/run-conformance.sh`: 223 client and 47 server checks, with no
+  failures or warnings;
+- `scripts/run-conformance-2026-07-28.sh`: 424 client and 168 server checks,
+  with no scored warning or failure. The 13 client and 25 server failures are
+  explicitly unscored Tasks, authorization-extension, or post-release JSON
+  Schema coverage.
+
+Final acceptance remains the cross-SDK matrix from the conformance repository:
+
+```sh
+npm run sdk-matrix -- \
+  --sdk swift-sdk@mcp-2026-conformance \
+  --requirements 2025-11-25,2026-07-28
+```
+
+Accept the report only when it contains 18/18 clean scored 2025 client
+scenarios, 30/30 2025 server scenarios, 32/32 2026 client scenarios, 37/37
+2026 server scenarios, and zero scored warnings or failures. Exit status alone
+is not sufficient.
 
 The combined tier command correctly attributed the temporary run to
 `coopsource/swift-sdk@swift-sdk-mcp-update-07-28-26` and scored 67/67 required

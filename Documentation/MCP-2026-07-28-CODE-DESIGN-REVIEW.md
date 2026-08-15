@@ -25,10 +25,12 @@ unit: each proposed review presents its final behavior the first time a maintain
 | --- | --- | --- |
 | Refresh token could be sent after discovery selected a different authorization server | PR 02 | Retain the stored token through discovery and require its recorded issuer to match before refresh. A two-issuer regression proves the second token endpoint never receives the first issuer's refresh token. |
 | Malformed or uncorrelated HTTP 400/404/405 discovery responses did not fall back | PR 03 and PR 05 | The HTTP transport now classifies an unrecognized compatibility response as initialization-era evidence. Client policy remains separate from HTTP parsing. |
+| An advertised supported version equal to the first discovery request was not retried | PR 03 and PR 05 | The client now performs the same bounded advertised-version retry used for any mutually supported version. HTTP coverage proves a correlated structured error reaches that policy. |
 | The conformance server advertised a custom-header tool without installing its schema on the transport | PR 11 | The executable and transport share one tool definition. An adapter regression and the pinned server scenario verify HTTP 400 and `-32020` behavior. |
 | `Accept` media parameters were parsed and discarded | PR 06 | Media parameters now participate in matching and specificity. Parameters after `q` remain media parameters under RFC 9110 rather than obsolete accept extensions. |
 | Extension identifiers accepted Unicode letters and digits outside the wire grammar | PR 01 | Identifier validation now uses explicit ASCII predicates with Unicode negative tests. |
 | HTTP lifecycle selection was discarded on every reconnect | PR 03 and PR 05 | Automatically selected initialization lifecycles are cached by canonical HTTP origin. A failed cached assumption is removed so a later connection can probe again. |
+| The conformance fixture lacked prompt and tool list-change diagnostics | PR 09 and PR 11 | Focused listener tests prove acknowledgment ordering and filter isolation; hidden diagnostic calls await `Server.notify` before returning success. |
 | Aggregate follow-ups and PR bodies were ahead of source review branches | Submission workflow | Corrections were moved into their owning units and every successor was restacked. The helper still rejects an explicit `PR-BLOCKER` marker if a future review discovers another propagation gap. |
 | Readiness text treated runner scoring as complete specification coverage | PR 11 and PR 12 | Documentation now reports scored status and actual requirement coverage separately. The previously failing custom-header scenario passes all ten checks. |
 
@@ -41,8 +43,10 @@ path required to make the new behavior safe:
 - the OAuth challenge and proactive-refresh paths now apply the issuer binding introduced by the
   new authorization support;
 - automatic lifecycle negotiation now implements the dated HTTP fallback and origin-cache rules;
+- advertised-version negotiation now performs the specification's one bounded discovery retry;
 - media, extension-identifier, and mirrored-header validation enforce new wire requirements; and
-- the conformance executable now configures the new mirrored-header feature that it advertises.
+- the conformance executable now configures the new mirrored-header feature that it advertises and
+  publishes subscribed prompt and tool changes through normal server routing.
 
 The broader source diff also removes branch-added protocol-history comments that did not match the
 repository's DocC style. That is documentation-only. The older stateless request-ID collision,
@@ -95,6 +99,17 @@ not part of the parameter grammar.[^rfc-9110-accept]
 body representation carries those parameters. For `Accept`, a parameterized-only JSON range does
 not authorize an unparameterized JSON response; a separate unparameterized range does.
 
+### Advertised-version retry
+
+A correlated `UnsupportedProtocolVersionError` can advertise a version that is mutually supported
+but equal to the version in the first discovery request. That is internally inconsistent server
+behavior, but the versioning rules still direct clients to retry an advertised supported version.
+The client now does so at most once, using a fresh JSON-RPC ID and the same version metadata.
+
+The retry applies only to idempotent `server/discover`. Authentication failures, transient transport
+failures, malformed or uncorrelated responses, and cancellation do not enter this path. A second
+structured rejection is surfaced without initialization fallback or a third request.
+
 ### Custom request headers
 
 The conformance executable now uses the same `Tool` value for `tools/list` and transport header
@@ -105,6 +120,14 @@ The migration guide also states the privacy boundary: Base64 is syntax-safe enco
 confidentiality. Mirrored values can be visible to proxies, gateways, access logs, and tracing
 systems. Tool authors should not annotate credentials, tokens, personal content, or unrestricted
 user input.
+
+### Conformance subscription diagnostics
+
+The prompt-change and tool-change diagnostics remain hidden handler cases rather than entries in
+`tools/list`, preserving the public fixture and frozen 2025 results. Each case upgrades the weak
+server reference, awaits the corresponding `Server.notify` publication, and returns success only
+after publication completes. They introduce no persistent mutation, detached work, delay, or direct
+transport write.
 
 ### Extension identifiers
 
@@ -149,6 +172,11 @@ units.
   connection-generation changes invalidate connection-scoped cache state.
 - Logs inspected in the changed authorization and per-request HTTP paths do not emit bearer tokens,
   refresh tokens, client secrets, authorization codes, or request bodies.
+- Advertised-version retry is limited to one correlated, structured rejection of an idempotent
+  discovery request and cannot retry authentication, transport, malformed-data, or cancellation
+  failures.
+- Conformance list-change diagnostics are localhost-only, retain no state or credentials, and use
+  ordinary subscription filtering and correlation.
 
 ### Remaining upstream risks
 
@@ -219,15 +247,18 @@ rechecked immediately before each corresponding submission:
 
 1. Wire models, including ASCII extension identifier validation.
 2. OAuth issuer validation, including refresh-token binding.
-3. Discovery and negotiation, owning lifecycle policy and the origin cache.
+3. Discovery and negotiation, owning lifecycle policy, the bounded advertised-version retry, and
+   the origin cache.
 4. Multi-round-trip requests.
-5. HTTP client, owning HTTP response evidence and the origin cache key.
+5. HTTP client, owning HTTP response evidence, the origin cache key, and transport-boundary retry
+   coverage.
 6. HTTP server, including RFC 9110 media matching.
 7. HTTP lifecycle router.
 8. Tool request headers.
-9. Subscriptions.
+9. Subscriptions, including prompt/tool filter-isolation coverage.
 10. Response caching.
-11. Conformance, including the shared custom-header tool configuration.
+11. Conformance, including the shared custom-header tool configuration and hidden list-change
+    diagnostics.
 12. Defaults and concise migration/release documentation.
 
 Transport code should report evidence; client code should select the protocol era. Header-schema
@@ -251,9 +282,12 @@ behavior-focused DocC style.
 - `swift test --filter 'HTTPRequestValidationTests|Protocol20260728Tests|PerRequestHTTPClientTransportTests'`:
   56 tests passed.
 - `swift test --filter HTTPHandlerTests`: 6 adapter tests passed.
-- Pinned 2026 server run: 166 checks passed and 25 failed. All ten custom-header checks passed; all
-  remaining failures are confined to nine unscored Tasks-extension scenarios.
-- Full `swift test`: 746 SDK tests in 51 suites and 6 adapter tests in 1 suite passed.
+- Pinned initialization-based run: 223 client checks and 47 server checks passed with no failure or
+  warning.
+- Pinned 2026 run: 424 client and 168 server checks passed with no scored failure or warning. The 13
+  client and 25 server failures are explicitly unscored Tasks, authorization-extension, or
+  post-release JSON Schema coverage.
+- Full `swift test`: 750 SDK tests in 51 suites and 6 adapter tests in 1 suite passed.
 - `swift package generate-documentation --target MCP --warnings-as-errors` succeeded. Compilation
   still reports the pre-existing `NetworkTransport` implicit-capture warning; this branch does not
   change that unrelated implementation.

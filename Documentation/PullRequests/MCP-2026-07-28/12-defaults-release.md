@@ -53,10 +53,12 @@ progress work finishes so a modern request-scoped SSE response remains open for 
 - migration client, server, multi-round-trip, cache, subscription, and tool-header examples
   type-check with compiler warnings treated as errors
 - DocC generation with `--warnings-as-errors`
-- 746 SDK tests in 51 suites plus 6 adapter tests in 1 suite on macOS after aggregate-review
+- 750 SDK tests in 51 suites plus 6 adapter tests in 1 suite on macOS after aggregate-review
   corrections
 - 638 tests available in the official Swift 6.1.3 Linux image
 - MCP target build with the official Swift 6.0.3 Linux image
 - static Linux server link without a new warning attributable to this work
 - every scored alpha.11 `2026-07-28` conformance requirement
+- alpha.11 local report: 424 client and 168 server checks passed, with zero scored warnings or
+  failures; 13 client and 25 server failures remain explicitly unscored
 - initialization-based `v0.1.15`: 223 client checks and 47 server checks with no unexpected failure

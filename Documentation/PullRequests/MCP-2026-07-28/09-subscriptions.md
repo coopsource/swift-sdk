@@ -5,6 +5,7 @@
 - add `subscriptions/listen` models and client subscription APIs
 - acknowledge each filter before delivering correlated notifications
 - support concurrent filtered listeners and request-scoped logging
+- cover prompt-only and tool-only publication through normal server notification routing
 - reconnect explicit client registrations with the same subscription ID
 - replace removed resource subscribe/unsubscribe behavior for 2026-07-28
 
@@ -35,10 +36,12 @@ delivered message carries the original client subscription ID rather than an int
 
 - acknowledgment-before-notification ordering
 - concurrent listeners and filter isolation
+- prompt and tool acknowledgments consumed before publication, with each notification carrying only
+  its listener's request ID and no cross-filter delivery
 - malformed, duplicated, and mismatched correlation metadata
 - explicit reconnect, cancellation, abrupt closure, and graceful shutdown
 - request-scoped logging thresholds
 - bounded slow-listener failure and FIFO publisher backpressure
 - cancellation and server shutdown while publishers are suspended
-- 14 subscription tests, 35 HTTP client tests, and 20 streamable HTTP server tests passed on
-  macOS; affected tests passed on Linux
+- 15 subscription tests, 35 HTTP client tests, and 20 streamable HTTP server tests passed on
+  macOS; the full 732-test suite passed on the PR 09 branch
