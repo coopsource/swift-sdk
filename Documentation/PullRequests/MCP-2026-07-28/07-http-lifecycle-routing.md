@@ -19,7 +19,10 @@ The router does not own either server lifecycle and does not replace the statefu
 HTTP applications can keep their session implementation and add the router at the framework adapter
 boundary.
 
-This unit requires both HTTP transport paths. It does not change protocol models or handler APIs.
+This unit requires both HTTP transport paths. It adds one file and its tests: it does not change
+protocol models, handler APIs, or `Server`. Rejecting `initialize` on a request that carries
+per-request metadata is server lifecycle policy and lives in PR 03, so the router can rely on it
+for any transport.
 
 ## Review guide
 

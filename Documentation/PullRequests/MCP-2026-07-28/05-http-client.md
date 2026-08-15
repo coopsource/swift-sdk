@@ -9,6 +9,9 @@
 - preserve correlated structured JSON-RPC errors from compatibility HTTP statuses for negotiation
 - expose `enableStandaloneGetStream` while retaining the deprecated explicit `streaming:` label
 - serialize authorization preparation and challenge handling across concurrent requests
+- align the initialization-era authorization retry budget with the new path so both count
+  attempts the same way
+- rename the conformance client's transport option to the new label (mechanical)
 
 ## Specification coverage
 

@@ -8,6 +8,11 @@
 - cover prompt-only and tool-only publication through normal server notification routing
 - reconnect explicit client registrations with the same subscription ID
 - replace removed resource subscribe/unsubscribe behavior for 2026-07-28
+- reject the methods and notifications the dated revision removes — `initialize`, `ping`,
+  `logging/setLevel`, resource subscribe/unsubscribe, `notifications/initialized`, and
+  roots list-changed — on a per-request connection
+- normalize the deprecated roots capability in per-request metadata
+- clear connection-scoped state for a change notification even when no subscriber can receive it
 
 ## Specification coverage
 

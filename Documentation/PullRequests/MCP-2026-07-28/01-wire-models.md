@@ -4,7 +4,8 @@
 
 - add the `2026-07-28` protocol vocabulary without enabling the new lifecycle
 - add structured remote errors, result and cache models, capability extensions, and resource-link fields
-- add fixtures copied from the tagged specification and record their provenance
+- add fixtures copied verbatim from the tagged specification's own examples
+- decode a discovery result that omits `resultType` as `complete`
 - enforce the dated specification's ASCII grammar for extension identifiers
 
 ## Specification coverage
@@ -27,7 +28,8 @@ non-source fixture directory from the test target.
 
 The authoritative source is specification tag `2026-07-28` at commit
 `5f5440bb26a62e2cf3440b92da5a667efa03b267`. Review the model names and wire keys first, then compare
-the fixture provenance recorded alongside the tests. Extension identifiers admit only the ASCII
+the fixture provenance recorded in the specification-coverage section above: every fixture is a
+verbatim copy of the tagged example of the same name. Extension identifiers admit only the ASCII
 letters, digits, and punctuation in the dated wire grammar; Swift's broader Unicode character
 classes are intentionally not used.
 

@@ -17,7 +17,11 @@
 
 ## Compatibility
 
-The existing stateful HTTP server transport remains unchanged for initialization-based sessions. The new
+The existing stateful and stateless HTTP server transports keep their initialization-based request
+handling. They gain a required-label `originValidator:` initializer overload and report their
+binding's protocol versions to `Server`, and `HTTPResponse` gains a `dataWithStatus` case for
+JSON-RPC bodies returned with a non-200 status; an adapter that switches exhaustively over
+`HTTPResponse` needs that case, which Appendix A.7 of the migration guide records. The new
 transport is a separate public type because session state and request-scoped stateless behavior cannot be
 combined safely behind the old transport's public surface.
 

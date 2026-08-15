@@ -116,7 +116,7 @@ request.
 
 | Order | Branch | Logical dependency | Review unit |
 | --- | --- | --- | --- |
-| 1 | `mcp-2026-wire-models` | Current SDK | Wire vocabulary, version constants, errors, metadata helpers, extensions, resource-link fields, fixtures, and this document. No lifecycle activation. |
+| 1 | `mcp-2026-wire-models` | Current SDK | Wire vocabulary, version constants, errors, metadata helpers, extensions, resource-link fields, and fixtures. No lifecycle activation. |
 | 2 | `mcp-2026-oauth-issuer-validation` | Current authorization design | Exact `iss`, DCR `application_type`, and issuer-bound credentials. |
 | 3 | `mcp-2026-discovery-negotiation` | 1 | Runtime modes, discovery, request metadata, `resultType`, protocol errors, stdio fallback, lifecycle caching, connection information, and handler context. |
 | 4 | `mcp-2026-multi-round-trip` | 1, 3 | Logical request attempts, embedded input handling, opaque state, response validation, fresh request IDs, and round limits. |
@@ -126,7 +126,7 @@ request.
 | 8 | `mcp-2026-tool-headers` | 3, 5 | Standard and schema-derived headers, exact encoding, agreement validation, and constrained `-32020` retry. |
 | 9 | `mcp-2026-subscriptions` | 5–7 | `subscriptions/listen`, acknowledgment ordering, filters, concurrent listeners, correlation, reconnect, and request-scoped logging. |
 | 10 | `mcp-2026-response-caching` | 3, 9 | Required cache fields, bounded cache, test clock, page keys, authorization partitions, invalidation, and call policies. |
-| 11 | `mcp-2026-conformance` | All prior units | Conformance adapters and tests, pinned runners, readiness checks, CI evidence, platform verification, and source-compatibility audit. Uses explicit lifecycle modes. |
+| 11 | `mcp-2026-conformance` | All prior units | Conformance adapters and tests, pinned runners, readiness checks, and CI evidence. Uses explicit lifecycle modes. Platform verification and the source-compatibility audit are recorded in this document, which is aggregate-only. |
 | 12 | `mcp-2026-defaults-release` | 11 | Programmatic default changes, `Version.latest`, migration guidance, and release documentation. |
 
 Pull-request descriptions and the filing script are aggregate review material added only after

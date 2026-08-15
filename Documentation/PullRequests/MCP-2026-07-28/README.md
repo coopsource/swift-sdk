@@ -67,9 +67,9 @@ correction in its owning unit and restack every successor before submission. Do 
 "fix" review unit for code that has not entered upstream review. A PR body with a `PR-BLOCKER`
 comment cannot be submitted by the helper.
 
-The source stack was regenerated after the aggregate review on 2026-08-14. Corrections now live in
-units 01, 02, 03, 05, 06, and 11, and the final documentation in unit 12 describes the resulting
-behavior. Each branch builds on its documented predecessor, so the delta for each review remains
+The source stack was regenerated after the aggregate review on 2026-08-14 and again after the
+third-party audit on 2026-08-15. Corrections now live in units 01, 02, 03, 04, 05, 06, 09, 10,
+and 11, and the final documentation in unit 12 describes the resulting behavior. Each branch builds on its documented predecessor, so the delta for each review remains
 focused and the complete tree is preserved at every step.
 
 For example, after the wire-model PR merges, prepare the OAuth submission without changing
