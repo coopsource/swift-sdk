@@ -115,7 +115,7 @@ initialization fallback, and surfacing of a distinguishable second rejection.
 The focused coverage proves all of the following together:
 
 - exactly one retry occurs;
-- initialization continues successfully after that retry;
+- the per-request connection succeeds after that retry;
 - cancellation is respected;
 - a second rejection cannot create a retry loop.
 
@@ -127,7 +127,7 @@ Resolved in PRs 09 and 11. Subscription tests consume prompt-only and tool-only
 acknowledgments before publication, then prove prompt notifications carry only
 the prompt listener's request ID. The hidden conformance diagnostic awaits
 `Server.notify(.promptListChanged)` and returns a normal tool result only after
-publication succeeds.
+the subscription publisher accepts the notification for delivery.
 
 ### 3. Tool list-change notification after subscription
 
