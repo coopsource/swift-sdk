@@ -5,7 +5,8 @@
 - add typed `input_required` results and retry parameters to the three supported methods
 - process embedded roots, sampling, and elicitation requests concurrently with existing client handlers
 - add one aggregate handler for manual processing
-- preserve opaque request state, use fresh IDs, validate response maps, and enforce round limits
+- preserve opaque request state, use fresh IDs, validate response maps, and bound automatic rounds
+- honor a cancellation issued before a logical request records its first attempt
 
 ## Specification coverage
 

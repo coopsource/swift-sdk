@@ -7,6 +7,7 @@
 - pin the new runner to `@modelcontextprotocol/conformance@0.2.0-alpha.11`
 - keep the initialization-based runner independently pinned to `v0.1.15`
 - collect scenario results and logs without hiding unscored failures behind a baseline
+- run the new suite in CI and upload its results and server log as artifacts
 - add hidden prompt-change and tool-change diagnostics that publish through `Server.notify`
 
 ## Specification coverage

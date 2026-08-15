@@ -10,7 +10,9 @@ coverage so the registration decision is based on the scored requirements.
 
 - Conformance commit: `c321dd32035556e6769d3724a8ee97d87c3faaac`
 - Initial Swift SDK commit: `584f8ff96b0e2cf9deb2b125eb614392e032b511`
-- Corrected review-stack tip: `30afa8ddeb7e7287e75ad9579b2e33dd8b1c68cb`
+- Corrected review-stack tip at the time of this report: `30afa8ddeb7e7287e75ad9579b2e33dd8b1c68cb`
+  (superseded by the later restacks; see `MCP-2026-07-28-CONFORMANCE-FINDINGS-v2.md` and the
+  third-party audit report for the current tips)
 - Swift branch: `swift-sdk-mcp-update-07-28-26`
 - Repository: `coopsource/swift-sdk`
 - Test date: 2026-08-14

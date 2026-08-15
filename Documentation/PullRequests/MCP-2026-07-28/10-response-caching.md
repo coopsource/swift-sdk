@@ -7,6 +7,8 @@
 - partition private entries by authorization context and allow public reuse
 - add pagination-aware keys, scope consistency checks, notification invalidation, and per-call policy
 - exclude multi-round-trip attempts and request-scoped logging from reuse
+- invalidate on a received change notification before subscription delivery, so a notification
+  that is dropped, filtered, or unmatched still expires the cached list
 
 ## Specification coverage
 
