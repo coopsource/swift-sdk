@@ -55,5 +55,5 @@ is sent.
 - HTTP 400 advertised-version retry with request recording across both POSTs
 - canonical and compatibility standalone GET configuration, automatic-fallback GET startup,
   modern state clearing, and request-scoped SSE independence
-- `PerRequestHTTPClientTransportTests`: 29 tests and `ProtocolNegotiationTests`: 21 tests passed on
+- `PerRequestHTTPClientTransportTests`: 29 tests and `ProtocolNegotiationTests`: 23 tests passed on
   the PR 05 branch; the full 648-test suite passed on macOS

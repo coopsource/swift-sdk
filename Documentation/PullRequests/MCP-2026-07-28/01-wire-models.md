@@ -40,4 +40,4 @@ classes are intentionally not used.
 - open capability and object-valued extension round trips, including rejection of scalar settings
 - arbitrary and explicit-null sampling structured content
 - ASCII boundary and Unicode-negative extension identifier cases
-- `Protocol20260728Tests`: 12 tests passed on macOS
+- `Protocol20260728Tests`: 10 tests passed on macOS

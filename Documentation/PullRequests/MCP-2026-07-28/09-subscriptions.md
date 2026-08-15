@@ -48,5 +48,5 @@ delivered message carries the original client subscription ID rather than an int
 - request-scoped logging thresholds
 - bounded slow-listener failure and FIFO publisher backpressure
 - cancellation and server shutdown while publishers are suspended
-- 15 subscription tests, 35 HTTP client tests, and 20 streamable HTTP server tests passed on
-  macOS; the full 732-test suite passed on the PR 09 branch
+- 15 subscription tests, 36 HTTP client tests, and 20 streamable HTTP server tests passed on
+  macOS; the full 736-test suite passed on the PR 09 branch

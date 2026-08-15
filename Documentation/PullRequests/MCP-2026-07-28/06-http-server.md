@@ -41,5 +41,5 @@ server shutdown, unknown methods, and malformed requests.
 - validation failures and exact HTTP status/error body preservation
 - case-insensitive media types, exact suffix rejection, valid parameters, `q=0`, wildcard
   precedence, duplicate ranges, and malformed `Accept` and `Content-Type` syntax
-- 66 tests across the HTTP server transport suites and 8 media-validation tests passed on macOS;
+- 66 tests across the HTTP server transport suites and 9 media-validation tests passed on macOS;
   focused tests passed on Linux

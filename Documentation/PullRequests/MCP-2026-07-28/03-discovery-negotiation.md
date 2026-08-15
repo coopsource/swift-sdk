@@ -78,4 +78,4 @@ becomes actionable in PR 04; here it is simply recognized rather than rejected.
 - the Streamable HTTP version partition excludes the deprecated HTTP+SSE revision
 - strict dual-lifecycle notification ordering, serialized configuration compatibility, and
   `ConnectionInfo`
-- `VersioningTests`: 13 tests and `ProtocolNegotiationTests`: 29 tests passed on macOS
+- `VersioningTests`: 13 tests and `ProtocolNegotiationTests`: 23 tests passed on macOS

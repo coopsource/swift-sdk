@@ -4,6 +4,30 @@ This directory contains an editable pull request body for each review branch in 
 MCP 2026-07-28 stack. The files live on the aggregate branch so preparing the reviews
 does not add bookkeeping-only commits to the feature branches.
 
+## Current branch tips
+
+These are the tips pushed to the contributor fork and the SHAs every other record in this
+directory refers to. Regenerate this table after any restack.
+
+| Order | Branch | Tip |
+| ---: | --- | --- |
+| 1 | `mcp-2026-wire-models` | `fd8b815ae88d4c975946d2f91c34cafafa7b75b6` |
+| 2 | `mcp-2026-oauth-issuer-validation` | `f50a56c0b9d1d4df229659b5f9a524c70635ed6d` |
+| 3 | `mcp-2026-discovery-negotiation` | `3776cc5ad6d6930c8553d6a43fa844127a384184` |
+| 4 | `mcp-2026-multi-round-trip` | `6602fa17025600b5c14ebac3cf6f12c7d7323a27` |
+| 5 | `mcp-2026-http-client` | `6cb1c3f90b8d2ab782af7b1cfae1c48eba3abeb9` |
+| 6 | `mcp-2026-http-server` | `05f2276c4953b16e130c86966a35cf82fd1e9649` |
+| 7 | `mcp-2026-http-lifecycle-routing` | `853cd14178eee3bd51b3a492d5d1412f524fa05c` |
+| 8 | `mcp-2026-tool-headers` | `bf8eac5aafa9e036f26f5c00e23c545d5a734f2e` |
+| 9 | `mcp-2026-subscriptions` | `38397dc0f0c31d5306267a617389dafb514174c6` |
+| 10 | `mcp-2026-response-caching` | `4431fa82f15ed96e773aa7168d975e037519a36e` |
+| 11 | `mcp-2026-conformance` | `7b97662dd3ce16dd059428494b1e4b273a8da36a` |
+| 12 | `mcp-2026-defaults-release` | `af3d4f028e61d5187bc36933f48963e3672fc36a` |
+| aggregate | `swift-sdk-mcp-update-07-28-26` | `51edd14b6779e13b6baf7a01be9226216ec0e202` |
+
+Earlier reports quote the tips that existed when they were written; the third-party audit
+report's Gate A section maps the pre-audit tips to these.
+
 Specification section names in the bodies refer to tag `2026-07-28`, commit
 `5f5440bb26a62e2cf3440b92da5a667efa03b267`. See the
 [versioning section](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning) and
