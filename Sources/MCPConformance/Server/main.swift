@@ -392,6 +392,28 @@ func createConformanceServer(
             return .init(content: [.text(text: "An error occurred during tool execution", annotations: nil, _meta: nil)], isError: true)
         case "test_logging":
             return .init(content: [.text(text: "Logging test completed", annotations: nil, _meta: nil)], isError: false)
+        case "test_trigger_prompt_change":
+            guard let server else {
+                throw MCPError.internalError("Conformance server is unavailable")
+            }
+            try await server.notify(PromptListChangedNotification.message(.init()))
+            return .init(
+                content: [.text(
+                    text: "Prompt list change published", annotations: nil, _meta: nil
+                )],
+                isError: false
+            )
+        case "test_trigger_tool_change":
+            guard let server else {
+                throw MCPError.internalError("Conformance server is unavailable")
+            }
+            try await server.notify(ToolListChangedNotification.message(.init()))
+            return .init(
+                content: [.text(
+                    text: "Tool list change published", annotations: nil, _meta: nil
+                )],
+                isError: false
+            )
         case "test_progress":
             let duration = params.arguments?["duration_ms"]?.intValue ?? 1000
             try? await Task.sleep(for: .milliseconds(duration))
