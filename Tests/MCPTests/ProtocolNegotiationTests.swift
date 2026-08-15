@@ -278,6 +278,124 @@ struct ProtocolNegotiationTests {
         await client.disconnect()
     }
 
+    @Test("Client retries a mutually supported advertised version once")
+    func advertisedVersionRetry() async throws {
+        let transport = MockTransport()
+        let client = Client(
+            name: "PerRequestClient",
+            version: "1.0",
+            configuration: .init(protocolMode: .perRequestMetadataOnly)
+        )
+        let connectionTask = Task {
+            try await client.connectWithInfo(transport: transport)
+        }
+
+        try await waitUntil { await transport.sentData.count == 1 }
+        let firstData = try #require(await transport.sentData.first)
+        let firstRequest = try JSONDecoder().decode(AnyRequest.self, from: firstData)
+        try await transport.queue(response: AnyMethod.response(
+            id: firstRequest.id,
+            error: .remote(
+                code: ProtocolErrorCode.unsupportedProtocolVersion,
+                message: "Retry the advertised version",
+                data: try Value(UnsupportedProtocolVersionData(
+                    supported: [Version.perRequestMetadataVersion],
+                    requested: Version.perRequestMetadataVersion
+                ))
+            )
+        ))
+
+        try await waitUntil { await transport.sentData.count == 2 }
+        let sent = await transport.sentData
+        let secondRequest = try JSONDecoder().decode(AnyRequest.self, from: sent[1])
+        #expect(firstRequest.method == Discover.name)
+        #expect(secondRequest.method == Discover.name)
+        #expect(firstRequest.id != secondRequest.id)
+        #expect(firstRequest.params == secondRequest.params)
+        #expect(protocolVersion(in: firstRequest) == Version.perRequestMetadataVersion)
+        #expect(protocolVersion(in: secondRequest) == Version.perRequestMetadataVersion)
+
+        try await transport.queue(response: Discover.response(
+            id: secondRequest.id,
+            result: .init(
+                supportedVersions: [Version.perRequestMetadataVersion],
+                capabilities: .init(),
+                ttlMs: 0,
+                cacheScope: .public
+            )
+        ))
+
+        let connection = try await connectionTask.value
+        #expect(connection.protocolLifecycle == .perRequestMetadata)
+        #expect(connection.protocolVersion == Version.perRequestMetadataVersion)
+        #expect(await transport.sentData.count == 2)
+        await client.disconnect()
+    }
+
+    @Test("Client surfaces a second advertised-version rejection without another retry")
+    func advertisedVersionRetryStopsAfterSecondRejection() async throws {
+        let transport = MockTransport()
+        let client = Client(
+            name: "AutomaticClient",
+            version: "1.0",
+            configuration: .init(protocolMode: .automatic)
+        )
+        let connectionTask = Task {
+            try await client.connectWithInfo(transport: transport)
+        }
+
+        try await waitUntil { await transport.sentData.count == 1 }
+        let firstData = try #require(await transport.sentData.first)
+        let firstRequest = try JSONDecoder().decode(AnyRequest.self, from: firstData)
+        try await transport.queue(response: AnyMethod.response(
+            id: firstRequest.id,
+            error: .remote(
+                code: ProtocolErrorCode.unsupportedProtocolVersion,
+                message: "First rejection",
+                data: try Value(UnsupportedProtocolVersionData(
+                    supported: [Version.perRequestMetadataVersion],
+                    requested: Version.perRequestMetadataVersion
+                ))
+            )
+        ))
+
+        try await waitUntil { await transport.sentData.count == 2 }
+        let sent = await transport.sentData
+        let secondRequest = try JSONDecoder().decode(AnyRequest.self, from: sent[1])
+        #expect(firstRequest.method == Discover.name)
+        #expect(secondRequest.method == Discover.name)
+        try await transport.queue(response: AnyMethod.response(
+            id: secondRequest.id,
+            error: .remote(
+                code: ProtocolErrorCode.unsupportedProtocolVersion,
+                message: "Second rejection",
+                data: try Value(UnsupportedProtocolVersionData(
+                    supported: [Version.perRequestMetadataVersion],
+                    requested: Version.perRequestMetadataVersion
+                ))
+            )
+        ))
+
+        do {
+            _ = try await connectionTask.value
+            Issue.record("Expected the second unsupported-version error")
+        } catch let error as MCPError {
+            guard case .remote(let code, let message, _) = error else {
+                Issue.record("Expected a remote protocol error")
+                await client.disconnect()
+                return
+            }
+            #expect(code == ProtocolErrorCode.unsupportedProtocolVersion)
+            #expect(message == "Second rejection")
+        }
+        #expect(firstRequest.id != secondRequest.id)
+        #expect(firstRequest.params == secondRequest.params)
+        #expect(protocolVersion(in: firstRequest) == Version.perRequestMetadataVersion)
+        #expect(protocolVersion(in: secondRequest) == Version.perRequestMetadataVersion)
+        #expect(await transport.sentData.count == 2)
+        await client.disconnect()
+    }
+
     @Test("Discovery without a mutually supported per-request version does not fall back")
     func discoveryWithoutMutualVersionDoesNotFallback() async throws {
         let transport = MockTransport()
@@ -758,6 +876,12 @@ struct ProtocolNegotiationTests {
                 from: JSONEncoder().encode(noTimeout)
             ) == noTimeout
         )
+    }
+
+    private func protocolVersion(in request: AnyRequest) -> String? {
+        request.params.objectValue?["_meta"]?.objectValue?[
+            ProtocolMetadataKey.protocolVersion
+        ]?.stringValue
     }
 
     private func waitUntil(
