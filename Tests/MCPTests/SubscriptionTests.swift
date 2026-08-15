@@ -356,6 +356,57 @@ struct SubscriptionTests {
         await server.stop()
     }
 
+    @Test("Prompt and tool listeners receive only their list-change notifications")
+    func promptAndToolListeners() async throws {
+        let (client, server) = try await connectedPair(
+            capabilities: .init(
+                prompts: .init(listChanged: true),
+                tools: .init(listChanged: true)
+            )
+        )
+        async let promptListen = client.listen(
+            notifications: SubscriptionFilter(promptsListChanged: true)
+        )
+        async let toolListen = client.listen(
+            notifications: SubscriptionFilter(toolsListChanged: true)
+        )
+        let (promptSubscription, toolSubscription) = try await (promptListen, toolListen)
+        var promptEvents = promptSubscription.events.makeAsyncIterator()
+        var toolEvents = toolSubscription.events.makeAsyncIterator()
+
+        #expect(
+            try await promptEvents.next()
+                == .acknowledged(.init(promptsListChanged: true))
+        )
+        #expect(
+            try await toolEvents.next()
+                == .acknowledged(.init(toolsListChanged: true))
+        )
+
+        try await server.notify(PromptListChangedNotification.message(.init()))
+        try await server.notify(ToolListChangedNotification.message(.init()))
+
+        guard case .notification(let promptNotification) = try await promptEvents.next(),
+            case .notification(let toolNotification) = try await toolEvents.next()
+        else {
+            Issue.record("Expected one matching list-change notification per subscription")
+            await client.disconnect()
+            await server.stop()
+            return
+        }
+        #expect(promptNotification.method == PromptListChangedNotification.name)
+        #expect(promptNotification.subscriptionID == promptSubscription.id)
+        #expect(toolNotification.method == ToolListChangedNotification.name)
+        #expect(toolNotification.subscriptionID == toolSubscription.id)
+
+        try await client.cancelSubscription(promptSubscription.id)
+        try await client.cancelSubscription(toolSubscription.id)
+        #expect(try await promptEvents.next() == nil)
+        #expect(try await toolEvents.next() == nil)
+        await client.disconnect()
+        await server.stop()
+    }
+
     @Test("A slow client fails explicitly and cancels its remote subscription once")
     func clientBufferOverflow() async throws {
         let transport = MockTransport()
