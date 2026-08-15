@@ -7,6 +7,7 @@
 - pin the new runner to `@modelcontextprotocol/conformance@0.2.0-alpha.11`
 - keep the initialization-based runner independently pinned to `v0.1.15`
 - collect scenario results and logs without hiding unscored failures behind a baseline
+- add hidden prompt-change and tool-change diagnostics that publish through `Server.notify`
 
 ## Specification coverage
 
@@ -28,6 +29,10 @@ Review the adapter task lifetime first: channel closure, inbound error, and fail
 request-scoped work, and all response writes must retain head/body/end order. Then review the runner's
 immutable version pin, readiness probe, result preservation, cleanup, and optional baseline handling.
 
+The list-change diagnostics are handler-only cases and do not alter `tools/list` or frozen 2025 tool
+results. Each upgrades the weak server reference, awaits normal subscription publication, and returns
+success only afterward; no detached task, delay, fixture mutation, or direct transport write is used.
+
 The alpha.11 run passes every scored requirement. The server also passes all ten checks in the
 released custom-header validation scenario. Remaining server failures are confined to the
 unimplemented Tasks extension; client failures remain visible in the generated artifacts and are
@@ -36,8 +41,8 @@ reported separately from runner scoring.
 ## Testing
 
 - 6 direct asynchronous NIO adapter tests on macOS and Linux
-- 715 SDK tests in 50 suites before the default flip
-- 2026 client: 423 passing checks; 13 failures limited to five unscored scenarios
-- 2026 server: 166 passing checks; 25 failures limited to nine Tasks-extension scenarios
+- 748 SDK tests in 50 suites before the default flip
+- focused `ProtocolNegotiationTests`: 25 and `SubscriptionTests`: 15
+- both conformance executable products build independently
 - build both conformance executables as part of `swift test`
 - `HTTPHandlerTests`: 6 adapter tests passed on macOS
