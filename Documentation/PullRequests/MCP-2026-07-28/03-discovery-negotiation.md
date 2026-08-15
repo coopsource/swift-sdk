@@ -79,3 +79,19 @@ becomes actionable in PR 04; here it is simply recognized rather than rejected.
 - strict dual-lifecycle notification ordering, serialized configuration compatibility, and
   `ConnectionInfo`
 - `VersioningTests`: 13 tests and `ProtocolNegotiationTests`: 23 tests passed on macOS
+
+
+## Related upstream pull requests
+
+- **[#257](https://github.com/modelcontextprotocol/swift-sdk/pull/257) — make `initialize`
+  idempotent.** Directly opposed to this unit: #257 deletes the already-initialized guard, while
+  this unit hardens `initialize` as a one-shot, era-selecting operation and rejects it outright on a
+  request that carries per-request metadata. Under `2026-07-28` an `initialize` selects the legacy
+  era for the session, so making it repeatable would let a client change era mid-session. Analysis
+  and the alternative this unit suggests (idempotency at the stateless transport, per issue #219):
+  [triage §#257](https://github.com/coopsource/swift-sdk/blob/swift-sdk-mcp-update-07-28-26/Documentation/MCP-2026-07-28-UPSTREAM-PR-TRIAGE.md#pr-257).
+- **[#264](https://github.com/modelcontextprotocol/swift-sdk/pull/264) /
+  [#267](https://github.com/modelcontextprotocol/swift-sdk/pull/267)** both modify
+  `StatelessHTTPServerTransport`, which this unit also touches to pin the initialization-era
+  Streamable HTTP version set. Textual overlap only, on the actor declaration:
+  [triage §#264 vs #267](https://github.com/coopsource/swift-sdk/blob/swift-sdk-mcp-update-07-28-26/Documentation/MCP-2026-07-28-UPSTREAM-PR-TRIAGE.md#collision).

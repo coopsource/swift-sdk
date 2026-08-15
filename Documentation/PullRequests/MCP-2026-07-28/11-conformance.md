@@ -48,3 +48,12 @@ reported separately from runner scoring.
 - both conformance executable products build independently
 - build both conformance executables as part of `swift test`
 - `HTTPHandlerTests`: 6 adapter tests passed on macOS
+
+
+## Related upstream pull requests
+
+- **[#269](https://github.com/modelcontextprotocol/swift-sdk/pull/269) — don't return a resource
+  template from `resources/list`.** Same defect, found independently. This unit's fixture supersedes
+  it: it keeps a concrete, `format: uri`-valid `test://template/example` resource, adds the missing
+  `resources/templates/list` handler, and carries the `2026-07-28` caching hints that scenario also
+  requires. #269 can be closed as covered once this lands. [triage §#269](https://github.com/coopsource/swift-sdk/blob/swift-sdk-mcp-update-07-28-26/Documentation/MCP-2026-07-28-UPSTREAM-PR-TRIAGE.md#pr-269).

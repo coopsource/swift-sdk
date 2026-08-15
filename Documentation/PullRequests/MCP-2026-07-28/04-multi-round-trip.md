@@ -38,3 +38,12 @@ state is copied without interpretation.
 - rejection of standalone roots, sampling, and elicitation requests at both client and server
   per-request boundaries
 - `MultiRoundTripTests`: 14 tests passed on macOS
+
+
+## Related upstream pull requests
+
+- **[#273](https://github.com/modelcontextprotocol/swift-sdk/pull/273) — raw JSON request
+  handling.** It changes `RequestHandlerBox.callAsFunction`'s signature, which this unit's
+  `MultiRoundTripRequestHandler` overrides, so whichever lands second must update the other. This
+  unit is the cheaper one to land first. Analysis, including a `Value` round-trip defect worth
+  extracting from that pull request independently: [triage §#273](https://github.com/coopsource/swift-sdk/blob/swift-sdk-mcp-update-07-28-26/Documentation/MCP-2026-07-28-UPSTREAM-PR-TRIAGE.md#pr-273).
