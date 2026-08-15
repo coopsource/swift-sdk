@@ -37,4 +37,4 @@ state is copied without interpretation.
 - cancellation, round limits, and concurrent logical requests
 - rejection of standalone roots, sampling, and elicitation requests at both client and server
   per-request boundaries
-- `MultiRoundTripTests`: 13 tests passed on macOS
+- `MultiRoundTripTests`: 14 tests passed on macOS

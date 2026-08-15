@@ -248,6 +248,10 @@ the corresponding pushes:
 | `mcp-2026-defaults-release` | `30afa8ddeb7e7287e75ad9579b2e33dd8b1c68cb` |
 | `swift-sdk-mcp-update-07-28-26` | `db6bb930cfd04d8a97f72dc72a57a6f731e81deb` |
 
+> **Superseded (2026-08-15).** The third-party audit restacked every unit, so all SHAs below
+> are historical. The current tips are listed in
+> [`PullRequests/MCP-2026-07-28/README.md`](PullRequests/MCP-2026-07-28/README.md).
+
 ## Corrected local branch tips before push
 
 | Branch | Corrected local SHA |

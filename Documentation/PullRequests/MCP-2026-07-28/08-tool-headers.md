@@ -37,5 +37,5 @@ case-sensitive values, optional whitespace, and schema reachability through nest
 - optional-whitespace normalization with case-sensitive values
 - client-scoped learned schemas across independent connections and authorization contexts
 - one stale-schema refresh and no retry for unrelated mismatches
-- 11 header-schema tests, 32 HTTP client tests, and 19 streamable HTTP server tests passed on
+- 11 header-schema tests, 33 HTTP client tests, and 19 streamable HTTP server tests passed on
   macOS; focused tests passed on Linux

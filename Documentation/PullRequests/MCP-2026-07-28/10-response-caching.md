@@ -42,4 +42,4 @@ multi-round-trip retries.
 - conservative non-reusable defaults for unchanged 2026 handlers
 - pagination scope mismatch and invalidation
 - notification invalidation and MRTR exclusion
-- 15 response-cache tests and 36 HTTP client tests passed on macOS; affected tests passed on Linux
+- 17 response-cache tests and 37 HTTP client tests passed on macOS; affected tests passed on Linux

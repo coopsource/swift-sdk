@@ -43,8 +43,8 @@ reported separately from runner scoring.
 ## Testing
 
 - 6 direct asynchronous NIO adapter tests on macOS and Linux
-- 748 SDK tests in 50 suites before the default flip
-- focused `ProtocolNegotiationTests`: 25 and `SubscriptionTests`: 15
+- 754 SDK tests in 51 suites before the default flip
+- focused `ProtocolNegotiationTests`: 27 and `SubscriptionTests`: 15
 - both conformance executable products build independently
 - build both conformance executables as part of `swift test`
 - `HTTPHandlerTests`: 6 adapter tests passed on macOS
