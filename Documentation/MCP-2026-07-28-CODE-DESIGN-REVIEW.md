@@ -125,9 +125,10 @@ user input.
 
 The prompt-change and tool-change diagnostics remain hidden handler cases rather than entries in
 `tools/list`, preserving the public fixture and frozen 2025 results. Each case upgrades the weak
-server reference, awaits the corresponding `Server.notify` publication, and returns success only
-after publication completes. They introduce no persistent mutation, detached work, delay, or direct
-transport write.
+server reference, awaits `Server.notify`, and returns success only after the subscription publisher
+accepts the notification for delivery. The publisher drains accepted notifications asynchronously
+through normal subscription routing. The diagnostics introduce no persistent mutation, detached
+work, delay, or direct transport write.
 
 ### Extension identifiers
 

@@ -30,8 +30,9 @@ request-scoped work, and all response writes must retain head/body/end order. Th
 immutable version pin, readiness probe, result preservation, cleanup, and optional baseline handling.
 
 The list-change diagnostics are handler-only cases and do not alter `tools/list` or frozen 2025 tool
-results. Each upgrades the weak server reference, awaits normal subscription publication, and returns
-success only afterward; no detached task, delay, fixture mutation, or direct transport write is used.
+results. Each upgrades the weak server reference, awaits `Server.notify`, and returns success only
+after the subscription publisher accepts the notification for delivery; no detached task, delay,
+fixture mutation, or direct transport write is used.
 
 The alpha.11 run passes every scored requirement. The server also passes all ten checks in the
 released custom-header validation scenario. Remaining server failures are confined to the
