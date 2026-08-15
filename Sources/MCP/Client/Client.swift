@@ -897,8 +897,7 @@ public actor Client {
             result = try await awaitDiscovery(context)
         } catch {
             if mayRetryVersion,
-                let retryVersion = mutuallySupportedVersion(from: error),
-                retryVersion != requestedVersion
+                let retryVersion = mutuallySupportedVersion(from: error)
             {
                 return try await discoverConnection(
                     requestedVersion: retryVersion,
