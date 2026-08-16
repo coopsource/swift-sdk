@@ -195,6 +195,7 @@ validation, supporting this shape.
 - [ ] **Phase 9: build the official-SDK compatibility matrix in a separate PR series.** Begin the
   Swift adapter inventory after Phase 7 behavior is stable; do not block the Graph application trial
   on the complete N×N suite.
+  Execution handoff: [`MCP-2026-07-28-SWIFT-CONFORMANCE-PLAN.md`](MCP-2026-07-28-SWIFT-CONFORMANCE-PLAN.md).
   - [ ] 9.1 (Swift PR 11 amendment or follow-up): stabilize the Swift everything-client/server
     command contracts, add explicit lifecycle and transport selection, and test adapter process,
     ordering, cancellation, and shutdown behavior.
