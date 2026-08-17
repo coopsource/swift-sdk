@@ -366,6 +366,12 @@ dependency, reduce platform support, or raise the Swift requirement.
   initialization fallback, following `basic/versioning#backward-compatibility-with-initialization-based-versions`
   and `basic/patterns/cancellation#transport-specific-cancellation`. Caller cancellation remains
   effective when the SDK timeout is disabled; it never starts an initialization attempt.
+  The default is 15 seconds. Silence is treated as initialization-era evidence because a pre-2026
+  server may ignore an unrecognized method rather than reporting `-32601`, so the budget has to cover
+  the peer's cold start: a server still loading an interpreter is indistinguishable on the wire from
+  one that will never answer, and too short a budget silently downgrades a modern peer that is merely
+  slow to start. The fallback logs at warning level with the underlying error attached so the
+  downgrade is diagnosable rather than invisible.
 - Strict combined-lifecycle servers track initialize handling, response delivery, and the ready
   notification separately. This preserves the initialization ordering in the 2025-11-25 lifecycle
   while allowing cancellation that is correlated to an active 2026-07-28 request. Per-request-only

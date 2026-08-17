@@ -13,16 +13,16 @@ directory refers to. Regenerate this table after any restack.
 | ---: | --- | --- |
 | 1 | `mcp-2026-wire-models` | `fd8b815ae88d4c975946d2f91c34cafafa7b75b6` |
 | 2 | `mcp-2026-oauth-issuer-validation` | `f50a56c0b9d1d4df229659b5f9a524c70635ed6d` |
-| 3 | `mcp-2026-discovery-negotiation` | `3776cc5ad6d6930c8553d6a43fa844127a384184` |
-| 4 | `mcp-2026-multi-round-trip` | `6602fa17025600b5c14ebac3cf6f12c7d7323a27` |
-| 5 | `mcp-2026-http-client` | `6cb1c3f90b8d2ab782af7b1cfae1c48eba3abeb9` |
-| 6 | `mcp-2026-http-server` | `19f9576bb3b93ebdca4fd9c83a82fbfdf157243e` |
-| 7 | `mcp-2026-http-lifecycle-routing` | `0bfd7a0217a1c3870f0cdafd5ec05128687b6dbd` |
-| 8 | `mcp-2026-tool-headers` | `ecd199f4fa86bc2fc5a8b52b4ea2ab8ea27f56fc` |
-| 9 | `mcp-2026-subscriptions` | `f4d9fb9ade3d00c997c7ec2e2c0a260a0f730b2b` |
-| 10 | `mcp-2026-response-caching` | `48f59c1195de106c7a871277e725c35ff50a7577` |
-| 11 | `mcp-2026-conformance` | `5bb05e56cc44761199d02ce5fdd1a7c679643e78` |
-| 12 | `mcp-2026-defaults-release` | `13a483eee9fecf1f6ba76672dfead3d053bf1aad` |
+| 3 | `mcp-2026-discovery-negotiation` | `03b73571d39f0ac8c50add3e031864e99dd9a5bf` |
+| 4 | `mcp-2026-multi-round-trip` | `dc40a1caa9819f9191e25e82c30e021a48e128f0` |
+| 5 | `mcp-2026-http-client` | `42879bc29d3ebf807963bfa648ac9e8da14904f5` |
+| 6 | `mcp-2026-http-server` | `bb707892c2edafa9e8d2115af688979aa704f028` |
+| 7 | `mcp-2026-http-lifecycle-routing` | `6032fa7a299d9da51eb2aae7edff563a0cee1583` |
+| 8 | `mcp-2026-tool-headers` | `dd1a7e3ae9d9a61b0204d4d41283de11b502331c` |
+| 9 | `mcp-2026-subscriptions` | `c4fd791252b1998f8480c978465f6199511b2298` |
+| 10 | `mcp-2026-response-caching` | `98a5b190bc53530a11c2afbfb6a004d809b77be5` |
+| 11 | `mcp-2026-conformance` | `3009621842dc425797ae1c0de11fa2840fb95ceb` |
+| 12 | `mcp-2026-defaults-release` | `93edc9d1d268f534f926f544478f604830ef38a6` |
 | aggregate | `swift-sdk-mcp-update-07-28-26` | this branch — a self-reference would go stale on every commit |
 
 Earlier reports quote the tips that existed when they were written; the third-party audit

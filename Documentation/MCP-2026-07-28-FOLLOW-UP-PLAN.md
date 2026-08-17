@@ -129,6 +129,53 @@ rejected, and invalid Accept, Content-Type, version, and (where applicable) sess
 rejected. TypeScript, Python, and Go expose origin/security policy independently from core protocol
 validation, supporting this shape.
 
+### 6. Adopt the Tasks extension as the durability path for Apple-platform clients
+
+Added 2026-08-17 from
+[`MCP-2026-07-28-ECOSYSTEM-COMPARISON.md`](MCP-2026-07-28-ECOSYSTEM-COMPARISON.md). Tasks (SEP-2663)
+was previously treated as an unscored deferral, on the reasoning that it is an optional extension and
+the conformance suite does not score it. That reasoning is sound for a datacenter SDK and wrong for
+this one.
+
+Verified against the specification: `2026-07-28` removes SSE resumability and `Last-Event-ID`, and
+redefines closing a response stream as *cancellation* of the request. A broken stream therefore loses
+the in-flight request, and clients MUST re-issue with a new request ID. Searching the specification
+and every SEP, "mobile" appears three times and only once as a design rationale — in the Tasks
+overview, which names "mobile clients, intermittent networks, or environments where connections drop"
+and states that task IDs survive disconnects. SEP-2575's own text directs durability workloads to
+Tasks explicitly.
+
+The consequence for an Apple-platform SDK: every backgrounding, Wi-Fi-to-cellular handoff, and NAT
+eviction is an involuntary disconnect that the protocol now reads as intent to cancel. Tasks is the
+only sanctioned mechanism that survives it, and its normative client requirement — persist task IDs
+durably so polling can resume after a crash or restart — maps directly onto iOS process death.
+
+Decision: implement the Tasks extension as its own PR series after the 12-unit stack lands. Do not
+fold it into the current stack; it is a separate body of work with its own wire surface, and the
+stack is in review. Track it against
+[swift-sdk#247](https://github.com/modelcontextprotocol/swift-sdk/issues/247).
+
+Design constraints carried over from the ecosystem survey:
+
+- Task IDs must be persistable by the host, not held only in memory. Provide a storage seam in the
+  same shape as `TokenStorage` rather than assuming a live process.
+- Respect the server-supplied `pollIntervalMs`, and apply jitter and bounded backoff. The
+  specification gives no mobile-aware polling guidance and servers MAY rate-limit aggressive callers;
+  a fixed interval across many clients is a thundering herd on wake.
+- Coalesce polling with platform background scheduling rather than a bare timer. The TypeScript SDK
+  documents this exact gap — its reconnect scheduler exists because timers do not survive
+  suspension — and leaves it to consumers.
+- Do not couple task lifetime to a transport connection or to a protocol session; a task outlives
+  both by design.
+- Keep it opt-in on both ends: a server may not offer the extension, and the client matrix currently
+  lists no mobile clients at all.
+
+Until it ships, the migration guide should state plainly that long-running tools have no resumption
+path under this revision, so an interrupted call must be re-issued and is therefore only safe for
+idempotent tools.
+
+Targets: a new PR series, plus a migration-guide note in unit 12 stating the interim limitation.
+
 ## Implementation phases
 
 - [x] Phase 1: restore initialization-only client/server defaults; update affected tests and documentation.
@@ -213,6 +260,20 @@ validation, supporting this shape.
     than the baseline matrix.
   - [ ] 9.6: add Java, Ruby, PHP, and Kotlin adapters to complete the ten-SDK official list, marking
     genuinely unsupported cells explicitly rather than treating them as failures.
+- [ ] **Phase 10: implement the Tasks extension (SEP-2663) as a separate PR series.** Rationale and
+  design constraints in item 6 above. Start after the 12-unit stack lands; do not fold into it.
+  - [ ] 10.1: wire models for `tasks/get`, `tasks/update`, `tasks/cancel`, task-augmented results,
+    and capability advertisement, with the same schema-fidelity tests unit 01 uses.
+  - [ ] 10.2: client polling driver honoring `pollIntervalMs` and `ttlMs`, with jitter, bounded
+    backoff, out-of-order poll rejection, and a documented terminal-state contract.
+  - [ ] 10.3: a task-ID storage seam shaped like `TokenStorage`, so a host can persist across process
+    death, plus a default in-memory implementation.
+  - [ ] 10.4: server-side task creation, state transitions, and cancellation, including the
+    interaction with request-scoped cancellation already implemented in unit 06.
+  - [ ] 10.5: platform-scheduling integration guidance for polling on suspension, and a worked
+    example. Do not ship a bare timer as the only option.
+  - [ ] 10.6: enable the Tasks conformance scenarios that the 2026 runs currently record as unscored
+    failures, and record the before/after counts here.
 
 ## Verification log
 
