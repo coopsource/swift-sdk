@@ -6,11 +6,21 @@ extension Data {
     @inline(__always) private static var dataURLRegex:
         Regex<(Substring, Substring, Substring?, Substring)>
     {
-        Regex {
+        // RFC 2045 tokens are printable ASCII excluding tspecials. Scalar matching
+        // prevents canonically equivalent Unicode (for example, the Kelvin sign)
+        // from being accepted as ASCII media text; payload matching is unchanged.
+        let token = CharacterClass("!"..."~").subtracting(.anyOf("()<>@,;:\\\"/[]?="))
+        let mediaType = Regex {
+            OneOrMore { token }
+            "/"
+            OneOrMore { token }
+        }.matchingSemantics(.unicodeScalar)
+
+        return Regex {
             "data:"
             Capture {
-                ZeroOrMore(.reluctant) {
-                    CharacterClass.anyOf(",;").inverted
+                Optionally {
+                    mediaType
                 }
             }
             Optionally {
